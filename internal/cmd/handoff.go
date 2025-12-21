@@ -464,6 +464,20 @@ func setRequestingState(role Role, action HandoffAction, townRoot string) error 
 	case RoleWitness:
 		// Would need rig context
 		stateFile = filepath.Join(townRoot, "witness", "state.json")
+	case RoleCrew:
+		// Crew state: <townRoot>/<rig>/crew/<name>/state.json
+		if crewID := getCrewIdentity(); crewID != "" {
+			// crewID format: <rig>-crew-<name>
+			parts := strings.SplitN(crewID, "-crew-", 2)
+			if len(parts) == 2 {
+				stateFile = filepath.Join(townRoot, parts[0], "crew", parts[1], "state.json")
+			}
+		}
+		if stateFile == "" {
+			// Fallback to cwd
+			cwd, _ := os.Getwd()
+			stateFile = filepath.Join(cwd, "state.json")
+		}
 	default:
 		// For other roles, use a generic location
 		stateFile = filepath.Join(townRoot, ".gastown", "agent-state.json")
