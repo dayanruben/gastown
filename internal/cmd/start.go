@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -12,8 +14,11 @@ import (
 )
 
 var (
-	shutdownGraceful bool
-	shutdownWait     int
+	shutdownGraceful    bool
+	shutdownWait        int
+	shutdownAll         bool
+	shutdownYes         bool
+	shutdownPolecatsOnly bool
 )
 
 var startCmd = &cobra.Command{
@@ -33,15 +38,18 @@ To stop Gas Town, use 'gt shutdown'.`,
 var shutdownCmd = &cobra.Command{
 	Use:   "shutdown",
 	Short: "Shutdown Gas Town",
-	Long: `Shutdown Gas Town by stopping all agents.
+	Long: `Shutdown Gas Town by stopping agents.
 
-By default, immediately kills all sessions. Use --graceful to allow agents
-time to save their state and update handoff beads.
+By default, preserves crew sessions (your persistent workspaces).
+Prompts for confirmation before stopping.
 
-Stops agents in the correct order:
-1. Deacon (health monitor) - so it doesn't restart others
-2. All polecats, witnesses, refineries, crew
-3. Mayor (global coordinator)`,
+Shutdown levels (progressively more aggressive):
+  (default)       - Stop infrastructure (Mayor, Deacon, Witnesses, Refineries, Polecats)
+  --all           - Also stop crew sessions
+  --polecats-only - Only stop polecats (leaves everything else running)
+
+Use --graceful to allow agents time to save state before killing.
+Use --yes to skip confirmation prompt.`,
 	RunE: runShutdown,
 }
 
@@ -50,6 +58,12 @@ func init() {
 		"Send ESC to agents and wait for them to handoff before killing")
 	shutdownCmd.Flags().IntVarP(&shutdownWait, "wait", "w", 30,
 		"Seconds to wait for graceful shutdown (default 30)")
+	shutdownCmd.Flags().BoolVarP(&shutdownAll, "all", "a", false,
+		"Also stop crew sessions (by default, crew is preserved)")
+	shutdownCmd.Flags().BoolVarP(&shutdownYes, "yes", "y", false,
+		"Skip confirmation prompt")
+	shutdownCmd.Flags().BoolVar(&shutdownPolecatsOnly, "polecats-only", false,
+		"Only stop polecats (minimal shutdown)")
 
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(shutdownCmd)
@@ -103,32 +117,98 @@ func runStart(cmd *cobra.Command, args []string) error {
 func runShutdown(cmd *cobra.Command, args []string) error {
 	t := tmux.NewTmux()
 
-	if shutdownGraceful {
-		return runGracefulShutdown(t)
-	}
-	return runImmediateShutdown(t)
-}
-
-func runGracefulShutdown(t *tmux.Tmux) error {
-	fmt.Printf("Graceful shutdown of Gas Town (waiting up to %ds)...\n\n", shutdownWait)
-
-	// Collect all gt-* sessions
+	// Collect sessions to show what will be stopped
 	sessions, err := t.ListSessions()
 	if err != nil {
 		return fmt.Errorf("listing sessions: %w", err)
 	}
 
-	var gtSessions []string
-	for _, sess := range sessions {
-		if strings.HasPrefix(sess, "gt-") {
-			gtSessions = append(gtSessions, sess)
-		}
-	}
+	toStop, preserved := categorizeSessions(sessions)
 
-	if len(gtSessions) == 0 {
+	if len(toStop) == 0 {
 		fmt.Printf("%s Gas Town was not running\n", style.Dim.Render("○"))
 		return nil
 	}
+
+	// Show what will happen
+	fmt.Println("Sessions to stop:")
+	for _, sess := range toStop {
+		fmt.Printf("  %s %s\n", style.Bold.Render("→"), sess)
+	}
+	if len(preserved) > 0 && !shutdownAll {
+		fmt.Println()
+		fmt.Println("Sessions preserved (crew):")
+		for _, sess := range preserved {
+			fmt.Printf("  %s %s\n", style.Dim.Render("○"), sess)
+		}
+	}
+	fmt.Println()
+
+	// Confirmation prompt
+	if !shutdownYes {
+		fmt.Printf("Proceed with shutdown? [y/N] ")
+		reader := bufio.NewReader(os.Stdin)
+		response, _ := reader.ReadString('\n')
+		response = strings.TrimSpace(strings.ToLower(response))
+		if response != "y" && response != "yes" {
+			fmt.Println("Shutdown cancelled.")
+			return nil
+		}
+	}
+
+	if shutdownGraceful {
+		return runGracefulShutdown(t, toStop)
+	}
+	return runImmediateShutdown(t, toStop)
+}
+
+// categorizeSessions splits sessions into those to stop and those to preserve.
+func categorizeSessions(sessions []string) (toStop, preserved []string) {
+	for _, sess := range sessions {
+		if !strings.HasPrefix(sess, "gt-") {
+			continue // Not a Gas Town session
+		}
+
+		// Check if it's a crew session (pattern: gt-<rig>-crew-<name>)
+		isCrew := strings.Contains(sess, "-crew-")
+
+		// Check if it's a polecat session (pattern: gt-<rig>-<name> where name is not crew/witness/refinery)
+		isPolecat := false
+		if !isCrew && sess != MayorSessionName && sess != DeaconSessionName {
+			parts := strings.Split(sess, "-")
+			if len(parts) >= 3 {
+				role := parts[2]
+				if role != "witness" && role != "refinery" && role != "crew" {
+					isPolecat = true
+				}
+			}
+		}
+
+		// Decide based on flags
+		if shutdownPolecatsOnly {
+			// Only stop polecats
+			if isPolecat {
+				toStop = append(toStop, sess)
+			} else {
+				preserved = append(preserved, sess)
+			}
+		} else if shutdownAll {
+			// Stop everything
+			toStop = append(toStop, sess)
+		} else {
+			// Default: preserve crew
+			if isCrew {
+				preserved = append(preserved, sess)
+			} else {
+				toStop = append(toStop, sess)
+			}
+		}
+	}
+	return
+}
+
+func runGracefulShutdown(t *tmux.Tmux, gtSessions []string) error {
+	fmt.Printf("Graceful shutdown of Gas Town (waiting up to %ds)...\n\n", shutdownWait)
 
 	// Phase 1: Send ESC to all agents to interrupt them
 	fmt.Printf("Phase 1: Sending ESC to %d agent(s)...\n", len(gtSessions))
@@ -162,22 +242,53 @@ func runGracefulShutdown(t *tmux.Tmux) error {
 		time.Sleep(time.Duration(sleepTime) * time.Second)
 	}
 
-	// Phase 4: Kill all sessions
+	// Phase 4: Kill sessions in correct order
 	fmt.Printf("\nPhase 4: Terminating sessions...\n")
+	stopped := killSessionsInOrder(t, gtSessions)
+
+	fmt.Println()
+	fmt.Printf("%s Graceful shutdown complete (%d sessions stopped)\n", style.Bold.Render("✓"), stopped)
+	return nil
+}
+
+func runImmediateShutdown(t *tmux.Tmux, gtSessions []string) error {
+	fmt.Println("Shutting down Gas Town...")
+
+	stopped := killSessionsInOrder(t, gtSessions)
+
+	fmt.Println()
+	fmt.Printf("%s Gas Town shutdown complete (%d sessions stopped)\n", style.Bold.Render("✓"), stopped)
+
+	return nil
+}
+
+// killSessionsInOrder stops sessions in the correct order:
+// 1. Deacon first (so it doesn't restart others)
+// 2. Everything except Mayor
+// 3. Mayor last
+func killSessionsInOrder(t *tmux.Tmux, sessions []string) int {
 	stopped := 0
 
-	// Stop Deacon first
-	for _, sess := range gtSessions {
-		if sess == DeaconSessionName {
-			if err := t.KillSession(sess); err == nil {
-				fmt.Printf("  %s %s stopped\n", style.Bold.Render("✓"), sess)
-				stopped++
+	// Helper to check if session is in our list
+	inList := func(sess string) bool {
+		for _, s := range sessions {
+			if s == sess {
+				return true
 			}
+		}
+		return false
+	}
+
+	// 1. Stop Deacon first
+	if inList(DeaconSessionName) {
+		if err := t.KillSession(DeaconSessionName); err == nil {
+			fmt.Printf("  %s %s stopped\n", style.Bold.Render("✓"), DeaconSessionName)
+			stopped++
 		}
 	}
 
-	// Stop others (except Mayor)
-	for _, sess := range gtSessions {
+	// 2. Stop others (except Mayor)
+	for _, sess := range sessions {
 		if sess == DeaconSessionName || sess == MayorSessionName {
 			continue
 		}
@@ -187,83 +298,13 @@ func runGracefulShutdown(t *tmux.Tmux) error {
 		}
 	}
 
-	// Stop Mayor last
-	for _, sess := range gtSessions {
-		if sess == MayorSessionName {
-			if err := t.KillSession(sess); err == nil {
-				fmt.Printf("  %s %s stopped\n", style.Bold.Render("✓"), sess)
-				stopped++
-			}
-		}
-	}
-
-	fmt.Println()
-	fmt.Printf("%s Graceful shutdown complete (%d sessions stopped)\n", style.Bold.Render("✓"), stopped)
-	return nil
-}
-
-func runImmediateShutdown(t *tmux.Tmux) error {
-	fmt.Println("Shutting down Gas Town...")
-
-	stopped := 0
-
-	// 1. Stop Deacon first (so it doesn't try to restart others)
-	deaconRunning, _ := t.HasSession(DeaconSessionName)
-	if deaconRunning {
-		fmt.Printf("  %s Stopping Deacon...\n", style.Bold.Render("→"))
-		if err := t.KillSession(DeaconSessionName); err != nil {
-			fmt.Printf("  %s Failed to stop Deacon: %v\n", style.Dim.Render("!"), err)
-		} else {
-			fmt.Printf("  %s Deacon stopped\n", style.Bold.Render("✓"))
-			stopped++
-		}
-	} else {
-		fmt.Printf("  %s Deacon not running\n", style.Dim.Render("○"))
-	}
-
-	// 2. Stop all other gt-* sessions (polecats, witnesses, refineries, crew)
-	sessions, err := t.ListSessions()
-	if err == nil {
-		for _, sess := range sessions {
-			// Skip Mayor (we'll stop it last) and Deacon (already stopped)
-			if sess == MayorSessionName || sess == DeaconSessionName {
-				continue
-			}
-			// Only kill gt-* sessions
-			if !strings.HasPrefix(sess, "gt-") {
-				continue
-			}
-
-			fmt.Printf("  %s Stopping %s...\n", style.Bold.Render("→"), sess)
-			if err := t.KillSession(sess); err != nil {
-				fmt.Printf("  %s Failed to stop %s: %v\n", style.Dim.Render("!"), sess, err)
-			} else {
-				fmt.Printf("  %s %s stopped\n", style.Bold.Render("✓"), sess)
-				stopped++
-			}
-		}
-	}
-
 	// 3. Stop Mayor last
-	mayorRunning, _ := t.HasSession(MayorSessionName)
-	if mayorRunning {
-		fmt.Printf("  %s Stopping Mayor...\n", style.Bold.Render("→"))
-		if err := t.KillSession(MayorSessionName); err != nil {
-			fmt.Printf("  %s Failed to stop Mayor: %v\n", style.Dim.Render("!"), err)
-		} else {
-			fmt.Printf("  %s Mayor stopped\n", style.Bold.Render("✓"))
+	if inList(MayorSessionName) {
+		if err := t.KillSession(MayorSessionName); err == nil {
+			fmt.Printf("  %s %s stopped\n", style.Bold.Render("✓"), MayorSessionName)
 			stopped++
 		}
-	} else {
-		fmt.Printf("  %s Mayor not running\n", style.Dim.Render("○"))
 	}
 
-	fmt.Println()
-	if stopped > 0 {
-		fmt.Printf("%s Gas Town shutdown complete (%d sessions stopped)\n", style.Bold.Render("✓"), stopped)
-	} else {
-		fmt.Printf("%s Gas Town was not running\n", style.Dim.Render("○"))
-	}
-
-	return nil
+	return stopped
 }
