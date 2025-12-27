@@ -241,19 +241,6 @@ Molecules survive crashes - any agent can continue where another left off.
 | `squash` | Mol/Wisp → Digest | Condense to permanent record |
 | `burn` | Wisp → ∅ | Discard without record |
 
-### Dynamic Bonding
-
-Patrol workflows can spawn children at runtime:
-
-```bash
-# Witness discovers 3 polecats, bonds an arm for each
-for polecat in ace nux toast; do
-  bd mol bond mol-polecat-arm $PATROL_ID --var name=$polecat
-done
-```
-
-Creates a "Christmas ornament" shape - trunk with dynamic arms.
-
 ---
 
 ## Prerequisites
