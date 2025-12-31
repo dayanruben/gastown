@@ -32,6 +32,7 @@ Session groups:
 - Town sessions: Mayor ↔ Deacon
 - Crew sessions: All crew members in the same rig (e.g., gastown/crew/max ↔ gastown/crew/joe)
 - Rig infra sessions: Witness ↔ Refinery (per rig)
+- Polecat sessions: All polecats in the same rig (e.g., gastown/Toast ↔ gastown/Nux)
 
 The appropriate cycling is detected automatically from the session name.`,
 }
@@ -92,7 +93,12 @@ func cycleToSession(direction int, sessionOverride string) error {
 		return cycleRigInfraSession(direction, session, rig)
 	}
 
-	// Unknown session type (polecat) - do nothing
+	// Check if it's a polecat session (gt-<rig>-<name>, not crew/witness/refinery)
+	if rig, _, ok := parsePolecatSessionName(session); ok && rig != "" {
+		return cyclePolecatSession(direction, session)
+	}
+
+	// Unknown session type - do nothing
 	return nil
 }
 
