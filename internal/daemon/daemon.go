@@ -67,6 +67,22 @@ func New(config *Config) (*Daemon, error) {
 func (d *Daemon) Run() error {
 	d.logger.Printf("Daemon starting (PID %d)", os.Getpid())
 
+	// Acquire exclusive lock to prevent multiple daemons from running.
+	// This prevents the TOCTOU race condition where multiple concurrent starts
+	// can all pass the IsRunning() check before any writes the PID file.
+	lockFile := filepath.Join(d.config.TownRoot, "daemon", "daemon.lock")
+	lock, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("opening lock file: %w", err)
+	}
+	defer lock.Close()
+
+	// Try to acquire exclusive lock (non-blocking)
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return fmt.Errorf("daemon already running (lock held by another process)")
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+
 	// Write PID file
 	if err := os.WriteFile(d.config.PidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
 		return fmt.Errorf("writing PID file: %w", err)
@@ -684,6 +700,9 @@ func (d *Daemon) Stop() {
 }
 
 // IsRunning checks if a daemon is running for the given town.
+// It checks the PID file and verifies the process is alive.
+// Note: The file lock in Run() is the authoritative mechanism for preventing
+// duplicate daemons. This function is for status checks and cleanup.
 func IsRunning(townRoot string) (bool, int, error) {
 	pidFile := filepath.Join(townRoot, "daemon", "daemon.pid")
 	data, err := os.ReadFile(pidFile)
@@ -708,7 +727,7 @@ func IsRunning(townRoot string) (bool, int, error) {
 	// On Unix, FindProcess always succeeds. Send signal 0 to check if alive.
 	err = process.Signal(syscall.Signal(0))
 	if err != nil {
-		// Process not running, clean up stale PID file (best-effort cleanup)
+		// Process not running, clean up stale PID file
 		_ = os.Remove(pidFile)
 		return false, 0, nil
 	}
@@ -717,6 +736,8 @@ func IsRunning(townRoot string) (bool, int, error) {
 }
 
 // StopDaemon stops the running daemon for the given town.
+// Note: The file lock in Run() prevents multiple daemons per town, so we only
+// need to kill the process from the PID file.
 func StopDaemon(townRoot string) error {
 	running, pid, err := IsRunning(townRoot)
 	if err != nil {
@@ -741,11 +762,11 @@ func StopDaemon(townRoot string) error {
 
 	// Check if still running
 	if err := process.Signal(syscall.Signal(0)); err == nil {
-		// Still running, force kill (best-effort)
+		// Still running, force kill
 		_ = process.Signal(syscall.SIGKILL)
 	}
 
-	// Clean up PID file (best-effort cleanup)
+	// Clean up PID file
 	pidFile := filepath.Join(townRoot, "daemon", "daemon.pid")
 	_ = os.Remove(pidFile)
 
