@@ -169,7 +169,7 @@ func (c *AgentBeadsCheck) Fix(ctx *CheckContext) error {
 			RoleType:   "deacon",
 			Rig:        "",
 			AgentState: "idle",
-			RoleBead:   "hq-deacon-role",
+			RoleBead:   beads.DeaconRoleBeadIDTown(),
 		}
 		desc := "Deacon (daemon beacon) - receives mechanical heartbeats, runs town plugins and monitoring."
 		if _, err := townBd.CreateAgentBead(deaconID, desc, fields); err != nil {
@@ -183,7 +183,7 @@ func (c *AgentBeadsCheck) Fix(ctx *CheckContext) error {
 			RoleType:   "mayor",
 			Rig:        "",
 			AgentState: "idle",
-			RoleBead:   "hq-mayor-role",
+			RoleBead:   beads.MayorRoleBeadIDTown(),
 		}
 		desc := "Mayor - global coordinator, handles cross-rig communication and escalations."
 		if _, err := townBd.CreateAgentBead(mayorID, desc, fields); err != nil {
