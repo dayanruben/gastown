@@ -15,7 +15,7 @@ npm install
 npm run start
 ```
 
-The development server runs at http://localhost:3000/gastown/.
+The development server runs at http://localhost:3000/.
 
 ## Build
 
