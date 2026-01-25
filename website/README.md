@@ -37,4 +37,4 @@ npm run serve
 npm run deploy
 ```
 
-Configure `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as needed for GitHub Pages deployments.
+Configure `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as needed for Cloudflare Pages deployments.
