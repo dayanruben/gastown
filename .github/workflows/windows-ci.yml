@@ -10,6 +10,7 @@ jobs:
   test:
     name: Windows Build and Unit Tests
     runs-on: windows-latest
+    if: github.repository == 'steveyegge/gastown'
     steps:
       - uses: actions/checkout@v6
         with:

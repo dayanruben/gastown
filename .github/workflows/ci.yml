@@ -7,10 +7,17 @@ on:
     branches: [ main ]
 
 jobs:
+  check-repo:
+    if: github.repository == 'steveyegge/gastown'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Running in original repository"
+
   # Fast check to catch accidental .beads/issues.jsonl changes from contributors
   check-no-beads-changes:
     name: Check for .beads changes
     runs-on: ubuntu-latest
+    needs: check-repo
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v6
@@ -38,6 +45,7 @@ jobs:
   check-embedded-formulas:
     name: Check embedded formulas
     runs-on: ubuntu-latest
+    needs: check-repo
     steps:
       - uses: actions/checkout@v6
 
@@ -66,6 +74,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    needs: check-repo
     steps:
       - uses: actions/checkout@v6
         with:
@@ -204,6 +213,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    needs: check-repo
     steps:
       - uses: actions/checkout@v6
 
@@ -221,6 +231,7 @@ jobs:
   integration:
     name: Integration Tests
     runs-on: ubuntu-latest
+    needs: check-repo
     steps:
       - uses: actions/checkout@v6
 
