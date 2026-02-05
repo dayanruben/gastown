@@ -326,8 +326,14 @@ func runDone(cmd *cobra.Command, args []string) error {
 		// The MR bead triggers Refinery to process this branch. If the branch
 		// isn't pushed yet, Refinery finds nothing to merge. The worktree gets
 		// nuked at the end of gt done, so the commits are lost forever.
+		//
+		// Use explicit refspec (branch:branch) to create the remote branch.
+		// Without refspec, git push follows the tracking config — polecat branches
+		// track origin/main, so a bare push sends commits to main directly,
+		// bypassing the MR/refinery flow (G20 root cause).
 		fmt.Printf("Pushing branch to remote...\n")
-		if err := g.Push("origin", branch, false); err != nil {
+		refspec := branch + ":" + branch
+		if err := g.Push("origin", refspec, false); err != nil {
 			return fmt.Errorf("pushing branch '%s' to origin: %w\nCommits exist locally but failed to push. Fix the issue and retry.", branch, err)
 		}
 		fmt.Printf("%s Branch pushed to origin\n", style.Bold.Render("✓"))
@@ -444,6 +450,9 @@ func runDone(cmd *cobra.Command, args []string) error {
 			// Success output
 			fmt.Printf("%s Work submitted to merge queue\n", style.Bold.Render("✓"))
 			fmt.Printf("  MR ID: %s\n", style.Bold.Render(mrID))
+
+			// Nudge refinery to pick up the new MR
+			nudgeRefinery(rigName, fmt.Sprintf("MR submitted: %s branch=%s", mrID, branch))
 		}
 		fmt.Printf("  Source: %s\n", branch)
 		fmt.Printf("  Target: %s\n", target)
@@ -671,9 +680,27 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, _ string) { // issueID unus
 			// Order matters: wisp closes -> unblocks base bead -> base bead closes.
 			attachment := beads.ParseAttachmentFields(hookedBead)
 			if attachment != nil && attachment.AttachedMolecule != "" {
-				if err := bd.Close(attachment.AttachedMolecule); err != nil {
-					// Non-fatal: warn but continue
-					fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s: %v\n", attachment.AttachedMolecule, err)
+				// Retry molecule close with exponential backoff. Transient failures
+				// can leave wisps orphaned, blocking the work bead from closing.
+				var moleculeClosed bool
+				var lastErr error
+				for attempt := 0; attempt < 3; attempt++ {
+					if err := bd.Close(attachment.AttachedMolecule); err == nil {
+						moleculeClosed = true
+						break
+					} else {
+						lastErr = err
+						if attempt < 2 {
+							time.Sleep(time.Duration(100<<attempt) * time.Millisecond) // 100ms, 200ms
+						}
+					}
+				}
+				if !moleculeClosed {
+					// All retries failed - skip closing hooked bead (it's blocked by the molecule)
+					fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s after 3 attempts: %v\n", attachment.AttachedMolecule, lastErr)
+					// Don't try to close hookedBeadID - it will fail because it's still blocked
+					// The Witness will clean up orphaned state
+					return
 				}
 			}
 
