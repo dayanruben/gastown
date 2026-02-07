@@ -42,6 +42,13 @@ install: check-up-to-date build
 	@mkdir -p $(INSTALL_DIR)
 	@rm -f $(INSTALL_DIR)/$(BINARY)
 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
+	@# Nuke any stale go-install binaries that shadow the canonical location
+	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
+		if [ -f "$$bad" ]; then \
+			echo "Removing stale $$bad (use make install, not go install)"; \
+			rm -f "$$bad"; \
+		fi; \
+	done
 	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY)"
 
 clean:

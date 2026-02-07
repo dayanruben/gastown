@@ -6,8 +6,8 @@
 > **Consolidates**: DOLT-STORAGE-DESIGN.md, THREE-PLANES.md, dolt-integration-analysis-v{1,2}.md,
 > dolt-license-analysis.md (all deleted; available in git history under ~/hop/docs/)
 > **Key decisions**: SQLite retired. JSONL retired (interim backup only). Dolt is the
-> only backend. Server mode is the default. Dolt-in-git replaces JSONL for federation
-> when it ships.
+> only backend. Server mode is **required** (embedded mode fully removed — no fallback).
+> Dolt-in-git replaces JSONL for federation when it ships.
 
 ---
 
@@ -19,20 +19,21 @@
 |----------|---------|
 | **Dolt is the only backend** | SQLite retired. No dual-backend. |
 | **JSONL is not source of truth** | One-way backup export only (interim). Eliminated entirely by dolt-in-git. |
-| **Dolt Server is the default** | One server per town, serving all rig databases. Required for multi-agent concurrency. |
-| **Embedded mode abandoned** | File-level locking causes hangs under concurrent load. Kept only for single-user Beads Classic. |
+| **Dolt Server is required** | One server per town, serving all rig databases. No embedded fallback. |
+| **Embedded mode removed** | File-level locking causes hangs under concurrent load. Removed entirely — not kept as fallback. |
 | **Single binary** | Pure-Go Dolt (`bd`). No CGO needed for local ops. |
 | **Licensing** | Dolt is Apache 2.0, compatible with Beads/Gas Town MIT. Standard attribution. |
 
 ### Server Mode Architecture
 
 ```
-Gas Town (multi-agent):              Beads Classic (single user):
-┌─────────────────────────────────┐  ┌──────────────────┐
-│  Dolt SQL Server (per town)     │  │  Dolt embedded   │
-│  - Port 3307                    │  │  (in-process)    │
-│  - Serves all rig databases     │  │  single-writer   │
-│  - Multi-client concurrency     │  └──────────────────┘
+┌─────────────────────────────────┐
+│  Dolt SQL Server (per town)     │
+│  - Port 3307                    │
+│  - Serves all rig databases     │
+│  - Multi-client concurrency     │
+│  - Managed by gt daemon         │
+│  - Auto-start, auto-restart     │
 └─────────────────────────────────┘
            │
            ├── hq/       (town-level beads, hq-* prefix)
@@ -41,18 +42,25 @@ Gas Town (multi-agent):              Beads Classic (single user):
            └── ...       (other rigs)
 ```
 
-### Why Embedded Mode Was Abandoned
+All `bd` commands connect via MySQL protocol. There is no embedded fallback.
+If the server is not running, `bd` fails fast with a clear error message
+pointing the user to `gt dolt start`.
 
-Embedded Dolt uses file-level locking. In multi-agent environments like Gas Town,
+### Why Embedded Mode Was Removed
+
+Embedded Dolt uses file-level locking (noms LOCK). In multi-agent environments,
 this causes severe problems:
 
 - `gt status` spawns 40+ `bd` processes to check all rigs
 - Each process contends for the same lock file
 - Processes hang indefinitely waiting for locks
 - A semaphore hack (MaxConcurrentBd=3) serializes access but kills parallelism
+- Even read-only operations acquire exclusive locks in the embedded driver
 
-**The fix**: Dolt SQL Server handles concurrency properly via MySQL protocol.
-Multiple clients can query/write simultaneously without lock contention.
+Embedded was initially kept as a fallback, but this created complexity for no
+benefit: if the server is down, the data lives on the server's data directory
+(`~/.dolt-data/`), so embedded can't access it anyway. Removing embedded entirely
+enables significant code simplification (see Part 11).
 
 ### Server Topology Options
 
@@ -251,20 +259,25 @@ in case of disk crashes. The git-tracked JSONL files are the recovery path.
 
 ### What's Working
 
-- Dolt SQL Server as the primary access method for multi-agent workloads
+- Dolt SQL Server as the **only** access method — embedded mode removed
 - Centralized data directory at `~/gt/.dolt-data/` with per-rig subdirectories
+- `gt daemon` auto-starts, monitors, and auto-restarts the Dolt server
 - Server commands: `gt dolt start`, `gt dolt stop`, `gt dolt status`, `gt dolt logs`
-- Migration command: `gt dolt migrate` moves old `.beads/dolt/` databases to centralized location
+- 5 concurrent `bd` processes tested with zero contention
 - Creates persist, reads work, `gt ready` shows items across all rigs
 
 ### Server Management
 
 ```bash
+# Daemon manages server lifecycle automatically (preferred)
+gt daemon start     # Daemon auto-starts Dolt server
+
+# Manual management (for debugging or one-off use)
 gt dolt start       # Start the Dolt SQL server (port 3307)
 gt dolt stop        # Stop the server
 gt dolt status      # Check server status, list databases
 gt dolt logs        # View server logs
-gt dolt sql         # Open SQL shell (connects to server if running)
+gt dolt sql         # Open SQL shell
 gt dolt init-rig X  # Initialize a new rig database
 gt dolt list        # List all rig databases
 gt dolt migrate     # Migrate from old .beads/dolt/ layout
@@ -280,14 +293,18 @@ gt dolt migrate     # Migrate from old .beads/dolt/ layout
 │   ├── beads/                  ← Beads rig (bd-* prefix)
 │   └── wyvern/                 ← Wyvern rig (wy-* prefix)
 ├── daemon/
-│   ├── dolt.pid                ← Server PID file
-│   ├── dolt.log                ← Server log
+│   ├── dolt.pid                ← Server PID file (daemon-managed)
+│   ├── dolt-server.log         ← Server log
 │   └── dolt-state.json         ← Server state
+├── mayor/
+│   └── daemon.json             ← Daemon config (dolt_server section)
 └── [rigs]/                     ← Rig directories (code, not data)
 ```
 
 The Dolt server runs with `--data-dir ~/.dolt-data`, making each subdirectory
-a separate database accessible via `USE <rigname>` in SQL.
+a separate database accessible via `USE <rigname>` in SQL. The daemon ensures
+the server is running on every heartbeat (3-minute interval) and auto-restarts
+on crash.
 
 ---
 
@@ -399,21 +416,21 @@ CREATE TABLE channels (
 
 ### Bootstrap Flow
 
-**Gas Town (server mode):**
-1. Run `gt dolt migrate` to move existing `.beads/dolt/` databases to `~/.dolt-data/`
-2. Run `gt dolt start` to start the server
-3. All `bd` commands connect via MySQL protocol to port 3307
+**Gas Town (existing install — migration from embedded):**
+1. Run `gt dolt migrate` to move town-level `.beads/dolt/` to `~/.dolt-data/hq/`
+2. Manually move rig-level databases: `mv <rig>/mayor/rig/.beads/dolt/beads ~/.dolt-data/<rigname>`
+3. Update all `metadata.json` files: `dolt_mode: "server"`, `dolt_database: "<rigname>"`
+4. Enable `dolt_server` in `mayor/daemon.json`, restart daemon
 
-**Fresh install:**
+**Fresh Gas Town install:**
 1. `gt dolt init-rig hq` — initialize town-level database
-2. `gt dolt init-rig gastown` — initialize per-rig databases
-3. `gt dolt start` — start serving all databases
+2. `gt dolt init-rig <rigname>` — initialize per-rig databases
+3. Enable `dolt_server` in `mayor/daemon.json`
+4. `gt daemon start` — daemon auto-starts the Dolt server
 
-**Beads Classic (embedded mode):**
-1. If Dolt DB exists → use it (embedded, single-writer)
-2. If JSONL exists but no Dolt → import to new Dolt DB (legacy bootstrap)
-3. If neither → create empty Dolt DB
-4. When dolt-in-git ships: Dolt binary IS in the clone, no bootstrap needed
+**Fresh Beads install (standalone):**
+1. `dolt sql-server --port 3307 --data-dir <path>` — start server
+2. `bd` connects via MySQL protocol, creates database and schema automatically
 
 ### Error Recovery
 
@@ -469,23 +486,25 @@ Direct answers from Tim Sehn (CEO) and Dustin Brown (engineer), January 2026.
 
 ### Completed
 
-- **Dolt Server mode**: Now the default for Gas Town. Commands: `gt dolt start/stop/status`
+- **Dolt Server mode**: Required for all access. Commands: `gt dolt start/stop/status`
 - **Centralized data directory**: `~/.dolt-data/` with per-rig subdirectories
-- **Migration tooling**: `gt dolt migrate` moves old `.beads/dolt/` databases
+- **Migration tooling**: `gt dolt migrate` + manual moves for rig-level databases
+- **Daemon integration**: Dolt server auto-starts/stops/restarts via `gt daemon`
+- **All 4 databases migrated**: hq (4197), beads (2468), gastown (1053), wyvern
 
 ### Immediate
 
-1. **Dolt-in-git integration**: Dolt team delivering soon.
+1. **Remove embedded mode from bd** (see Part 11): Major code simplification.
+2. **Dolt-in-git integration**: Dolt team delivering soon.
    When ready, integrate into bd — replace JSONL with Dolt binary commits.
-2. **Gas Town pristine state**: Clean up patrol pollution, stale SQLite, misrouted
-   beads, stale JSONL.
-3. **Auto-start server**: Integrate Dolt server start into `gt daemon` lifecycle.
+3. **Gas Town pristine state**: Clean up old `.beads/dolt/` directories, stale
+   SQLite, misrouted beads, stale JSONL.
 
 ### Next
 
 - Closed-beads-only ledger export
 - Agent-managed Dolt migration flow for Beads users
-- Ship `bd` release with pure-Go Dolt (single binary, works out of the box)
+- Ship `bd` release (server-only, no embedded driver → smaller binary)
 - Per-rig server option for isolation (if demand emerges)
 
 ### Future
@@ -503,7 +522,8 @@ Direct answers from Tim Sehn (CEO) and Dustin Brown (engineer), January 2026.
 | JSONL retired as source of truth | Dolt is truth; JSONL is interim backup | 2026-01-15 |
 | ~~Embedded Dolt default~~ | ~~No server process, just works~~ | ~~2026-01-30~~ |
 | **Server mode is default** | Embedded file locking causes hangs under multi-agent concurrency | 2026-02-05 |
-| **Embedded mode abandoned** | 40+ concurrent `bd` processes contend for lock file, hang indefinitely | 2026-02-05 |
+| **Embedded mode removed entirely** | No fallback — data lives on server, embedded can't access it. Enables major code simplification. | 2026-02-05 |
+| **Daemon manages Dolt server** | Auto-start on heartbeat, auto-restart on crash, graceful shutdown | 2026-02-05 |
 | **One server per town** | Centralized `.dolt-data/` serves all rigs; simple ops, single process | 2026-02-05 |
 | Single binary (pure-Go) | No CGO needed for local ops | 2026-01-30 |
 | Dolt-in-git replaces JSONL | Native binary in git, cell-level merge | 2026-01-30 |
@@ -514,3 +534,55 @@ Direct answers from Tim Sehn (CEO) and Dustin Brown (engineer), January 2026.
 | dolt_diff() for export | No dirty_issues table; Dolt IS the tracker | 2026-01-16 |
 | Per-worktree export state | Prevent polecats exporting each other's work | 2026-01-16 |
 | Apache 2.0 compatible with MIT | Standard attribution, no architectural impact | 2026-01-13 |
+
+---
+
+## Part 11: Code Simplification (Embedded Removal)
+
+Removing embedded mode entirely enables significant cleanup across the `bd` codebase.
+This is not incremental — it's a wholesale removal of a code path that no longer executes.
+
+### What Gets Removed
+
+| Component | File | What |
+|-----------|------|------|
+| **Embedded Dolt driver** | `go.mod` | `go-dolt` dependency — largest single dep in the binary |
+| **Advisory lock layer** | `access_lock.go` | Entire file: shared/exclusive flock, `AcquireAccessLock()`, `dolt-access.lock` |
+| **Embedded connection** | `store.go` | `openEmbeddedConnection()`, `withEmbeddedDolt()`, embedded backoff/retry |
+| **UOW1/UOW2 init path** | `store.go` | Embedded-only `CREATE DATABASE` + schema init via embedded driver |
+| **Server fallback** | `factory_dolt.go` | `isServerConnectionError()` fallback to embedded (lines 39-55) |
+| **JSONL bootstrap** | `factory_dolt.go` | `bootstrapEmbeddedDolt()`, `hasDoltSubdir()` |
+| **Read-only distinction** | `main.go` | `isReadOnlyCommand()` map — server handles concurrency natively |
+| **Semaphore hacks** | gt hooks, `main.go` | `MaxConcurrentBd=3` (G1/G5) — no contention with server |
+| **Lock timeout config** | `main.go` | 5s/15s read/write timeouts — no advisory locks |
+| **`BD_SKIP_ACCESS_LOCK`** | `store.go` | Debug env var for bypassing flock |
+| **Embedded build tags** | Various | `//go:build cgo` guards |
+
+### Impact
+
+| Metric | Before | After (estimated) |
+|--------|--------|-------------------|
+| Binary size | ~120MB (embedded Dolt engine) | ~20MB (MySQL client only) |
+| Build time | ~90s (CGO, Dolt compilation) | ~15s (pure Go, no CGO) |
+| `store.go` complexity | Two code paths (embedded + server) | One code path (server only) |
+| Lock-related code | ~300 lines across 4 files | 0 |
+| External deps | go-dolt + go-sql-driver/mysql | go-sql-driver/mysql only |
+
+### What Stays
+
+- `openServerConnection()` in `store.go` — the MySQL connection path
+- `initSchemaOnDB()` — schema creation (runs via MySQL now)
+- `dolt.Config` struct — simplified (remove `Path`, `OpenTimeout`, embedded fields)
+- `metadata.json` config — `dolt_mode` field becomes vestigial (always server)
+- JSONL export (`bd sync --flush-only`) — interim backup until dolt-in-git ships
+
+### Migration Path
+
+1. Remove embedded code paths from `store.go` and `factory_dolt.go`
+2. Remove `access_lock.go` entirely
+3. Remove `go-dolt` from `go.mod`
+4. Remove CGO build tags
+5. Simplify `main.go` — remove `isReadOnlyCommand()`, lock timeout logic
+6. Remove semaphore infrastructure from gt hooks
+7. Update `metadata.json` handling — `dolt_mode: "server"` becomes the only valid value
+8. Clean up old `.beads/dolt/` directories and `dolt-access.lock` files
