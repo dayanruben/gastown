@@ -20,6 +20,12 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
+// Retry constants for Dolt operations (matching hook update pattern in sling.go:492-539).
+const (
+	doltMaxRetries  = 3
+	doltBaseBackoff = 500 * time.Millisecond
+)
+
 // Common errors
 var (
 	ErrPolecatExists      = errors.New("polecat already exists")
@@ -27,6 +33,7 @@ var (
 	ErrHasChanges         = errors.New("polecat has uncommitted changes")
 	ErrHasUncommittedWork = errors.New("polecat has uncommitted work")
 	ErrShellInWorktree    = errors.New("shell working directory is inside polecat worktree")
+	ErrDoltUnhealthy      = errors.New("dolt health check failed")
 )
 
 // UncommittedWorkError provides details about uncommitted work.
@@ -87,6 +94,77 @@ func NewManager(r *rig.Rig, g *git.Git, t *tmux.Tmux) *Manager {
 		namePool: pool,
 		tmux:     t,
 	}
+}
+
+// CheckDoltHealth verifies that the Dolt database is reachable before spawning.
+// Returns an error if Dolt exists but is unhealthy after retries.
+// Returns nil if beads is not configured (test/setup environments).
+func (m *Manager) CheckDoltHealth() error {
+	var lastErr error
+	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
+		// Use a lightweight beads operation to verify Dolt is responsive
+		_, err := m.beads.Show("__health_check_nonexistent__")
+		if err == nil || errors.Is(err, beads.ErrNotFound) || strings.Contains(err.Error(), "not found") {
+			// Dolt is healthy — a "not found" error means the DB responded
+			return nil
+		}
+		// If beads isn't configured at all, skip the health check
+		if strings.Contains(err.Error(), "does not exist") || errors.Is(err, beads.ErrNotInstalled) {
+			return nil
+		}
+		lastErr = err
+		if attempt < doltMaxRetries {
+			backoff := time.Duration(attempt) * doltBaseBackoff
+			fmt.Printf("Warning: Dolt health check attempt %d failed, retrying in %v...\n", attempt, backoff)
+			time.Sleep(backoff)
+		}
+	}
+	return fmt.Errorf("%w: %v", ErrDoltUnhealthy, lastErr)
+}
+
+// createAgentBeadWithRetry wraps CreateOrReopenAgentBead with retry logic.
+// For transient Dolt failures (server exists but write fails), retries with backoff
+// and fails hard — a polecat without an agent bead is untrackable.
+// If beads is not configured (no .beads directory), warns and returns nil
+// since this indicates a test/setup environment, not a Dolt failure.
+func (m *Manager) createAgentBeadWithRetry(agentID string, fields *beads.AgentFields) error {
+	var lastErr error
+	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
+		_, err := m.beads.CreateOrReopenAgentBead(agentID, agentID, fields)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		// If beads directory doesn't exist, this is a test/setup env — warn only
+		if strings.Contains(err.Error(), "does not exist") || errors.Is(err, beads.ErrNotInstalled) {
+			fmt.Printf("Warning: could not create agent bead (beads not configured): %v\n", err)
+			return nil
+		}
+		if attempt < doltMaxRetries {
+			backoff := time.Duration(attempt) * doltBaseBackoff
+			fmt.Printf("Warning: agent bead creation attempt %d failed, retrying in %v: %v\n", attempt, backoff, err)
+			time.Sleep(backoff)
+		}
+	}
+	return fmt.Errorf("creating agent bead after %d attempts: %w", doltMaxRetries, lastErr)
+}
+
+// SetAgentStateWithRetry wraps SetAgentState with retry logic.
+func (m *Manager) SetAgentStateWithRetry(name string, state string) error {
+	var lastErr error
+	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
+		err := m.SetAgentState(name, state)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < doltMaxRetries {
+			backoff := time.Duration(attempt) * doltBaseBackoff
+			fmt.Printf("Warning: SetAgentState attempt %d failed, retrying in %v: %v\n", attempt, backoff, err)
+			time.Sleep(backoff)
+		}
+	}
+	return fmt.Errorf("setting agent state after %d attempts: %w", doltMaxRetries, lastErr)
 }
 
 // assigneeID returns the beads assignee identifier for a polecat.
@@ -464,16 +542,17 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (*Polecat, error)
 	// State starts as "spawning" - will be updated to "working" when Claude starts.
 	// HookBead is set atomically at creation time if provided (avoids cross-beads routing issues).
 	// Uses CreateOrReopenAgentBead to handle re-spawning with same name (GH #332).
+	// Retries with backoff — a polecat without an agent bead is untrackable (gt-94llt7).
 	agentID := m.agentBeadID(name)
-	_, err = m.beads.CreateOrReopenAgentBead(agentID, agentID, &beads.AgentFields{
+	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
 		RoleType:   "polecat",
 		Rig:        m.rig.Name,
 		AgentState: "spawning",
 		HookBead:   opts.HookBead, // Set atomically at spawn time
-	})
-	if err != nil {
-		// Non-fatal - log warning but continue
-		fmt.Printf("Warning: could not create agent bead: %v\n", err)
+	}); err != nil {
+		// Hard fail — an untrackable polecat is worse than no polecat
+		cleanupOnError()
+		return nil, fmt.Errorf("agent bead required for polecat tracking: %w", err)
 	}
 
 	// Return polecat with working state (transient model: polecats are spawned with work)
@@ -865,14 +944,17 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 	// Create or reopen agent bead for ZFC compliance
 	// HookBead is set atomically at recreation time if provided.
 	// Uses CreateOrReopenAgentBead to handle re-spawning with same name (GH #332).
-	_, err = m.beads.CreateOrReopenAgentBead(agentID, agentID, &beads.AgentFields{
+	// Retries with backoff — a polecat without an agent bead is untrackable (gt-94llt7).
+	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
 		RoleType:   "polecat",
 		Rig:        m.rig.Name,
 		AgentState: "spawning",
 		HookBead:   opts.HookBead, // Set atomically at spawn time
-	})
-	if err != nil {
-		fmt.Printf("Warning: could not create agent bead: %v\n", err)
+	}); err != nil {
+		// Hard fail — clean up the new worktree since we can't track this polecat
+		_ = repoGit.WorktreeRemove(newClonePath, true)
+		_ = os.RemoveAll(newClonePath)
+		return nil, fmt.Errorf("agent bead required for polecat tracking: %w", err)
 	}
 
 	// Return fresh polecat in working state (transient model: polecats are spawned with work)

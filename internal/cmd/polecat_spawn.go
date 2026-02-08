@@ -81,6 +81,12 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	t := tmux.NewTmux()
 	polecatMgr := polecat.NewManager(r, polecatGit, t)
 
+	// Pre-spawn Dolt health check (gt-94llt7): verify Dolt is reachable before
+	// allocating a polecat. Prevents orphaned polecats when Dolt is down.
+	if err := polecatMgr.CheckDoltHealth(); err != nil {
+		return nil, fmt.Errorf("pre-spawn health check failed: %w", err)
+	}
+
 	// Allocate a new polecat name
 	polecatName, err := polecatMgr.AllocateName()
 	if err != nil {
@@ -229,11 +235,11 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 		fmt.Printf("Warning: runtime may not be fully ready: %v\n", err)
 	}
 
-	// Update agent state
+	// Update agent state with retry logic (gt-94llt7: fail-safe Dolt writes)
 	polecatGit := git.NewGit(r.Path)
 	polecatMgr := polecat.NewManager(r, polecatGit, t)
-	if err := polecatMgr.SetAgentState(s.PolecatName, "working"); err != nil {
-		fmt.Printf("Warning: could not update agent state: %v\n", err)
+	if err := polecatMgr.SetAgentStateWithRetry(s.PolecatName, "working"); err != nil {
+		fmt.Printf("Warning: could not update agent state after retries: %v\n", err)
 	}
 
 	// Update issue status from hooked to in_progress
