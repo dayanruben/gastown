@@ -382,9 +382,10 @@ func (m *DoltServerManager) maybeResetBackoff() {
 			m.restartTimes = nil
 			m.escalated = false
 		}
+		// Reset the healthy timestamp after a successful reset so the next
+		// reset interval is measured from now, not from the original detection.
+		m.lastHealthyTime = now
 	}
-	// Update last healthy time on every successful health check
-	m.lastHealthyTime = now
 }
 
 // sendEscalationMail sends a mail to the mayor when the Dolt server has

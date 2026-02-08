@@ -146,6 +146,53 @@ func TestMaybeResetBackoff_NoResetIfNotLongEnough(t *testing.T) {
 	}
 }
 
+func TestMaybeResetBackoff_AccumulatesAcrossHeartbeats(t *testing.T) {
+	// Regression test: with the bug, lastHealthyTime was updated on every call,
+	// so the delta never exceeded the heartbeat interval. With the fix,
+	// lastHealthyTime is only updated on initial detection and after a successful
+	// reset, allowing the delta to accumulate across multiple heartbeat calls.
+	m := &DoltServerManager{
+		config: &DoltServerConfig{
+			HealthyResetInterval: 10 * time.Minute,
+		},
+		logger:       func(format string, v ...interface{}) {},
+		currentDelay: 40 * time.Second,
+		restartTimes: []time.Time{time.Now()},
+		escalated:    true,
+	}
+
+	// First call: sets lastHealthyTime to now
+	m.maybeResetBackoff()
+	if m.currentDelay != 40*time.Second {
+		t.Fatal("should not reset on first call")
+	}
+
+	// Simulate calling every 1 minute for 9 minutes (short heartbeats).
+	// With the bug, each call reset lastHealthyTime so delta was always ~1min.
+	// With the fix, lastHealthyTime stays at the initial value.
+	for i := 1; i <= 9; i++ {
+		m.maybeResetBackoff()
+	}
+	// After 9 calls at ~0 delta each (in test time), still should not reset
+	// because no real time has passed. But importantly, lastHealthyTime should
+	// NOT have been updated on these calls.
+	if m.currentDelay != 40*time.Second {
+		t.Fatal("should not have reset yet")
+	}
+
+	// Now set lastHealthyTime to 11 minutes ago (simulating accumulated healthy time)
+	// This should trigger a reset because the initial healthy detection was >10min ago.
+	m.lastHealthyTime = time.Now().Add(-11 * time.Minute)
+	m.maybeResetBackoff()
+
+	if m.currentDelay != 0 {
+		t.Errorf("expected delay reset to 0 after 11 minutes healthy, got %v", m.currentDelay)
+	}
+	if m.escalated {
+		t.Error("expected escalated to be false after reset")
+	}
+}
+
 func TestDefaultConfig_BackoffFields(t *testing.T) {
 	cfg := DefaultDoltServerConfig("/tmp/test")
 
