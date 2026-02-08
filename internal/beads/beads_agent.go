@@ -13,7 +13,7 @@ import (
 // This is needed when the agent bead was created via routing to a different
 // database than the Beads wrapper's default directory.
 func runSlotSet(workDir, beadID, slotName, slotValue string) error {
-	cmd := exec.Command("bd", "slot", "set", beadID, slotName, slotValue)
+	cmd := exec.Command("bd", "--no-daemon", "--allow-stale", "slot", "set", beadID, slotName, slotValue) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = workDir
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s: %w", strings.TrimSpace(string(output)), err)
@@ -23,7 +23,7 @@ func runSlotSet(workDir, beadID, slotName, slotValue string) error {
 
 // runSlotClear runs `bd slot clear` from a specific directory.
 func runSlotClear(workDir, beadID, slotName string) error {
-	cmd := exec.Command("bd", "slot", "clear", beadID, slotName)
+	cmd := exec.Command("bd", "--no-daemon", "--allow-stale", "slot", "clear", beadID, slotName) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = workDir
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s: %w", strings.TrimSpace(string(output)), err)

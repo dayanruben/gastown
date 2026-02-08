@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -105,6 +107,9 @@ This command will:
 2. Move them to .dolt-data/<rigname>/
 3. Remove the old empty directories
 
+Use --dry-run to preview what would be moved (source/target paths and sizes)
+without making any changes.
+
 After migration, start the server with 'gt dolt start'.`,
 	RunE: runDoltMigrate,
 }
@@ -124,9 +129,33 @@ Safe to run multiple times (idempotent). Preserves any existing fields in metada
 	RunE: runDoltFixMetadata,
 }
 
+var doltRollbackCmd = &cobra.Command{
+	Use:   "rollback [backup-dir]",
+	Short: "Restore .beads directories from a migration backup",
+	Long: `Roll back a migration by restoring .beads directories from a backup.
+
+If no backup directory is specified, the most recent migration-backup-TIMESTAMP/
+directory is used automatically.
+
+This command will:
+1. Stop the Dolt server if running
+2. Find the specified (or most recent) backup
+3. Restore all .beads directories from the backup
+4. Reset metadata.json files to their pre-migration state
+5. Validate the restored state with bd list
+
+The backup directory is expected to be in the format created by the migration
+formula's backup step (migration-backup-YYYYMMDD-HHMMSS/).`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runDoltRollback,
+}
+
 var (
-	doltLogLines  int
-	doltLogFollow bool
+	doltLogLines     int
+	doltLogFollow    bool
+	doltMigrateDry   bool
+	doltRollbackDry  bool
+	doltRollbackList bool
 )
 
 func init() {
@@ -139,9 +168,15 @@ func init() {
 	doltCmd.AddCommand(doltListCmd)
 	doltCmd.AddCommand(doltMigrateCmd)
 	doltCmd.AddCommand(doltFixMetadataCmd)
+	doltCmd.AddCommand(doltRollbackCmd)
 
 	doltLogsCmd.Flags().IntVarP(&doltLogLines, "lines", "n", 50, "Number of lines to show")
 	doltLogsCmd.Flags().BoolVarP(&doltLogFollow, "follow", "f", false, "Follow log output")
+
+	doltMigrateCmd.Flags().BoolVar(&doltMigrateDry, "dry-run", false, "Preview what would be migrated without making changes")
+
+	doltRollbackCmd.Flags().BoolVar(&doltRollbackDry, "dry-run", false, "Show what would be restored without making changes")
+	doltRollbackCmd.Flags().BoolVar(&doltRollbackList, "list", false, "List available backups and exit")
 
 	rootCmd.AddCommand(doltCmd)
 }
@@ -375,7 +410,16 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	// Check if server is running - must stop first
+	// Check if daemon is running - must stop first to avoid race conditions.
+	// The daemon spawns many bd processes via gt status heartbeats. If these
+	// run concurrently with migration, race conditions occur between old
+	// SQLite and new Dolt backends.
+	daemonRunning, _, _ := daemon.IsRunning(townRoot)
+	if daemonRunning {
+		return fmt.Errorf("Gas Town daemon is running. Stop it first with: gt daemon stop\n\nThe daemon spawns bd processes that can race with migration.\nStop the daemon, run migration, then restart it.")
+	}
+
+	// Check if Dolt server is running - must stop first
 	running, _, _ := doltserver.IsRunning(townRoot)
 	if running {
 		return fmt.Errorf("Dolt server is running. Stop it first with: gt dolt stop")
@@ -390,8 +434,14 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Found %d database(s) to migrate:\n\n", len(migrations))
 	for _, m := range migrations {
-		fmt.Printf("  %s\n", m.SourcePath)
+		sizeStr := dirSizeHuman(m.SourcePath)
+		fmt.Printf("  %s (%s)\n", m.SourcePath, sizeStr)
 		fmt.Printf("    → %s\n\n", m.TargetPath)
+	}
+
+	if doltMigrateDry {
+		fmt.Println("Dry run: no changes made.")
+		return nil
 	}
 
 	// Perform migrations
@@ -413,9 +463,38 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\n%s Migration complete.\n", style.Bold.Render("✓"))
-	fmt.Printf("\nStart server with: %s\n", style.Dim.Render("gt dolt start"))
+
+	// Auto-start the Dolt server to prevent split-brain risk.
+	// If bd commands are run before the server starts, they may silently create
+	// isolated local databases instead of connecting to the centralized server.
+	fmt.Printf("\nStarting Dolt server to prevent split-brain risk...\n")
+	if err := doltserver.Start(townRoot); err != nil {
+		fmt.Printf("\n%s Could not auto-start Dolt server: %v\n", style.Bold.Render("⚠"), err)
+		fmt.Printf("\n%s WARNING: Do NOT run bd commands until the server is started!\n", style.Bold.Render("⚠"))
+		fmt.Printf("  Running bd before 'gt dolt start' risks split-brain: bd may create an\n")
+		fmt.Printf("  isolated local database instead of connecting to the centralized server.\n")
+		fmt.Printf("\n  Start manually with: %s\n", style.Dim.Render("gt dolt start"))
+	} else {
+		state, _ := doltserver.LoadState(townRoot)
+		fmt.Printf("%s Dolt server started (PID %d)\n", style.Bold.Render("✓"), state.PID)
+	}
 
 	return nil
+}
+
+// dirSizeHuman returns a human-readable size string for a directory tree.
+func dirSizeHuman(path string) string {
+	var total int64
+	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // skip errors
+		}
+		if !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return formatBytes(total)
 }
 
 func runDoltFixMetadata(cmd *cobra.Command, args []string) error {
@@ -445,4 +524,181 @@ func runDoltFixMetadata(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func runDoltRollback(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Find available backups
+	backups, err := doltserver.FindBackups(townRoot)
+	if err != nil {
+		return fmt.Errorf("finding backups: %w", err)
+	}
+
+	if len(backups) == 0 {
+		return fmt.Errorf("no migration backups found in %s\nExpected directories matching: migration-backup-YYYYMMDD-HHMMSS/", townRoot)
+	}
+
+	// List mode: show available backups and exit
+	if doltRollbackList {
+		fmt.Printf("Available migration backups in %s:\n\n", townRoot)
+		for i, b := range backups {
+			label := ""
+			if i == 0 {
+				label = " (most recent)"
+			}
+			fmt.Printf("  %s%s\n", b.Timestamp, label)
+			fmt.Printf("    %s\n", style.Dim.Render(b.Path))
+			if b.Metadata != nil {
+				if createdAt, ok := b.Metadata["created_at"]; ok {
+					fmt.Printf("    Created: %v\n", createdAt)
+				}
+			}
+		}
+		return nil
+	}
+
+	// Determine which backup to use
+	var backupPath string
+	if len(args) > 0 {
+		// User specified a backup directory
+		backupPath = args[0]
+		// Check if it's a relative path or timestamp
+		if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+			// Try as a timestamp suffix
+			candidate := fmt.Sprintf("migration-backup-%s", args[0])
+			candidatePath := fmt.Sprintf("%s/%s", townRoot, candidate)
+			if _, err := os.Stat(candidatePath); err == nil {
+				backupPath = candidatePath
+			} else {
+				return fmt.Errorf("backup not found: %s\nUse --list to see available backups", args[0])
+			}
+		}
+	} else {
+		// Use the most recent backup
+		backupPath = backups[0].Path
+	}
+
+	fmt.Printf("Backup: %s\n", backupPath)
+
+	// Dry-run mode: show what would be restored
+	if doltRollbackDry {
+		fmt.Printf("\n%s Dry run - no changes will be made\n\n", style.Bold.Render("!"))
+		printBackupContents(backupPath, townRoot)
+		return nil
+	}
+
+	// Stop Dolt server if running
+	running, _, _ := doltserver.IsRunning(townRoot)
+	if running {
+		fmt.Println("Stopping Dolt server...")
+		if err := doltserver.Stop(townRoot); err != nil {
+			return fmt.Errorf("stopping Dolt server: %w", err)
+		}
+		fmt.Printf("%s Dolt server stopped\n", style.Bold.Render("✓"))
+	}
+
+	// Perform the rollback
+	fmt.Println("\nRestoring from backup...")
+	result, err := doltserver.RestoreFromBackup(townRoot, backupPath)
+	if err != nil {
+		return fmt.Errorf("rollback failed: %w", err)
+	}
+
+	// Report results
+	fmt.Println()
+	if result.RestoredTown {
+		fmt.Printf("  %s Restored town-level .beads\n", style.Bold.Render("✓"))
+	}
+	for _, rig := range result.RestoredRigs {
+		fmt.Printf("  %s Restored %s/.beads\n", style.Bold.Render("✓"), rig)
+	}
+	for _, rig := range result.SkippedRigs {
+		fmt.Printf("  %s Skipped %s (restore failed)\n", style.Dim.Render("⚠"), rig)
+	}
+
+	if len(result.MetadataReset) > 0 {
+		fmt.Printf("\n  Metadata reset for: %s\n", strings.Join(result.MetadataReset, ", "))
+	}
+
+	// Validate restored state
+	fmt.Println("\nValidating restored state...")
+	validateCmd := exec.Command("bd", "list", "--limit", "5")
+	validateCmd.Dir = townRoot
+	output, validateErr := validateCmd.CombinedOutput()
+	if validateErr != nil {
+		fmt.Printf("  %s bd list returned an error (this may be expected if reverting to SQLite): %v\n",
+			style.Dim.Render("⚠"), validateErr)
+		if len(output) > 0 {
+			fmt.Printf("  %s\n", string(output))
+		}
+	} else {
+		fmt.Printf("  %s bd list succeeded\n", style.Bold.Render("✓"))
+		if len(output) > 0 {
+			// Show first few lines of output
+			lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+			for _, line := range lines {
+				fmt.Printf("  %s\n", style.Dim.Render(line))
+			}
+		}
+	}
+
+	fmt.Printf("\n%s Rollback complete from %s\n", style.Bold.Render("✓"), backupPath)
+
+	return nil
+}
+
+// printBackupContents shows what's in a backup directory for dry-run output.
+func printBackupContents(backupPath, townRoot string) {
+	// Check town-level backup
+	townBackup := fmt.Sprintf("%s/town-beads", backupPath)
+	if _, err := os.Stat(townBackup); err == nil {
+		dst := fmt.Sprintf("%s/.beads", townRoot)
+		fmt.Printf("  Would restore: %s\n", style.Dim.Render(dst))
+		fmt.Printf("    From: %s\n", style.Dim.Render(townBackup))
+	}
+
+	// Check formula-style rig backups
+	entries, err := os.ReadDir(backupPath)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if name == "town-beads" || name == "rigs" {
+			continue
+		}
+		if strings.HasSuffix(name, "-beads") {
+			rigName := strings.TrimSuffix(name, "-beads")
+			dst := fmt.Sprintf("%s/%s/.beads", townRoot, rigName)
+			src := fmt.Sprintf("%s/%s", backupPath, name)
+			fmt.Printf("  Would restore: %s\n", style.Dim.Render(dst))
+			fmt.Printf("    From: %s\n", style.Dim.Render(src))
+		}
+	}
+
+	// Check test-backup-style rig backups
+	rigsDir := fmt.Sprintf("%s/rigs", backupPath)
+	if rigEntries, err := os.ReadDir(rigsDir); err == nil {
+		for _, entry := range rigEntries {
+			if !entry.IsDir() {
+				continue
+			}
+			rigName := entry.Name()
+			beadsDir := fmt.Sprintf("%s/%s/.beads", rigsDir, rigName)
+			if _, err := os.Stat(beadsDir); err != nil {
+				continue
+			}
+			dst := fmt.Sprintf("%s/%s/.beads", townRoot, rigName)
+			fmt.Printf("  Would restore: %s\n", style.Dim.Render(dst))
+			fmt.Printf("    From: %s\n", style.Dim.Render(beadsDir))
+		}
+	}
 }

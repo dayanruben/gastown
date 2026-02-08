@@ -694,6 +694,7 @@ func (r *Router) sendToGroup(msg *Message) error {
 		// Create a copy of the message for this recipient
 		msgCopy := *msg
 		msgCopy.To = recipient
+		msgCopy.ID = "" // Each fan-out copy gets its own ID from bd create
 
 		if err := r.sendToSingle(&msgCopy); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", recipient, err))
@@ -821,7 +822,7 @@ func (r *Router) sendToSingle(msg *Message) error {
 
 // sendToList expands a mailing list and sends individual copies to each recipient.
 // Each recipient gets their own message copy with the same content.
-// Returns a ListDeliveryResult with details about the fan-out.
+// Collects all delivery errors and reports partial failures.
 func (r *Router) sendToList(msg *Message) error {
 	listName := parseListName(msg.To)
 	recipients, err := r.expandList(listName)
@@ -829,24 +830,21 @@ func (r *Router) sendToList(msg *Message) error {
 		return err
 	}
 
-	// Send to each recipient
-	var lastErr error
-	successCount := 0
+	// Fan-out: send a copy to each recipient, collecting all errors
+	var errs []string
 	for _, recipient := range recipients {
 		// Create a copy of the message for this recipient
-		copy := *msg
-		copy.To = recipient
+		msgCopy := *msg
+		msgCopy.To = recipient
+		msgCopy.ID = "" // Each fan-out copy gets its own ID from bd create
 
-		if err := r.Send(&copy); err != nil {
-			lastErr = err
-			continue
+		if err := r.Send(&msgCopy); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", recipient, err))
 		}
-		successCount++
 	}
 
-	// If all sends failed, return the last error
-	if successCount == 0 && lastErr != nil {
-		return fmt.Errorf("sending to list %s: %w", listName, lastErr)
+	if len(errs) > 0 {
+		return fmt.Errorf("sending to list %s: some deliveries failed: %s", listName, strings.Join(errs, "; "))
 	}
 
 	return nil
@@ -1078,6 +1076,7 @@ func (r *Router) sendToChannel(msg *Message) error {
 
 	// Fan-out delivery: send a copy to each subscriber's inbox
 	if len(fields.Subscribers) > 0 {
+		var errs []string
 		for _, subscriber := range fields.Subscribers {
 			// Skip self-delivery (don't notify the sender)
 			if isSelfMail(msg.From, subscriber) {
@@ -1087,10 +1086,15 @@ func (r *Router) sendToChannel(msg *Message) error {
 			// Create a copy for this subscriber with channel context in subject
 			msgCopy := *msg
 			msgCopy.To = subscriber
+			msgCopy.ID = "" // Each fan-out copy gets its own ID from bd create
 			msgCopy.Subject = fmt.Sprintf("[channel:%s] %s", channelName, msg.Subject)
 
-			// Best-effort delivery - don't fail the channel send if one subscriber fails
-			_ = r.sendToSingle(&msgCopy)
+			if err := r.sendToSingle(&msgCopy); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", subscriber, err))
+			}
+		}
+		if len(errs) > 0 {
+			return fmt.Errorf("channel %s: some subscriber deliveries failed: %s", channelName, strings.Join(errs, "; "))
 		}
 	}
 

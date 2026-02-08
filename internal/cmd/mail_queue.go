@@ -95,29 +95,56 @@ func runMailClaim(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Pick the oldest unclaimed message (first in list, sorted by created)
-	oldest := messages[0]
+	// Try to claim messages in order. Post-claim verification prevents the
+	// TOCTOU race where two workers list the same unclaimed message and both
+	// attempt to claim it. After writing our claim labels we re-read the
+	// message; if someone else's claimed-by label is present instead, we lost
+	// the race and move on to the next candidate.
+	var claimed *queueMessage
+	for i := range messages {
+		candidate := &messages[i]
 
-	// Claim the message: add claimed-by and claimed-at labels
-	if err := claimQueueMessage(beadsDir, oldest.ID, caller); err != nil {
-		return fmt.Errorf("claiming message: %w", err)
+		// Attempt to claim: add claimed-by and claimed-at labels
+		if err := claimQueueMessage(beadsDir, candidate.ID, caller); err != nil {
+			return fmt.Errorf("claiming message: %w", err)
+		}
+
+		// Post-claim verification: re-read and confirm we won the race
+		info, err := getQueueMessageInfo(beadsDir, candidate.ID)
+		if err != nil {
+			return fmt.Errorf("verifying claim: %w", err)
+		}
+
+		if info.ClaimedBy == caller {
+			claimed = candidate
+			break
+		}
+
+		// Another worker claimed it first — remove our stale labels and try next
+		_ = releaseQueueMessage(beadsDir, candidate.ID, caller)
+	}
+
+	if claimed == nil {
+		fmt.Printf("%s No messages to claim in queue %s (all contested)\n",
+			style.Dim.Render("○"), queueName)
+		return nil
 	}
 
 	// Print claimed message details
 	fmt.Printf("%s Claimed message from queue %s\n", style.Bold.Render("✓"), queueName)
-	fmt.Printf("  ID: %s\n", oldest.ID)
-	fmt.Printf("  Subject: %s\n", oldest.Title)
-	if oldest.Description != "" {
+	fmt.Printf("  ID: %s\n", claimed.ID)
+	fmt.Printf("  Subject: %s\n", claimed.Title)
+	if claimed.Description != "" {
 		// Show first line of description
-		lines := strings.SplitN(oldest.Description, "\n", 2)
+		lines := strings.SplitN(claimed.Description, "\n", 2)
 		preview := lines[0]
 		if len(preview) > 80 {
 			preview = preview[:77] + "..."
 		}
 		fmt.Printf("  Preview: %s\n", style.Dim.Render(preview))
 	}
-	fmt.Printf("  From: %s\n", oldest.From)
-	fmt.Printf("  Created: %s\n", oldest.Created.Format("2006-01-02 15:04"))
+	fmt.Printf("  From: %s\n", claimed.From)
+	fmt.Printf("  Created: %s\n", claimed.Created.Format("2006-01-02 15:04"))
 
 	return nil
 }

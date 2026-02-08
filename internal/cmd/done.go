@@ -124,10 +124,24 @@ func runDone(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Find current rig
-	rigName, _, err := findCurrentRig(townRoot)
-	if err != nil {
-		return err
+	// Find current rig - use cwd (which has fallback for deleted worktrees)
+	// instead of findCurrentRig which calls os.Getwd() and fails on deleted cwd
+	var rigName string
+	if cwd != "" {
+		relPath, err := filepath.Rel(townRoot, cwd)
+		if err == nil {
+			parts := strings.Split(relPath, string(filepath.Separator))
+			if len(parts) > 0 && parts[0] != "" && parts[0] != "." {
+				rigName = parts[0]
+			}
+		}
+	}
+	if rigName == "" {
+		// Last resort: try GT_RIG env var
+		rigName = os.Getenv("GT_RIG")
+	}
+	if rigName == "" {
+		return fmt.Errorf("cannot determine current rig (working directory may be deleted)")
 	}
 
 	// Initialize git - use cwd if available, otherwise use rig's mayor clone

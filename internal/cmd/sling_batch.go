@@ -7,8 +7,14 @@ import (
 	"path/filepath"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // runBatchSling handles slinging multiple beads to a rig.
@@ -59,9 +65,9 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 			continue
 		}
 
-		if info.Status == "pinned" && !slingForce {
-			results = append(results, slingResult{beadID: beadID, success: false, errMsg: "already pinned"})
-			fmt.Printf("  %s Already pinned (use --force to re-sling)\n", style.Dim.Render("✗"))
+		if (info.Status == "pinned" || info.Status == "hooked") && !slingForce {
+			results = append(results, slingResult{beadID: beadID, success: false, errMsg: "already " + info.Status})
+			fmt.Printf("  %s Already %s (use --force to re-sling)\n", style.Dim.Render("✗"), info.Status)
 			continue
 		}
 
@@ -130,6 +136,8 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		if err := hookCmd.Run(); err != nil {
 			results = append(results, slingResult{beadID: beadID, polecat: spawnInfo.PolecatName, success: false, errMsg: "hook failed"})
 			fmt.Printf("  %s Failed to hook bead: %v\n", style.Dim.Render("✗"), err)
+			// Clean up orphaned polecat to avoid leaving spawned-but-unhookable polecats
+			cleanupSpawnedPolecat(spawnInfo, rigName)
 			continue
 		}
 
@@ -141,6 +149,18 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 
 		// Update agent bead state
 		updateAgentHookBead(targetAgent, beadToHook, hookWorkDir, townBeadsDir)
+
+		// Store dispatcher in bead (enables completion notification to dispatcher)
+		if err := storeDispatcherInBead(beadID, actor); err != nil {
+			fmt.Printf("  %s Could not store dispatcher in bead: %v\n", style.Dim.Render("Warning:"), err)
+		}
+
+		// Store no_merge flag in bead (skips merge queue on completion)
+		if slingNoMerge {
+			if err := storeNoMergeInBead(beadID, true); err != nil {
+				fmt.Printf("  %s Could not store no_merge in bead: %v\n", style.Dim.Render("Warning:"), err)
+			}
+		}
 
 		// Store attached molecule in the hooked bead
 		if attachedMoleculeID != "" {
@@ -156,13 +176,16 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 			}
 		}
 
-		// Nudge the polecat
-		if spawnInfo.Pane != "" {
-			if err := injectStartPrompt(spawnInfo.Pane, beadID, slingSubject, slingArgs); err != nil {
-				fmt.Printf("  %s Could not nudge (agent will discover via gt prime)\n", style.Dim.Render("○"))
-			} else {
-				fmt.Printf("  %s Start prompt sent\n", style.Bold.Render("▶"))
-			}
+		// Start polecat session now that molecule/bead is attached.
+		// This ensures polecat sees its work when gt prime runs on session start.
+		pane, err := spawnInfo.StartSession()
+		if err != nil {
+			fmt.Printf("  %s Could not start session: %v (agent will need manual start)\n", style.Dim.Render("✗"), err)
+		} else {
+			fmt.Printf("  %s Session started for %s\n", style.Bold.Render("▶"), spawnInfo.PolecatName)
+			// Fresh polecats get StartupNudge from SessionManager.Start(),
+			// so no need to inject a start prompt here.
+			_ = pane
 		}
 
 		results = append(results, slingResult{beadID: beadID, polecat: spawnInfo.PolecatName, success: true})
@@ -190,4 +213,34 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 	}
 
 	return nil
+}
+
+// cleanupSpawnedPolecat removes a polecat that was spawned but whose hook failed,
+// preventing orphaned polecats from accumulating.
+func cleanupSpawnedPolecat(spawnInfo *SpawnedPolecatInfo, rigName string) {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return
+	}
+	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigsConfig, err := config.LoadRigsConfig(rigsConfigPath)
+	if err != nil {
+		return
+	}
+	g := git.NewGit(townRoot)
+	rigMgr := rig.NewManager(townRoot, rigsConfig, g)
+	r, err := rigMgr.GetRig(rigName)
+	if err != nil {
+		return
+	}
+	polecatGit := git.NewGit(r.Path)
+	t := tmux.NewTmux()
+	polecatMgr := polecat.NewManager(r, polecatGit, t)
+	if err := polecatMgr.Remove(spawnInfo.PolecatName, true); err != nil {
+		fmt.Printf("  %s Could not clean up orphaned polecat %s: %v\n",
+			style.Dim.Render("Warning:"), spawnInfo.PolecatName, err)
+	} else {
+		fmt.Printf("  %s Cleaned up orphaned polecat %s\n",
+			style.Dim.Render("○"), spawnInfo.PolecatName)
+	}
 }

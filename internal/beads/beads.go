@@ -443,8 +443,7 @@ func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
 	args := append([]string{"show", "--json"}, ids...)
 	out, err := b.run(args...)
 	if err != nil {
-		// If bd fails, return empty map (some IDs might not exist)
-		return make(map[string]*Issue), nil
+		return nil, fmt.Errorf("bd show: %w", err)
 	}
 
 	var issues []*Issue

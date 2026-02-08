@@ -88,7 +88,7 @@ Patrol checks:
 
 Migration readiness checks (--migrate):
   - migration-readiness      Overall migration readiness status
-  - unmigrated-rigs          Detect rigs still using SQLite backend
+  - rig-backend-status       Classify rig backends (never/partially/fully migrated)
 
 Use --fix to attempt automatic fixes for issues that support it.
 Use --rig to check a specific rig instead of the entire workspace.
@@ -215,8 +215,9 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	// Migration readiness checks
 	d.Register(doctor.NewMigrationReadinessCheck())
-	d.Register(doctor.NewUnmigratedRigCheck())
+	d.Register(doctor.NewRigBackendStatusCheck())
 	d.Register(doctor.NewDoltMetadataCheck())
+	d.Register(doctor.NewDoltServerReachableCheck())
 
 	// Rig-specific checks (only when --rig is specified)
 	if doctorRig != "" {
