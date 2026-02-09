@@ -35,9 +35,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -52,6 +54,17 @@ const (
 	DefaultUser           = "root" // Default Dolt user (no password for local access)
 	DefaultMaxConnections = 50     // Conservative default to prevent connection storms
 )
+
+// metadataMu provides per-path mutexes for EnsureMetadata goroutine synchronization.
+// flock is inter-process only and cannot reliably synchronize goroutines within the
+// same process (the same process may acquire the same flock twice without blocking).
+var metadataMu sync.Map // map[string]*sync.Mutex
+
+// getMetadataMu returns a mutex for the given metadata file path, creating one if needed.
+func getMetadataMu(path string) *sync.Mutex {
+	mu, _ := metadataMu.LoadOrStore(path, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
 
 // Config holds Dolt server configuration.
 type Config struct {
@@ -236,7 +249,7 @@ func HasServerModeMetadata(townRoot string) []string {
 	}
 
 	for rigName := range config.Rigs {
-		beadsDir := findRigBeadsDir(townRoot, rigName)
+		beadsDir := FindRigBeadsDir(townRoot, rigName)
 		if beadsDir != "" && hasServerMode(beadsDir) {
 			serverRigs = append(serverRigs, rigName)
 		}
@@ -555,9 +568,12 @@ func ListDatabases(townRoot string) ([]string, error) {
 }
 
 // InitRig initializes a new rig database in the data directory.
-func InitRig(townRoot, rigName string) error {
+// If the Dolt server is running, it executes CREATE DATABASE to register the
+// database with the live server (avoiding the need for a restart).
+// Returns true if the database was registered with a running server.
+func InitRig(townRoot, rigName string) (serverWasRunning bool, err error) {
 	if rigName == "" {
-		return fmt.Errorf("rig name cannot be empty")
+		return false, fmt.Errorf("rig name cannot be empty")
 	}
 
 	config := DefaultConfig(townRoot)
@@ -565,28 +581,39 @@ func InitRig(townRoot, rigName string) error {
 	// Validate rig name (simple alphanumeric + underscore/dash)
 	for _, r := range rigName {
 		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-') {
-			return fmt.Errorf("invalid rig name %q: must contain only alphanumeric, underscore, or dash", rigName)
+			return false, fmt.Errorf("invalid rig name %q: must contain only alphanumeric, underscore, or dash", rigName)
 		}
 	}
 
 	rigDir := filepath.Join(config.DataDir, rigName)
 
-	// Check if already exists
+	// Check if already exists on disk
 	if _, err := os.Stat(filepath.Join(rigDir, ".dolt")); err == nil {
-		return fmt.Errorf("rig database %q already exists at %s", rigName, rigDir)
+		return false, fmt.Errorf("rig database %q already exists at %s", rigName, rigDir)
 	}
 
-	// Create the rig directory
-	if err := os.MkdirAll(rigDir, 0755); err != nil {
-		return fmt.Errorf("creating rig directory: %w", err)
-	}
+	// Check if server is running
+	running, _, _ := IsRunning(townRoot)
 
-	// Initialize Dolt database
-	cmd := exec.Command("dolt", "init")
-	cmd.Dir = rigDir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("initializing Dolt database: %w\n%s", err, output)
+	if running {
+		// Server is running: use CREATE DATABASE which both creates the
+		// directory and registers the database with the live server.
+		if err := serverExecSQL(townRoot, fmt.Sprintf("CREATE DATABASE `%s`", rigName)); err != nil {
+			return true, fmt.Errorf("creating database on running server: %w", err)
+		}
+	} else {
+		// Server not running: create directory and init manually.
+		// The database will be picked up when the server starts.
+		if err := os.MkdirAll(rigDir, 0755); err != nil {
+			return false, fmt.Errorf("creating rig directory: %w", err)
+		}
+
+		cmd := exec.Command("dolt", "init")
+		cmd.Dir = rigDir
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return false, fmt.Errorf("initializing Dolt database: %w\n%s", err, output)
+		}
 	}
 
 	// Update metadata.json to point to the server
@@ -595,7 +622,7 @@ func InitRig(townRoot, rigName string) error {
 		fmt.Fprintf(os.Stderr, "Warning: database initialized but metadata.json update failed: %v\n", err)
 	}
 
-	return nil
+	return running, nil
 }
 
 // Migration represents a database migration from old to new location.
@@ -694,6 +721,139 @@ func MigrateRigFromBeads(townRoot, rigName, sourcePath string) error {
 	return nil
 }
 
+// DatabaseExists checks whether a rig database exists in the centralized .dolt-data/ directory.
+func DatabaseExists(townRoot, rigName string) bool {
+	config := DefaultConfig(townRoot)
+	doltDir := filepath.Join(config.DataDir, rigName, ".dolt")
+	_, err := os.Stat(doltDir)
+	return err == nil
+}
+
+// BrokenWorkspace represents a workspace whose metadata.json points to a
+// nonexistent database on the Dolt server.
+type BrokenWorkspace struct {
+	// RigName is the rig whose database is missing.
+	RigName string
+
+	// BeadsDir is the path to the .beads directory with the broken metadata.
+	BeadsDir string
+
+	// ConfiguredDB is the dolt_database value from metadata.json.
+	ConfiguredDB string
+
+	// HasLocalData is true if .beads/dolt/<dbname> exists locally and can be migrated.
+	HasLocalData bool
+
+	// LocalDataPath is the path to local Dolt data, if present.
+	LocalDataPath string
+}
+
+// FindBrokenWorkspaces scans all rig metadata.json files for Dolt server
+// configuration where the referenced database doesn't exist in .dolt-data/.
+// These workspaces are broken: bd commands will fail or silently create
+// isolated local databases instead of connecting to the centralized server.
+func FindBrokenWorkspaces(townRoot string) []BrokenWorkspace {
+	var broken []BrokenWorkspace
+
+	// Check town-level beads (hq)
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if ws := checkWorkspace(townRoot, "hq", townBeadsDir); ws != nil {
+		broken = append(broken, *ws)
+	}
+
+	// Check rig-level beads via rigs.json
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	data, err := os.ReadFile(rigsPath)
+	if err != nil {
+		return broken
+	}
+	var config struct {
+		Rigs map[string]interface{} `json:"rigs"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return broken
+	}
+
+	for rigName := range config.Rigs {
+		beadsDir := FindRigBeadsDir(townRoot, rigName)
+		if beadsDir == "" {
+			continue
+		}
+		if ws := checkWorkspace(townRoot, rigName, beadsDir); ws != nil {
+			broken = append(broken, *ws)
+		}
+	}
+
+	return broken
+}
+
+// checkWorkspace checks a single rig's metadata.json for broken Dolt configuration.
+// Returns nil if the workspace is healthy or not configured for Dolt server mode.
+func checkWorkspace(townRoot, rigName, beadsDir string) *BrokenWorkspace {
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return nil
+	}
+
+	var metadata struct {
+		DoltMode     string `json:"dolt_mode"`
+		DoltDatabase string `json:"dolt_database"`
+		Backend      string `json:"backend"`
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil
+	}
+
+	// Only check workspaces configured for Dolt server mode
+	if metadata.DoltMode != "server" || metadata.Backend != "dolt" {
+		return nil
+	}
+
+	dbName := metadata.DoltDatabase
+	if dbName == "" {
+		dbName = rigName
+	}
+
+	// Check if the database actually exists
+	if DatabaseExists(townRoot, dbName) {
+		return nil // healthy
+	}
+
+	ws := &BrokenWorkspace{
+		RigName:      rigName,
+		BeadsDir:     beadsDir,
+		ConfiguredDB: dbName,
+	}
+
+	// Check for local data that could be migrated
+	localDoltPath := filepath.Join(beadsDir, "dolt", "beads")
+	if _, err := os.Stat(filepath.Join(localDoltPath, ".dolt")); err == nil {
+		ws.HasLocalData = true
+		ws.LocalDataPath = localDoltPath
+	}
+
+	return ws
+}
+
+// RepairWorkspace fixes a broken workspace by creating the missing database
+// or migrating local data if present. Returns a description of what was done.
+func RepairWorkspace(townRoot string, ws BrokenWorkspace) (string, error) {
+	if ws.HasLocalData {
+		// Migrate local data to centralized location
+		if err := MigrateRigFromBeads(townRoot, ws.ConfiguredDB, ws.LocalDataPath); err != nil {
+			return "", fmt.Errorf("migrating local data for %s: %w", ws.RigName, err)
+		}
+		return fmt.Sprintf("migrated local data from %s", ws.LocalDataPath), nil
+	}
+
+	// No local data — create a fresh database
+	if _, err := InitRig(townRoot, ws.ConfiguredDB); err != nil {
+		return "", fmt.Errorf("creating database for %s: %w", ws.RigName, err)
+	}
+	return "created new database", nil
+}
+
 // EnsureMetadata writes or updates the metadata.json for a rig's beads directory
 // to include proper Dolt server configuration. This prevents the split-brain problem
 // where bd falls back to local embedded databases instead of connecting to the
@@ -702,12 +862,22 @@ func MigrateRigFromBeads(townRoot, rigName, sourcePath string) error {
 // For the "hq" rig, it writes to <townRoot>/.beads/metadata.json.
 // For other rigs, it writes to <townRoot>/<rigName>/mayor/rig/.beads/metadata.json.
 func EnsureMetadata(townRoot, rigName string) error {
-	beadsDir := findRigBeadsDir(townRoot, rigName)
-	if beadsDir == "" {
-		return fmt.Errorf("could not find .beads directory for rig %q", rigName)
+	// Use FindOrCreateRigBeadsDir to atomically resolve and create the directory,
+	// avoiding the TOCTOU race where the directory state changes between
+	// FindRigBeadsDir's Stat check and our subsequent file operations.
+	beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
+	if err != nil {
+		return fmt.Errorf("resolving beads directory for rig %q: %w", rigName, err)
 	}
 
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
+
+	// Acquire per-path mutex for goroutine synchronization.
+	// EnsureAllMetadata calls EnsureMetadata concurrently; flock (inter-process)
+	// cannot reliably synchronize goroutines within the same process.
+	mu := getMetadataMu(metadataPath)
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Load existing metadata if present (preserve any extra fields)
 	existing := make(map[string]interface{})
@@ -721,19 +891,13 @@ func EnsureMetadata(townRoot, rigName string) error {
 	existing["dolt_mode"] = "server"
 	existing["dolt_database"] = rigName
 
-	// Ensure jsonl_export has a default
-	if _, ok := existing["jsonl_export"]; !ok {
-		existing["jsonl_export"] = "issues.jsonl"
-	}
+	// Always set jsonl_export to the canonical filename.
+	// Historical migrations may have left stale values (e.g., "beads.jsonl").
+	existing["jsonl_export"] = "issues.jsonl"
 
 	data, err := json.MarshalIndent(existing, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling metadata: %w", err)
-	}
-
-	// Ensure directory exists
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		return fmt.Errorf("creating beads directory: %w", err)
 	}
 
 	if err := util.AtomicWriteFile(metadataPath, append(data, '\n'), 0600); err != nil {
@@ -763,11 +927,17 @@ func EnsureAllMetadata(townRoot string) (updated []string, errs []error) {
 	return updated, errs
 }
 
-// findRigBeadsDir returns the canonical .beads directory path for a rig.
+// FindRigBeadsDir returns the .beads directory path for a rig (read-only lookup).
 // For "hq", returns <townRoot>/.beads.
 // For other rigs, returns <townRoot>/<rigName>/mayor/rig/.beads if it exists,
-// otherwise <townRoot>/<rigName>/.beads.
-func findRigBeadsDir(townRoot, rigName string) string {
+// otherwise <townRoot>/<rigName>/.beads if it exists,
+// otherwise <townRoot>/<rigName>/mayor/rig/.beads (for creation by caller).
+//
+// WARNING: This function has a TOCTOU race — the returned directory may change
+// state between the Stat check and the caller's operation. For write operations
+// that need the directory to exist, use FindOrCreateRigBeadsDir instead.
+// For read-only operations, handle errors on the returned path gracefully.
+func FindRigBeadsDir(townRoot, rigName string) string {
 	if rigName == "hq" {
 		return filepath.Join(townRoot, ".beads")
 	}
@@ -786,6 +956,45 @@ func findRigBeadsDir(townRoot, rigName string) string {
 
 	// Neither exists; return mayor path (caller will create it)
 	return mayorBeads
+}
+
+// FindOrCreateRigBeadsDir atomically resolves and ensures the .beads directory
+// exists for a rig. Unlike FindRigBeadsDir, this combines directory resolution
+// with creation to avoid TOCTOU races where the directory state changes between
+// the existence check and the caller's write operation.
+//
+// Use this for write operations (EnsureMetadata, etc.) where the directory must
+// exist. Use FindRigBeadsDir for read-only lookups where graceful failure on
+// missing directories is acceptable.
+func FindOrCreateRigBeadsDir(townRoot, rigName string) (string, error) {
+	if rigName == "hq" {
+		dir := filepath.Join(townRoot, ".beads")
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return "", fmt.Errorf("creating HQ beads dir: %w", err)
+		}
+		return dir, nil
+	}
+
+	// Check mayor/rig/.beads first (canonical location)
+	mayorBeads := filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
+	if _, err := os.Stat(mayorBeads); err == nil {
+		return mayorBeads, nil
+	}
+
+	// Check rig-root .beads
+	rigBeads := filepath.Join(townRoot, rigName, ".beads")
+	if _, err := os.Stat(rigBeads); err == nil {
+		return rigBeads, nil
+	}
+
+	// Neither exists — atomically create the canonical mayor path.
+	// MkdirAll uses mkdir(2) which is atomic per POSIX, so concurrent
+	// callers creating the same path won't race.
+	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+		return "", fmt.Errorf("creating beads dir: %w", err)
+	}
+
+	return mayorBeads, nil
 }
 
 // GetActiveConnectionCount queries the Dolt server to get the number of active connections.
@@ -1001,6 +1210,22 @@ func moveDir(src, dest string) error {
 	return nil
 }
 
+// serverExecSQL executes a SQL statement against the Dolt server without targeting
+// a specific database. Used for server-level commands like CREATE DATABASE.
+func serverExecSQL(townRoot, query string) error {
+	config := DefaultConfig(townRoot)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "dolt", "sql", "-q", query)
+	cmd.Dir = config.DataDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
 // doltSQL executes a SQL statement against a specific rig database on the Dolt server.
 // Uses the dolt CLI from the data directory (auto-detects running server).
 // The USE prefix selects the database since --use-db is not available on all dolt versions.
@@ -1020,6 +1245,24 @@ func doltSQL(townRoot, rigDB, query string) error {
 	return nil
 }
 
+// validBranchNameRe matches only safe branch name characters: alphanumeric, hyphen,
+// underscore, dot, and forward slash. This prevents SQL injection via branch names
+// interpolated into Dolt stored procedure calls.
+var validBranchNameRe = regexp.MustCompile(`^[a-zA-Z0-9._/-]+$`)
+
+// validateBranchName returns an error if branchName contains characters that could
+// break out of SQL string literals. Defense-in-depth: PolecatBranchName generates
+// safe names, but callers accept arbitrary strings.
+func validateBranchName(branchName string) error {
+	if branchName == "" {
+		return fmt.Errorf("branch name must not be empty")
+	}
+	if !validBranchNameRe.MatchString(branchName) {
+		return fmt.Errorf("branch name %q contains invalid characters", branchName)
+	}
+	return nil
+}
+
 // PolecatBranchName returns the Dolt branch name for a polecat.
 // Format: polecat-<name>-<unix-timestamp>
 func PolecatBranchName(polecatName string) string {
@@ -1029,6 +1272,9 @@ func PolecatBranchName(polecatName string) string {
 // CreatePolecatBranch creates a Dolt branch for a polecat's isolated writes.
 // Each polecat gets its own branch to eliminate optimistic lock contention.
 func CreatePolecatBranch(townRoot, rigDB, branchName string) error {
+	if err := validateBranchName(branchName); err != nil {
+		return fmt.Errorf("creating Dolt branch in %s: %w", rigDB, err)
+	}
 	query := fmt.Sprintf("CALL DOLT_BRANCH('%s')", branchName)
 	if err := doltSQL(townRoot, rigDB, query); err != nil {
 		return fmt.Errorf("creating Dolt branch %s in %s: %w", branchName, rigDB, err)
@@ -1039,6 +1285,9 @@ func CreatePolecatBranch(townRoot, rigDB, branchName string) error {
 // MergePolecatBranch merges a polecat's Dolt branch into main and deletes it.
 // Called at gt done time to make the polecat's beads changes visible.
 func MergePolecatBranch(townRoot, rigDB, branchName string) error {
+	if err := validateBranchName(branchName); err != nil {
+		return fmt.Errorf("merging Dolt branch in %s: %w", rigDB, err)
+	}
 	// Checkout main, merge, delete branch — each as separate commands
 	// to avoid multi-statement parsing issues with dolt sql CLI.
 	if err := doltSQL(townRoot, rigDB, "CALL DOLT_CHECKOUT('main')"); err != nil {
@@ -1057,6 +1306,10 @@ func MergePolecatBranch(townRoot, rigDB, branchName string) error {
 // DeletePolecatBranch deletes a polecat's Dolt branch (cleanup/nuke).
 // Best-effort: logs warning if branch doesn't exist or deletion fails.
 func DeletePolecatBranch(townRoot, rigDB, branchName string) {
+	if err := validateBranchName(branchName); err != nil {
+		fmt.Printf("Warning: invalid Dolt branch name %q: %v\n", branchName, err)
+		return
+	}
 	query := fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s')", branchName)
 	if err := doltSQL(townRoot, rigDB, query); err != nil {
 		// Non-fatal: branch may not exist (already merged/deleted)

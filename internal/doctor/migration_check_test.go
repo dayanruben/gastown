@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -563,7 +564,7 @@ func TestDoltMetadataCheck_CorrectMetadata(t *testing.T) {
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	metadata := `{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`
+	metadata := `{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq","jsonl_export":"issues.jsonl"}`
 	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -675,6 +676,67 @@ func TestDoltMetadataCheck_RigWithMayorBeads(t *testing.T) {
 	result = check.Run(ctx)
 	if result.Status != StatusOK {
 		t.Errorf("Expected StatusOK after fix, got %v: %s", result.Status, result.Message)
+	}
+}
+
+func TestDoltMetadataCheck_StaleJsonlExport(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create .dolt-data/hq
+	doltDataDir := filepath.Join(tmpDir, ".dolt-data", "hq", ".dolt")
+	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create .beads with correct dolt config BUT stale jsonl_export
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := `{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq","jsonl_export":"beads.jsonl"}`
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	mayorDir := filepath.Join(tmpDir, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(`{"rigs":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := &CheckContext{TownRoot: tmpDir}
+	check := NewDoltMetadataCheck()
+
+	// Should detect the stale jsonl_export as a problem
+	result := check.Run(ctx)
+	if result.Status != StatusWarning {
+		t.Fatalf("Expected StatusWarning for stale jsonl_export, got %v: %s", result.Status, result.Message)
+	}
+
+	// Fix should correct the jsonl_export value
+	if err := check.Fix(ctx); err != nil {
+		t.Fatalf("Fix failed: %v", err)
+	}
+
+	// Verify the fix corrected jsonl_export
+	result = check.Run(ctx)
+	if result.Status != StatusOK {
+		t.Errorf("Expected StatusOK after fix, got %v: %s", result.Status, result.Message)
+	}
+
+	// Verify the actual file content
+	data, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta["jsonl_export"] != "issues.jsonl" {
+		t.Errorf("jsonl_export = %v, want issues.jsonl", meta["jsonl_export"])
 	}
 }
 

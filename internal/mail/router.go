@@ -584,7 +584,9 @@ func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, 
 		args = append(args, "--desc-contains="+descContains)
 	}
 
-	stdout, err := runBdCommand(args, filepath.Dir(beadsDir), beadsDir)
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	stdout, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
 	if err != nil {
 		return nil, fmt.Errorf("querying agents in %s: %w", beadsDir, err)
 	}
@@ -755,6 +757,11 @@ func (r *Router) validateRecipient(identity string) error {
 
 // sendToSingle sends a message to a single recipient.
 func (r *Router) sendToSingle(msg *Message) error {
+	// Ensure message has an ID (callers may omit it; bd create doesn't generate one)
+	if msg.ID == "" {
+		msg.ID = generateID()
+	}
+
 	// Validate message before sending
 	if err := msg.Validate(); err != nil {
 		return fmt.Errorf("invalid message: %w", err)
@@ -811,7 +818,9 @@ func (r *Router) sendToSingle(msg *Message) error {
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
-	_, err := runBdCommand(args, filepath.Dir(beadsDir), beadsDir)
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	_, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
 	if err != nil {
 		return fmt.Errorf("sending message: %w", err)
 	}
@@ -921,7 +930,9 @@ func (r *Router) sendToQueue(msg *Message) error {
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
-	_, err = runBdCommand(args, filepath.Dir(beadsDir), beadsDir)
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	_, err = runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
 	if err != nil {
 		return fmt.Errorf("sending to queue %s: %w", queueName, err)
 	}
@@ -995,7 +1006,9 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
-	_, err = runBdCommand(args, filepath.Dir(beadsDir), beadsDir)
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	_, err = runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
 	if err != nil {
 		return fmt.Errorf("sending to announce %s: %w", announceName, err)
 	}
@@ -1071,7 +1084,9 @@ func (r *Router) sendToChannel(msg *Message) error {
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
-	_, err = runBdCommand(args, filepath.Dir(beadsDir), beadsDir)
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	_, err = runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
 	if err != nil {
 		return fmt.Errorf("sending to channel %s: %w", channelName, err)
 	}
@@ -1129,7 +1144,9 @@ func (r *Router) pruneAnnounce(announceName string, retainCount int) error {
 		"--asc", // Oldest first
 	}
 
-	stdout, err := runBdCommand(args, filepath.Dir(beadsDir), beadsDir)
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	stdout, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
 	if err != nil {
 		return fmt.Errorf("querying announce messages: %w", err)
 	}
@@ -1154,18 +1171,18 @@ func (r *Router) pruneAnnounce(announceName string, retainCount int) error {
 	for i := 0; i < toDelete && i < len(messages); i++ {
 		deleteArgs := []string{"close", messages[i].ID, "--reason=retention pruning"}
 		// Best-effort deletion - don't fail if one delete fails
-		_, _ = runBdCommand(deleteArgs, filepath.Dir(beadsDir), beadsDir)
+		delCtx, delCancel := bdWriteCtx()
+		_, _ = runBdCommand(delCtx, deleteArgs, filepath.Dir(beadsDir), beadsDir)
+		delCancel()
 	}
 
 	return nil
 }
 
 // isSelfMail returns true if sender and recipient are the same identity.
-// Normalizes addresses by removing trailing slashes for comparison.
+// Uses AddressToIdentity for canonical normalization (handles crew/, polecats/ paths).
 func isSelfMail(from, to string) bool {
-	fromNorm := strings.TrimSuffix(from, "/")
-	toNorm := strings.TrimSuffix(to, "/")
-	return fromNorm == toNorm
+	return AddressToIdentity(from) == AddressToIdentity(to)
 }
 
 // GetMailbox returns a Mailbox for the given address.

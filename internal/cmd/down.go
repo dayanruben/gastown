@@ -26,6 +26,11 @@ import (
 const (
 	shutdownLockFile    = "daemon/shutdown.lock"
 	shutdownLockTimeout = 5 * time.Second
+
+	// defaultDownOrphanGraceSecs is the grace period for orphan cleanup during gt down.
+	// Short because gt down is meant to be quick - processes already had SIGTERM via
+	// KillSessionWithProcesses.
+	defaultDownOrphanGraceSecs = 5
 )
 
 var downCmd = &cobra.Command{
@@ -223,8 +228,12 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Phase 5: Verification (--all only)
-	if downAll && !downDryRun {
+	// Phase 5: Orphan cleanup and verification (--all or --force)
+	if (downAll || downForce) && !downDryRun {
+		fmt.Println()
+		fmt.Println("Cleaning up orphaned Claude processes...")
+		cleanupOrphanedClaude(defaultDownOrphanGraceSecs)
+
 		time.Sleep(500 * time.Millisecond)
 		respawned := verifyShutdown(t, townRoot)
 		if len(respawned) > 0 {

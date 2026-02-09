@@ -24,6 +24,7 @@ import (
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/feed"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
@@ -58,6 +59,11 @@ type Daemon struct {
 	// See: https://github.com/steveyegge/gastown/issues/567
 	// Note: Only accessed from heartbeat loop goroutine - no sync needed.
 	deaconLastStarted time.Time
+
+	// syncFailures tracks consecutive git pull failures per workdir.
+	// Used to escalate logging from WARN to ERROR after repeated failures.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	syncFailures map[string]int
 }
 
 // sessionDeath records a detected session death for mass death analysis.
@@ -140,6 +146,15 @@ func (d *Daemon) Run() error {
 	// Refuse to start if any rig is still on SQLite.
 	if err := d.checkAllRigsDolt(); err != nil {
 		return err
+	}
+
+	// Repair metadata.json for all rigs on startup.
+	// This auto-fixes stale jsonl_export values (e.g., "beads.jsonl" → "issues.jsonl")
+	// left behind by historical migrations.
+	if _, errs := doltserver.EnsureAllMetadata(d.config.TownRoot); len(errs) > 0 {
+		for _, e := range errs {
+			d.logger.Printf("Warning: metadata repair: %v", e)
+		}
 	}
 
 	// Write PID file

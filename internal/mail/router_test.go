@@ -174,8 +174,14 @@ func TestIsSelfMail(t *testing.T) {
 		{"mayor/", "mayor", true},
 		{"gastown/Toast", "gastown/Toast", true},
 		{"gastown/Toast/", "gastown/Toast", true},
+		{"gastown/crew/max", "gastown/max", true},
+		{"gastown/max", "gastown/crew/max", true},
+		{"gastown/polecats/Toast", "gastown/Toast", true},
+		{"gastown/Toast", "gastown/polecats/Toast", true},
+		{"gastown/crew/max", "gastown/polecats/max", true},
 		{"mayor/", "deacon/", false},
 		{"gastown/Toast", "gastown/Nux", false},
+		{"gastown/crew/max", "gastown/crew/nux", false},
 		{"", "", true},
 	}
 

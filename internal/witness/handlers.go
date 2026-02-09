@@ -861,15 +861,24 @@ type ZombieResult struct {
 type DetectZombiePolecatsResult struct {
 	Checked int
 	Zombies []ZombieResult
+	Errors  []error // Transient errors that prevented checking some polecats
 }
 
 // DetectZombiePolecats cross-references polecat agent state with tmux session
 // existence to find zombie polecats. A zombie is a polecat whose tmux session
-// is dead but whose agent bead still shows agent_state="working" or has a
-// hook_bead assigned.
+// is dead but whose agent bead still shows agent_state="working", "running",
+// or "spawning", or has a hook_bead assigned.
 //
 // Zombies cannot send POLECAT_DONE or other signals, so they sit undetected
 // by the reactive signal-based patrol. This function provides proactive detection.
+//
+// Race safety: Records the detection timestamp before checking session liveness.
+// Before taking any destructive action (nuke), re-verifies that the session
+// hasn't been recreated since detection. This prevents killing newly-spawned
+// sessions that reuse the same name.
+//
+// Dedup: Checks for existing cleanup wisps before escalating, preventing
+// infinite escalation loops on subsequent patrol cycles.
 //
 // For each zombie found:
 //   - If git state is clean (no unpushed work): auto-nuke
@@ -902,10 +911,22 @@ func DetectZombiePolecats(workDir, rigName string, router *mail.Router) *DetectZ
 		sessionName := fmt.Sprintf("gt-%s-%s", rigName, polecatName)
 		result.Checked++
 
+		// Record timestamp BEFORE checking session liveness.
+		// Used later to guard against TOCTOU race where a new session
+		// could be spawned between our check and the nuke action.
+		detectedAt := time.Now()
+
 		// Check if tmux session exists
 		sessionAlive, err := t.HasSession(sessionName)
-		if err != nil || sessionAlive {
-			continue // Session exists or error checking — not a zombie
+		if err != nil {
+			// Transient tmux error — record it so the caller knows detection
+			// was incomplete, rather than silently skipping this polecat.
+			result.Errors = append(result.Errors,
+				fmt.Errorf("checking session %s: %w", sessionName, err))
+			continue
+		}
+		if sessionAlive {
+			continue // Session exists — not a zombie
 		}
 
 		// Session is dead. Check agent bead state.
@@ -915,17 +936,25 @@ func DetectZombiePolecats(workDir, rigName string, router *mail.Router) *DetectZ
 		agentState, hookBead := getAgentBeadState(workDir, agentBeadID)
 
 		// A zombie has a dead session but agent_state suggests it should be alive,
-		// or it still has work hooked.
+		// or it still has work hooked. Include "spawning" so polecats that crash
+		// during spawn are detected rather than invisible to zombie detection.
 		isZombie := false
 		if hookBead != "" {
 			isZombie = true
 		}
-		if agentState == "working" || agentState == "running" {
+		if agentState == "working" || agentState == "running" || agentState == "spawning" {
 			isZombie = true
 		}
 
 		if !isZombie {
 			continue
+		}
+
+		// TOCTOU guard: Before taking any destructive action, re-verify that
+		// the session hasn't been recreated since we checked. A new polecat
+		// manager may have spawned a fresh session with the same name.
+		if sessionRecreated(t, sessionName, detectedAt) {
+			continue // New session exists — not a zombie, skip
 		}
 
 		// Zombie detected! Determine cleanup action based on git state.
@@ -975,25 +1004,32 @@ func DetectZombiePolecats(workDir, rigName string, router *mail.Router) *DetectZ
 			}
 
 		case "has_uncommitted", "has_stash", "has_unpushed":
-			// Dirty state — escalate to Mayor for recovery
-			if router != nil {
-				_, escErr := EscalateRecoveryNeeded(router, rigName, &RecoveryPayload{
-					PolecatName:   polecatName,
-					Rig:           rigName,
-					CleanupStatus: cleanupStatus,
-					IssueID:       hookBead,
-					DetectedAt:    time.Now(),
-				})
-				if escErr != nil {
-					zombie.Error = escErr
+			// Dirty state — escalate to Mayor for recovery, but only if we
+			// haven't already created a cleanup wisp for this polecat (dedup).
+			existingWisp := findAnyCleanupWisp(workDir, polecatName)
+			if existingWisp != "" {
+				// Already tracked — skip escalation to prevent infinite loops.
+				zombie.Action = fmt.Sprintf("already-tracked (cleanup_status=%s, existing-wisp=%s)", cleanupStatus, existingWisp)
+			} else {
+				if router != nil {
+					_, escErr := EscalateRecoveryNeeded(router, rigName, &RecoveryPayload{
+						PolecatName:   polecatName,
+						Rig:           rigName,
+						CleanupStatus: cleanupStatus,
+						IssueID:       hookBead,
+						DetectedAt:    time.Now(),
+					})
+					if escErr != nil {
+						zombie.Error = escErr
+					}
 				}
+				// Create cleanup wisp for tracking
+				wispID, wispErr := createCleanupWisp(workDir, polecatName, hookBead, "")
+				if wispErr != nil && zombie.Error == nil {
+					zombie.Error = wispErr
+				}
+				zombie.Action = fmt.Sprintf("escalated (cleanup_status=%s, wisp=%s)", cleanupStatus, wispID)
 			}
-			// Also create cleanup wisp for tracking
-			wispID, wispErr := createCleanupWisp(workDir, polecatName, hookBead, "")
-			if wispErr != nil && zombie.Error == nil {
-				zombie.Error = wispErr
-			}
-			zombie.Action = fmt.Sprintf("escalated (cleanup_status=%s, wisp=%s)", cleanupStatus, wispID)
 		}
 
 		result.Zombies = append(result.Zombies, zombie)
@@ -1020,4 +1056,47 @@ func getAgentBeadState(workDir, agentBeadID string) (agentState, hookBead string
 	}
 
 	return issues[0].AgentState, issues[0].HookBead
+}
+
+// sessionRecreated checks whether a tmux session was (re)created after the
+// given timestamp. Returns true if the session exists and was created after
+// detectedAt, indicating a new session replaced the dead one (TOCTOU guard).
+func sessionRecreated(t *tmux.Tmux, sessionName string, detectedAt time.Time) bool {
+	alive, err := t.HasSession(sessionName)
+	if err != nil || !alive {
+		return false // Still dead — not recreated
+	}
+	// Session exists now. Check if it was created after our detection.
+	createdAt, err := session.SessionCreatedAt(sessionName)
+	if err != nil {
+		// Can't determine creation time — assume recreated to be safe.
+		// Better to skip a real zombie than kill a live session.
+		return true
+	}
+	return !createdAt.Before(detectedAt)
+}
+
+// findAnyCleanupWisp checks if any cleanup wisp already exists for a polecat,
+// regardless of state. Used to prevent duplicate escalation on repeated patrol
+// cycles for the same zombie.
+func findAnyCleanupWisp(workDir, polecatName string) string {
+	output, err := util.ExecWithOutput(workDir, "bd", "list",
+		"--ephemeral",
+		"--labels", fmt.Sprintf("cleanup,polecat:%s", polecatName),
+		"--status", "open",
+		"--json",
+	)
+	if err != nil {
+		return ""
+	}
+	if output == "" || output == "[]" || output == "null" {
+		return ""
+	}
+	var items []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(output), &items); err != nil || len(items) == 0 {
+		return ""
+	}
+	return items[0].ID
 }

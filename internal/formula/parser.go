@@ -3,6 +3,7 @@ package formula
 import (
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/BurntSushi/toml"
 )
@@ -238,7 +239,14 @@ func checkDependencyCycles(deps map[string][]string) error {
 		return nil
 	}
 
+	// Sort keys for deterministic cycle detection order
+	ids := make([]string, 0, len(deps))
 	for id := range deps {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	for _, id := range ids {
 		if err := visit(id); err != nil {
 			return err
 		}

@@ -201,7 +201,7 @@ type trackedIssueInfo struct {
 }
 
 // extractIssueID strips the external:prefix:id wrapper from bead IDs.
-// formatTrackBeadID() wraps cross-rig IDs as "external:prefix:id" for routing,
+// bd dep add wraps cross-rig IDs as "external:prefix:id" for routing,
 // but consumers need the raw bead ID for bd show lookups.
 func extractIssueID(id string) string {
 	if strings.HasPrefix(id, "external:") {
@@ -882,17 +882,15 @@ func truncateStatusHint(line string) string {
 }
 
 // parsePolecatSessionName parses a tmux session name into rig and polecat components.
-// Format: gt-<rig>-<polecat> -> (rig, polecat, true)
-// Returns ("", "", false) if the format is invalid.
+// Delegates to session.ParseSessionName for consistent parsing of hyphenated
+// rig names (e.g., gt-my-rig-Toast correctly yields rig="my-rig", name="Toast").
+// Returns ("", "", false) if the format is invalid or not a polecat/crew/witness/refinery.
 func parsePolecatSessionName(sessionName string) (rig, polecat string, ok bool) {
-	if !strings.HasPrefix(sessionName, "gt-") {
+	identity, err := session.ParseSessionName(sessionName)
+	if err != nil {
 		return "", "", false
 	}
-	parts := strings.SplitN(sessionName, "-", 3)
-	if len(parts) != 3 {
-		return "", "", false
-	}
-	return parts[1], parts[2], true
+	return identity.Rig, identity.Name, true
 }
 
 // isWorkerSession returns true if the polecat name represents a worker session.

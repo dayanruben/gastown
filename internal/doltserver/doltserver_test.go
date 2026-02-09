@@ -345,7 +345,7 @@ func TestFindRigBeadsDir(t *testing.T) {
 	townRoot := t.TempDir()
 
 	// Test HQ
-	if dir := findRigBeadsDir(townRoot, "hq"); dir != filepath.Join(townRoot, ".beads") {
+	if dir := FindRigBeadsDir(townRoot, "hq"); dir != filepath.Join(townRoot, ".beads") {
 		t.Errorf("hq beads dir = %q, want %q", dir, filepath.Join(townRoot, ".beads"))
 	}
 
@@ -354,7 +354,7 @@ func TestFindRigBeadsDir(t *testing.T) {
 	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if dir := findRigBeadsDir(townRoot, "myrig"); dir != mayorBeads {
+	if dir := FindRigBeadsDir(townRoot, "myrig"); dir != mayorBeads {
 		t.Errorf("myrig beads dir = %q, want %q", dir, mayorBeads)
 	}
 
@@ -363,9 +363,112 @@ func TestFindRigBeadsDir(t *testing.T) {
 	if err := os.MkdirAll(rigBeads, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if dir := findRigBeadsDir(townRoot, "otherrig"); dir != rigBeads {
+	if dir := FindRigBeadsDir(townRoot, "otherrig"); dir != rigBeads {
 		t.Errorf("otherrig beads dir = %q, want %q", dir, rigBeads)
 	}
+
+	// Test rig with neither directory existing — should return mayor path for creation
+	neitherRig := "newrig"
+	expectedMayor := filepath.Join(townRoot, neitherRig, "mayor", "rig", ".beads")
+	if dir := FindRigBeadsDir(townRoot, neitherRig); dir != expectedMayor {
+		t.Errorf("newrig (neither exists) beads dir = %q, want %q (mayor path for creation)", dir, expectedMayor)
+	}
+}
+
+func TestFindOrCreateRigBeadsDir(t *testing.T) {
+	t.Run("hq creates directory", func(t *testing.T) {
+		townRoot := t.TempDir()
+		dir, err := FindOrCreateRigBeadsDir(townRoot, "hq")
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := filepath.Join(townRoot, ".beads")
+		if dir != expected {
+			t.Errorf("hq beads dir = %q, want %q", dir, expected)
+		}
+		// Verify directory was actually created
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			t.Error("hq .beads directory was not created")
+		}
+	})
+
+	t.Run("existing mayor path returned as-is", func(t *testing.T) {
+		townRoot := t.TempDir()
+		mayorBeads := filepath.Join(townRoot, "myrig", "mayor", "rig", ".beads")
+		if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+			t.Fatal(err)
+		}
+		dir, err := FindOrCreateRigBeadsDir(townRoot, "myrig")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dir != mayorBeads {
+			t.Errorf("myrig beads dir = %q, want %q", dir, mayorBeads)
+		}
+	})
+
+	t.Run("existing rig-root path returned", func(t *testing.T) {
+		townRoot := t.TempDir()
+		rigBeads := filepath.Join(townRoot, "otherrig", ".beads")
+		if err := os.MkdirAll(rigBeads, 0755); err != nil {
+			t.Fatal(err)
+		}
+		dir, err := FindOrCreateRigBeadsDir(townRoot, "otherrig")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dir != rigBeads {
+			t.Errorf("otherrig beads dir = %q, want %q", dir, rigBeads)
+		}
+	})
+
+	t.Run("neither exists creates mayor path", func(t *testing.T) {
+		townRoot := t.TempDir()
+		dir, err := FindOrCreateRigBeadsDir(townRoot, "newrig")
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectedMayor := filepath.Join(townRoot, "newrig", "mayor", "rig", ".beads")
+		if dir != expectedMayor {
+			t.Errorf("newrig beads dir = %q, want %q", dir, expectedMayor)
+		}
+		// Verify directory was actually created
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			t.Error("mayor .beads directory was not created")
+		}
+	})
+
+	t.Run("concurrent callers for same rig don't race", func(t *testing.T) {
+		townRoot := t.TempDir()
+		const goroutines = 10
+		results := make([]string, goroutines)
+		errs := make([]error, goroutines)
+
+		var wg sync.WaitGroup
+		wg.Add(goroutines)
+		for i := 0; i < goroutines; i++ {
+			go func(idx int) {
+				defer wg.Done()
+				results[idx], errs[idx] = FindOrCreateRigBeadsDir(townRoot, "racerig")
+			}(i)
+		}
+		wg.Wait()
+
+		expectedMayor := filepath.Join(townRoot, "racerig", "mayor", "rig", ".beads")
+		for i := 0; i < goroutines; i++ {
+			if errs[i] != nil {
+				t.Errorf("goroutine %d: unexpected error: %v", i, errs[i])
+			}
+			if results[i] != expectedMayor {
+				t.Errorf("goroutine %d: got %q, want %q", i, results[i], expectedMayor)
+			}
+		}
+
+		// Verify directory exists
+		if _, err := os.Stat(expectedMayor); os.IsNotExist(err) {
+			t.Error("directory was not created after concurrent calls")
+		}
+	})
 }
 
 func TestMoveDir_SameFilesystem(t *testing.T) {
@@ -818,6 +921,88 @@ func TestConcurrentMetadataAccess(t *testing.T) {
 		if meta["backend"] != "dolt" {
 			t.Errorf("%s: backend = %v, want dolt", rig, meta["backend"])
 		}
+	}
+}
+
+// TestConcurrentMetadataSameFile tests that concurrent EnsureMetadata calls
+// targeting the SAME metadata.json file don't corrupt data. This exercises
+// the file locking added to prevent read-modify-write races.
+func TestConcurrentMetadataSameFile(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// All goroutines will target the same rig (and thus the same metadata.json)
+	rigName := "shared-rig"
+	beadsDir := filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed with extra fields that must survive concurrent overwrites
+	initial := map[string]interface{}{
+		"custom_field": "preserve-me",
+		"version":      42.0,
+	}
+	data, _ := json.MarshalIndent(initial, "", "  ")
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metadataPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run 10 concurrent goroutines all writing to the same file
+	const concurrency = 10
+	var wg sync.WaitGroup
+	errs := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = EnsureMetadata(townRoot, rigName)
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: EnsureMetadata failed: %v", i, err)
+		}
+	}
+
+	// Verify final metadata is valid and preserves all fields
+	finalData, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var meta map[string]interface{}
+	if err := json.Unmarshal(finalData, &meta); err != nil {
+		t.Fatalf("final metadata is corrupted JSON: %v\ncontent: %s", err, string(finalData))
+	}
+
+	// Dolt fields must be set
+	if meta["backend"] != "dolt" {
+		t.Errorf("backend = %v, want dolt", meta["backend"])
+	}
+	if meta["dolt_database"] != rigName {
+		t.Errorf("dolt_database = %v, want %s", meta["dolt_database"], rigName)
+	}
+	if meta["dolt_mode"] != "server" {
+		t.Errorf("dolt_mode = %v, want server", meta["dolt_mode"])
+	}
+
+	// Custom fields must be preserved (not clobbered by concurrent writes)
+	if meta["custom_field"] != "preserve-me" {
+		t.Errorf("custom_field = %v, want preserve-me (field was clobbered)", meta["custom_field"])
+	}
+	if meta["version"] != 42.0 {
+		t.Errorf("version = %v, want 42 (field was clobbered)", meta["version"])
+	}
+
+	// No lock file should be left behind (sync.Mutex is used instead of flock)
+	lockPath := metadataPath + ".lock"
+	if _, err := os.Stat(lockPath); err == nil {
+		t.Error("lock file should not exist — EnsureMetadata uses sync.Mutex, not flock")
 	}
 }
 
@@ -1386,7 +1571,7 @@ func TestEnsureMetadata_CreatesBeadsDir(t *testing.T) {
 	}
 }
 
-func TestEnsureMetadata_PreservesJSONLExport(t *testing.T) {
+func TestEnsureMetadata_CorrectsStaleJSONLExport(t *testing.T) {
 	townRoot := t.TempDir()
 
 	beadsDir := filepath.Join(townRoot, ".beads")
@@ -1394,7 +1579,8 @@ func TestEnsureMetadata_PreservesJSONLExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	existing := map[string]interface{}{"jsonl_export": "custom-issues.jsonl"}
+	// Simulate a stale jsonl_export value left by a historical migration
+	existing := map[string]interface{}{"jsonl_export": "beads.jsonl"}
 	data, _ := json.Marshal(existing)
 	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0600); err != nil {
 		t.Fatal(err)
@@ -1407,8 +1593,8 @@ func TestEnsureMetadata_PreservesJSONLExport(t *testing.T) {
 	updated, _ := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
 	var meta map[string]interface{}
 	json.Unmarshal(updated, &meta)
-	if meta["jsonl_export"] != "custom-issues.jsonl" {
-		t.Errorf("jsonl_export = %v, want custom-issues.jsonl", meta["jsonl_export"])
+	if meta["jsonl_export"] != "issues.jsonl" {
+		t.Errorf("jsonl_export = %v, want issues.jsonl (stale value should be corrected)", meta["jsonl_export"])
 	}
 }
 
@@ -1436,7 +1622,7 @@ func TestEnsureMetadata_SetsDefaultJSONLExport(t *testing.T) {
 
 func TestInitRig_EmptyName(t *testing.T) {
 	townRoot := t.TempDir()
-	err := InitRig(townRoot, "")
+	_, err := InitRig(townRoot, "")
 	if err == nil {
 		t.Fatal("expected error for empty rig name")
 	}
@@ -1445,7 +1631,7 @@ func TestInitRig_EmptyName(t *testing.T) {
 func TestInitRig_InvalidCharacters(t *testing.T) {
 	townRoot := t.TempDir()
 	for _, name := range []string{"my rig", "rig/name", "rig.name", "rig@name"} {
-		err := InitRig(townRoot, name)
+		_, err := InitRig(townRoot, name)
 		if err == nil {
 			t.Errorf("expected error for invalid rig name %q", name)
 		}
@@ -1729,5 +1915,267 @@ func TestMoveDir_SourceNotExists(t *testing.T) {
 	err := moveDir(filepath.Join(tmpDir, "nonexistent"), filepath.Join(tmpDir, "dest"))
 	if err == nil {
 		t.Fatal("expected error for nonexistent source")
+	}
+}
+
+// =============================================================================
+// Branch name validation tests (SQL injection prevention)
+// =============================================================================
+
+func TestValidateBranchName_ValidNames(t *testing.T) {
+	valid := []string{
+		"main",
+		"polecat-furiosa-1707400000",
+		"feature/my-branch",
+		"release-v1.2.3",
+		"my_branch",
+		"UPPER-case",
+		"a",
+	}
+	for _, name := range valid {
+		if err := validateBranchName(name); err != nil {
+			t.Errorf("validateBranchName(%q) = %v, want nil", name, err)
+		}
+	}
+}
+
+// =============================================================================
+// DatabaseExists tests
+// =============================================================================
+
+func TestDatabaseExists_True(t *testing.T) {
+	townRoot := t.TempDir()
+	doltDir := filepath.Join(townRoot, ".dolt-data", "myrig", ".dolt")
+	if err := os.MkdirAll(doltDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if !DatabaseExists(townRoot, "myrig") {
+		t.Error("expected database to exist")
+	}
+}
+
+func TestDatabaseExists_False(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if DatabaseExists(townRoot, "nonexistent") {
+		t.Error("expected database to not exist")
+	}
+}
+
+func TestDatabaseExists_NoDataDir(t *testing.T) {
+	townRoot := t.TempDir()
+	if DatabaseExists(townRoot, "anything") {
+		t.Error("expected false when .dolt-data doesn't exist")
+	}
+}
+
+// =============================================================================
+// FindBrokenWorkspaces tests
+// =============================================================================
+
+func TestFindBrokenWorkspaces_HealthyWorkspace(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Create a healthy workspace: metadata says dolt, and database exists
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := `{"backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Database exists
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data", "hq", ".dolt"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up rigs.json (empty, only checking hq)
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), []byte(`{"rigs":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	broken := FindBrokenWorkspaces(townRoot)
+	if len(broken) != 0 {
+		t.Errorf("expected 0 broken workspaces, got %d: %+v", len(broken), broken)
+	}
+}
+
+func TestFindBrokenWorkspaces_MissingDatabase(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Metadata says dolt, but database does NOT exist
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := `{"backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create .dolt-data but NO hq database inside
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), []byte(`{"rigs":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	broken := FindBrokenWorkspaces(townRoot)
+	if len(broken) != 1 {
+		t.Fatalf("expected 1 broken workspace, got %d", len(broken))
+	}
+	if broken[0].RigName != "hq" {
+		t.Errorf("expected rig hq, got %s", broken[0].RigName)
+	}
+	if broken[0].ConfiguredDB != "hq" {
+		t.Errorf("expected ConfiguredDB=hq, got %s", broken[0].ConfiguredDB)
+	}
+	if broken[0].HasLocalData {
+		t.Error("expected no local data")
+	}
+}
+
+func TestFindBrokenWorkspaces_WithLocalData(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Rig metadata says dolt, database missing, but local data exists
+	rigName := "myrig"
+	beadsDir := filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := `{"backend":"dolt","dolt_mode":"server","dolt_database":"myrig"}`
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Local Dolt data exists
+	localDolt := filepath.Join(beadsDir, "dolt", "beads", ".dolt")
+	if err := os.MkdirAll(localDolt, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"),
+		[]byte(`{"rigs":{"myrig":{}}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	broken := FindBrokenWorkspaces(townRoot)
+	if len(broken) != 1 {
+		t.Fatalf("expected 1 broken workspace, got %d", len(broken))
+	}
+	if !broken[0].HasLocalData {
+		t.Error("expected HasLocalData=true")
+	}
+	if broken[0].LocalDataPath == "" {
+		t.Error("expected non-empty LocalDataPath")
+	}
+}
+
+func TestFindBrokenWorkspaces_SqliteNotBroken(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Workspace configured for SQLite, not Dolt — should not appear as broken
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := `{"backend":"sqlite","database":"beads.db"}`
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), []byte(`{"rigs":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	broken := FindBrokenWorkspaces(townRoot)
+	if len(broken) != 0 {
+		t.Errorf("expected 0 broken workspaces for sqlite backend, got %d", len(broken))
+	}
+}
+
+func TestFindBrokenWorkspaces_MultipleRigs(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Set up rigs.json with two rigs
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"),
+		[]byte(`{"rigs":{"rig-a":{},"rig-b":{}}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// rig-a: broken (metadata says dolt, no database)
+	beadsDirA := filepath.Join(townRoot, "rig-a", "mayor", "rig", ".beads")
+	if err := os.MkdirAll(beadsDirA, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDirA, "metadata.json"),
+		[]byte(`{"backend":"dolt","dolt_mode":"server","dolt_database":"rig-a"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// rig-b: healthy (metadata says dolt, database exists)
+	beadsDirB := filepath.Join(townRoot, "rig-b", "mayor", "rig", ".beads")
+	if err := os.MkdirAll(beadsDirB, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDirB, "metadata.json"),
+		[]byte(`{"backend":"dolt","dolt_mode":"server","dolt_database":"rig-b"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data", "rig-b", ".dolt"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	broken := FindBrokenWorkspaces(townRoot)
+	if len(broken) != 1 {
+		t.Fatalf("expected 1 broken workspace (rig-a only), got %d", len(broken))
+	}
+	if broken[0].RigName != "rig-a" {
+		t.Errorf("expected rig-a broken, got %s", broken[0].RigName)
+	}
+}
+
+func TestValidateBranchName_InvalidNames(t *testing.T) {
+	invalid := []string{
+		"",                          // empty
+		"branch'name",               // single quote (SQL injection)
+		"branch;DROP TABLE",         // semicolon
+		"branch name",               // space
+		"branch\tname",              // tab
+		"$(command)",                // command substitution
+		"branch`cmd`",               // backtick
+		"branch\"name",              // double quote
+		"branch\\name",              // backslash
+		"'); DROP TABLE issues; --", // classic SQL injection
+	}
+	for _, name := range invalid {
+		if err := validateBranchName(name); err == nil {
+			t.Errorf("validateBranchName(%q) = nil, want error", name)
+		}
 	}
 }

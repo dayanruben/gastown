@@ -46,7 +46,11 @@ func NewManager(townRoot string, rigsConfig *config.RigsConfig) *Manager {
 // This prevents concurrent load-modify-save races on .dog.json.
 // Caller must defer fl.Unlock().
 func (m *Manager) lockDog(name string) (*flock.Flock, error) {
-	lockPath := filepath.Join(m.dogDir(name), ".dog.lock")
+	lockDir := m.dogDir(name)
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating dog lock dir: %w", err)
+	}
+	lockPath := filepath.Join(lockDir, ".dog.lock")
 	fl := flock.New(lockPath)
 	if err := fl.Lock(); err != nil {
 		return nil, fmt.Errorf("acquiring dog lock for %s: %w", name, err)

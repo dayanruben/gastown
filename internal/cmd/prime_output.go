@@ -308,7 +308,7 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("3. If you have mail with work instructions → execute that work")
 		fmt.Println("4. If NO mail → run `" + cli.Name() + " done` IMMEDIATELY")
 		fmt.Println()
-		fmt.Println("Polecats are ephemeral workers. No work on hook + no mail = terminate.")
+		fmt.Println("Polecat sessions are ephemeral. No work on hook + no mail = terminate.")
 		fmt.Println("DO NOT wait. DO NOT escalate. DO NOT send idle alerts.")
 		fmt.Println("Just run `" + cli.Name() + " done` and exit.")
 	case RoleRefinery:

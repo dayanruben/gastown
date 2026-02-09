@@ -202,7 +202,7 @@ Task({
 ```yaml
 ---
 name: polecat
-description: Gas Town ephemeral worker agent
+description: Gas Town polecat worker agent (persistent identity, ephemeral sessions)
 model: sonnet
 hooks:
   SessionStart:
@@ -225,7 +225,7 @@ hooks:
           command: "gt signal stop"
 ---
 
-You are a Gas Town polecat (ephemeral worker agent).
+You are a Gas Town polecat (persistent identity, ephemeral sessions).
 
 ## Startup
 1. `cd` to your assigned worktree (given in your spawn prompt)

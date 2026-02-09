@@ -86,10 +86,11 @@ func init() {
 func runDone(cmd *cobra.Command, args []string) error {
 	// Guard: Only polecats should call gt done
 	// Crew, deacons, witnesses etc. don't use gt done - they persist across tasks.
-	// Polecats are ephemeral workers that self-destruct after completing work.
+	// Polecat sessions end with gt done — the session is cleaned up, but the
+	// polecat's persistent identity (agent bead, CV chain) survives across assignments.
 	actor := os.Getenv("BD_ACTOR")
 	if actor != "" && !isPolecatActor(actor) {
-		return fmt.Errorf("gt done is for polecats only (you are %s)\nPolecats are ephemeral workers that self-destruct after completing work.\nOther roles persist across tasks and don't use gt done.", actor)
+		return fmt.Errorf("gt done is for polecats only (you are %s)\nPolecat sessions end with gt done — the session is cleaned up, but identity persists.\nOther roles persist across tasks and don't use gt done.", actor)
 	}
 
 	// Handle --phase-complete flag (overrides --status)

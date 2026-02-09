@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -233,22 +234,29 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 	// Create failed - check if bead already exists (handles both open and closed states)
 	createErr := err
 
-	existing, showErr := b.Show(id)
+	// Resolve where this bead lives. For cross-rig beads (e.g., bd-beads-polecat-obsidian
+	// created from gastown), the target database differs from b's local database.
+	// We need a Beads instance pointed at the target to run show/update/reopen,
+	// because bd show/update don't route cross-rig when BEADS_DIR is set (gt-mh3tb).
+	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
+	target := b
+	if targetDir != b.getResolvedBeadsDir() {
+		target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+	}
+
+	existing, showErr := target.Show(id)
 	if showErr != nil {
 		// Bead doesn't exist (or can't be read) - return original create error
 		return nil, createErr
 	}
 
-	// Resolve where this bead lives (for slot operations)
-	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
-
 	// If bead is closed, reopen it first
 	if existing.Status == "closed" {
-		if _, reopenErr := b.run("reopen", id, "--reason=re-spawning agent"); reopenErr != nil {
+		if _, reopenErr := target.run("reopen", id, "--reason=re-spawning agent"); reopenErr != nil {
 			// Reopen failed - try setting status to open via update as fallback
 			// This handles Dolt backends where bd reopen may not work
 			openStatus := "open"
-			if updateErr := b.Update(id, UpdateOptions{Status: &openStatus}); updateErr != nil {
+			if updateErr := target.Update(id, UpdateOptions{Status: &openStatus}); updateErr != nil {
 				return nil, fmt.Errorf("could not reopen agent bead %s (reopen: %v, update: %v, original: %v)",
 					id, reopenErr, updateErr, createErr)
 			}
@@ -263,11 +271,11 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 		Description: &description,
 		SetLabels:   []string{"gt:agent"},
 	}
-	if err := b.Update(id, updateOpts); err != nil {
+	if err := target.Update(id, updateOpts); err != nil {
 		return nil, fmt.Errorf("updating agent bead: %w", err)
 	}
 	// Fix type separately — UpdateOptions doesn't support type changes
-	if _, err := b.run("update", id, "--type=agent"); err != nil {
+	if _, err := target.run("update", id, "--type=agent"); err != nil {
 		return nil, fmt.Errorf("fixing agent bead type: %w", err)
 	}
 
@@ -287,7 +295,7 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 	}
 
 	// Return the updated bead
-	return b.Show(id)
+	return target.Show(id)
 }
 
 // ResetAgentBeadForReuse clears all mutable fields on an agent bead without closing it.
@@ -298,8 +306,17 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 //
 // This replaces CloseAndClearAgentBead for the nuke path (gt-14b8o).
 func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
+	// Resolve where this bead lives (handles cross-rig routing).
+	// Without this, cross-rig agent beads (e.g., bd-beads-polecat-obsidian
+	// from gastown) would be looked up in the local rig's database and fail.
+	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
+	target := b
+	if targetDir != b.getResolvedBeadsDir() {
+		target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+	}
+
 	// Get current issue to preserve immutable fields (title, role_type, rig)
-	issue, err := b.Show(id)
+	issue, err := target.Show(id)
 	if err != nil {
 		return err
 	}
@@ -313,12 +330,12 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 
 	// Update description with cleared fields
 	description := FormatAgentDescription(issue.Title, fields)
-	if err := b.Update(id, UpdateOptions{Description: &description}); err != nil {
+	if err := target.Update(id, UpdateOptions{Description: &description}); err != nil {
 		return fmt.Errorf("resetting agent bead fields: %w", err)
 	}
 
 	// Also clear the hook slot in the database
-	_ = b.ClearHookBead(id)
+	_ = target.ClearHookBead(id)
 
 	return nil
 }
@@ -500,27 +517,37 @@ func (b *Beads) DeleteAgentBead(id string) error {
 }
 
 // CloseAndClearAgentBead closes an agent bead (soft delete).
-// This is the recommended way to clean up agent beads because CreateOrReopenAgentBead
-// can reopen closed beads when re-spawning polecats with the same name.
 //
-// This is a workaround for the bd tombstone bug where DeleteAgentBead creates
-// tombstones that cannot be reopened.
+// Deprecated: Use ResetAgentBeadForReuse instead. Agent beads represent persistent
+// identity (not lifecycle artifacts) and should not be closed during nuke cycles.
+// Closing destroys work history continuity. ResetAgentBeadForReuse keeps the bead
+// open with agent_state="nuked", preserving the CV chain across assignments.
 //
-// To emulate the clean slate of delete --force --hard, this clears all mutable
-// fields (hook_bead, active_mr, cleanup_status, agent_state) before closing.
+// This function remains for backward compatibility with older cleanup paths.
+// CreateOrReopenAgentBead can reopen closed beads when re-spawning polecats,
+// but the preferred path avoids close/reopen entirely.
 func (b *Beads) CloseAndClearAgentBead(id, reason string) error {
+	// Resolve where this bead lives (handles cross-rig routing).
+	// Without this, cross-rig agent beads (e.g., bd-beads-polecat-obsidian
+	// from gastown) would be looked up in the local rig's database and fail.
+	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
+	target := b
+	if targetDir != b.getResolvedBeadsDir() {
+		target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+	}
+
 	// Clear mutable fields to emulate delete --force --hard behavior.
 	// This ensures reopened agent beads don't have stale state.
 
 	// First get current issue to preserve immutable fields
-	issue, err := b.Show(id)
+	issue, err := target.Show(id)
 	if err != nil {
 		// If we can't read the issue, still attempt to close
 		args := []string{"close", id}
 		if reason != "" {
 			args = append(args, "--reason="+reason)
 		}
-		_, closeErr := b.run(args...)
+		_, closeErr := target.run(args...)
 		return closeErr
 	}
 
@@ -533,12 +560,12 @@ func (b *Beads) CloseAndClearAgentBead(id, reason string) error {
 
 	// Update description with cleared fields
 	description := FormatAgentDescription(issue.Title, fields)
-	if err := b.Update(id, UpdateOptions{Description: &description}); err != nil {
+	if err := target.Update(id, UpdateOptions{Description: &description}); err != nil {
 		// Non-fatal: continue with close even if update fails
 	}
 
 	// Also clear the hook slot in the database
-	if err := b.ClearHookBead(id); err != nil {
+	if err := target.ClearHookBead(id); err != nil {
 		// Non-fatal
 	}
 
@@ -546,7 +573,7 @@ func (b *Beads) CloseAndClearAgentBead(id, reason string) error {
 	if reason != "" {
 		args = append(args, "--reason="+reason)
 	}
-	_, err = b.run(args...)
+	_, err = target.run(args...)
 	return err
 }
 

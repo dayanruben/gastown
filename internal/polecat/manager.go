@@ -1,4 +1,4 @@
-// Liftoff test: 2026-01-09T14:30:00
+// Liftoff test: 2026-02-08T14:00:00
 
 package polecat
 
@@ -1417,12 +1417,17 @@ func (m *Manager) ClearIssue(name string) error {
 	return nil
 }
 
-// loadFromBeads gets polecat info from beads assignee field + tmux session state.
-// State derivation: issue assigned → working, no issue but session alive → working,
-// no issue and no session → done (ready for cleanup).
-// The tmux session check prevents false "done" status for actively running polecats
-// whose beads assignment hasn't been recorded yet or whose query returned empty.
-// We don't interpret issue status (ZFC: Go is transport, not decision-maker).
+// loadFromBeads gets polecat info from agent bead hook + beads assignee field + tmux session state.
+// State derivation priority:
+//  1. Agent bead hook_bead set → working (authoritative source for current assignment)
+//  2. Issue assigned via beads assignee → working
+//  3. Tmux session alive → working (session active even if assignment not yet recorded)
+//  4. None of the above → done (ready for cleanup)
+//
+// The hook_bead check (1) is critical for polecat name recycling: when a polecat name
+// is reused across rounds, GetAssignedIssue may return a stale issue from the previous
+// round whose assignee was never cleared. The hook_bead is set atomically at spawn/sling
+// time and is always current. (gt-ckk12)
 func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	// Use clonePath which handles both new (polecats/<name>/<rigname>/)
 	// and old (polecats/<name>/) structures
@@ -1436,7 +1441,26 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 		branchName = fmt.Sprintf("polecat/%s", name)
 	}
 
-	// Query beads for assigned issue
+	// Check agent bead's hook_bead field first — this is the authoritative source
+	// for what work is currently assigned to this polecat. The hook_bead is set
+	// atomically at spawn/sling time, so it's always current even after polecat
+	// name recycling. GetAssignedIssue queries by assignee which can return stale
+	// data from previous rounds. (gt-ckk12)
+	agentID := m.agentBeadID(name)
+	_, fields, agentErr := m.beads.GetAgentBead(agentID)
+	if agentErr == nil && fields != nil && fields.HookBead != "" {
+		return &Polecat{
+			Name:      name,
+			Rig:       m.rig.Name,
+			State:     StateWorking,
+			ClonePath: clonePath,
+			Branch:    branchName,
+			Issue:     fields.HookBead,
+		}, nil
+	}
+
+	// Fallback: Query beads for assigned issue (for polecats without agent beads
+	// or with empty hook_bead)
 	assignee := m.assigneeID(name)
 	issue, beadsErr := m.beads.GetAssignedIssue(assignee)
 	if beadsErr != nil {

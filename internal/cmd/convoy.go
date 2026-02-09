@@ -1215,9 +1215,41 @@ func runConvoyList(cmd *cobra.Command, args []string) error {
 	}
 
 	if convoyListJSON {
+		// Enrich each convoy with tracked issues and completion counts
+		type convoyListEntry struct {
+			ID        string             `json:"id"`
+			Title     string             `json:"title"`
+			Status    string             `json:"status"`
+			CreatedAt string             `json:"created_at"`
+			Tracked   []trackedIssueInfo `json:"tracked"`
+			Completed int                `json:"completed"`
+			Total     int                `json:"total"`
+		}
+		enriched := make([]convoyListEntry, 0, len(convoys))
+		for _, c := range convoys {
+			tracked := getTrackedIssues(townBeads, c.ID)
+			if tracked == nil {
+				tracked = []trackedIssueInfo{} // Ensure JSON [] not null
+			}
+			completed := 0
+			for _, t := range tracked {
+				if t.Status == "closed" {
+					completed++
+				}
+			}
+			enriched = append(enriched, convoyListEntry{
+				ID:        c.ID,
+				Title:     c.Title,
+				Status:    c.Status,
+				CreatedAt: c.CreatedAt,
+				Tracked:   tracked,
+				Completed: completed,
+				Total:     len(tracked),
+			})
+		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(convoys)
+		return enc.Encode(enriched)
 	}
 
 	if len(convoys) == 0 {
@@ -1322,7 +1354,7 @@ type trackedIssueInfo struct {
 }
 
 // extractIssueID strips the external:prefix:id wrapper from bead IDs.
-// formatTrackBeadID() wraps cross-rig IDs as "external:prefix:id" for routing,
+// bd dep add wraps cross-rig IDs as "external:prefix:id" for routing,
 // but consumers need the raw bead ID for bd show lookups.
 func extractIssueID(id string) string {
 	if strings.HasPrefix(id, "external:") {

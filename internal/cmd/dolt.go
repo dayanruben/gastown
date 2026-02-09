@@ -34,6 +34,24 @@ Server configuration:
 Each rig (hq, gastown, beads) has its own database subdirectory.`,
 }
 
+var doltInitCmd = &cobra.Command{
+	Use:   "init",
+	Short: "Initialize and repair Dolt workspace configuration",
+	Long: `Verify and repair the Dolt workspace configuration.
+
+This command scans all rig metadata.json files for Dolt server configuration
+and ensures the referenced databases actually exist. It fixes the broken state
+where metadata.json says backend=dolt but the database is missing from .dolt-data/.
+
+For each broken workspace, it will:
+  1. Check if local .beads/dolt/ data exists and migrate it
+  2. Otherwise, create a fresh database in .dolt-data/
+
+This is safe to run multiple times (idempotent). It will not modify workspaces
+that are already healthy.`,
+	RunE: runDoltInit,
+}
+
 var doltStartCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Start the Dolt server",
@@ -160,6 +178,7 @@ var (
 )
 
 func init() {
+	doltCmd.AddCommand(doltInitCmd)
 	doltCmd.AddCommand(doltStartCmd)
 	doltCmd.AddCommand(doltStopCmd)
 	doltCmd.AddCommand(doltStatusCmd)
@@ -377,7 +396,8 @@ func runDoltInitRig(cmd *cobra.Command, args []string) error {
 
 	rigName := args[0]
 
-	if err := doltserver.InitRig(townRoot, rigName); err != nil {
+	serverWasRunning, err := doltserver.InitRig(townRoot, rigName)
+	if err != nil {
 		return err
 	}
 
@@ -387,7 +407,61 @@ func runDoltInitRig(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Initialized rig database %q\n", style.Bold.Render("✓"), rigName)
 	fmt.Printf("  Location: %s\n", rigDir)
 	fmt.Printf("  Data dir: %s\n", config.DataDir)
-	fmt.Printf("\nStart server with: %s\n", style.Dim.Render("gt dolt start"))
+
+	if serverWasRunning {
+		fmt.Printf("  Server: %s\n", style.Bold.Render("database registered with running server"))
+	} else {
+		fmt.Printf("\nStart server with: %s\n", style.Dim.Render("gt dolt start"))
+	}
+
+	return nil
+}
+
+func runDoltInit(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Find workspaces with broken Dolt configuration
+	broken := doltserver.FindBrokenWorkspaces(townRoot)
+
+	if len(broken) == 0 {
+		// Also check if there are any databases at all
+		databases, _ := doltserver.ListDatabases(townRoot)
+		if len(databases) == 0 {
+			fmt.Println("No Dolt databases found and no workspaces configured for Dolt.")
+			fmt.Printf("\nInitialize a rig database with: %s\n", style.Dim.Render("gt dolt init-rig <name>"))
+		} else {
+			fmt.Printf("%s All workspaces healthy (%d database(s) verified)\n",
+				style.Bold.Render("✓"), len(databases))
+		}
+		return nil
+	}
+
+	fmt.Printf("Found %d workspace(s) with broken Dolt configuration:\n\n", len(broken))
+
+	repaired := 0
+	for _, ws := range broken {
+		fmt.Printf("  %s %s: metadata.json → database %q (missing from .dolt-data/)\n",
+			style.Bold.Render("!"), ws.RigName, ws.ConfiguredDB)
+		if ws.HasLocalData {
+			fmt.Printf("    Local data found at %s\n", style.Dim.Render(ws.LocalDataPath))
+		}
+
+		action, err := doltserver.RepairWorkspace(townRoot, ws)
+		if err != nil {
+			fmt.Printf("    %s Repair failed: %v\n", style.Bold.Render("✗"), err)
+			continue
+		}
+
+		fmt.Printf("    %s Repaired: %s\n", style.Bold.Render("✓"), action)
+		repaired++
+	}
+
+	if repaired > 0 {
+		fmt.Printf("\n%s Repaired %d/%d workspace(s)\n", style.Bold.Render("✓"), repaired, len(broken))
+	}
 
 	return nil
 }
@@ -746,7 +820,13 @@ func setSyncModeForAllRigs(townRoot string) []error {
 	var errs []error
 	var set []string
 	for _, dbName := range databases {
-		beadsDir := findRigBeadsDir(townRoot, dbName)
+		// Use FindOrCreateRigBeadsDir to atomically resolve and ensure the
+		// directory exists, avoiding TOCTOU races in the stat-then-use pattern.
+		beadsDir, err := doltserver.FindOrCreateRigBeadsDir(townRoot, dbName)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: resolving beads dir: %w", dbName, err))
+			continue
+		}
 
 		cmd := exec.Command("bd", "sync", "mode", "set", "dolt-native")
 		cmd.Dir = filepath.Dir(beadsDir) // run from parent of .beads
@@ -767,19 +847,3 @@ func setSyncModeForAllRigs(townRoot string) []error {
 	return errs
 }
 
-// findRigBeadsDir returns the .beads directory for a rig name.
-// Delegates to doltserver.FindRigBeadsDir if available, otherwise uses heuristics.
-func findRigBeadsDir(townRoot, rigName string) string {
-	if rigName == "hq" {
-		return filepath.Join(townRoot, ".beads")
-	}
-
-	// Prefer mayor/rig/.beads (canonical location for tracked beads)
-	mayorBeads := filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
-	if _, err := os.Stat(mayorBeads); err == nil {
-		return mayorBeads
-	}
-
-	// Fall back to rig-root .beads
-	return filepath.Join(townRoot, rigName, ".beads")
-}

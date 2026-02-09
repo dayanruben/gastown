@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -472,6 +473,7 @@ func (c *DoltMetadataCheck) hasDoltMetadata(beadsDir, expectedDB string) bool {
 		Backend      string `json:"backend"`
 		DoltMode     string `json:"dolt_mode"`
 		DoltDatabase string `json:"dolt_database"`
+		JsonlExport  string `json:"jsonl_export"`
 	}
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		return false
@@ -479,14 +481,17 @@ func (c *DoltMetadataCheck) hasDoltMetadata(beadsDir, expectedDB string) bool {
 
 	return metadata.Backend == "dolt" &&
 		metadata.DoltMode == "server" &&
-		metadata.DoltDatabase == expectedDB
+		metadata.DoltDatabase == expectedDB &&
+		metadata.JsonlExport == "issues.jsonl"
 }
 
 // writeDoltMetadata writes dolt server config to a rig's metadata.json.
 func (c *DoltMetadataCheck) writeDoltMetadata(townRoot, rigName string) error {
-	beadsDir := c.findRigBeadsDir(townRoot, rigName)
-	if beadsDir == "" {
-		return fmt.Errorf("could not find .beads directory for rig %q", rigName)
+	// Use FindOrCreateRigBeadsDir to atomically resolve and create the directory,
+	// avoiding the TOCTOU race in the stat-then-use pattern.
+	beadsDir, err := c.findOrCreateRigBeadsDir(townRoot, rigName)
+	if err != nil {
+		return fmt.Errorf("resolving beads directory for rig %q: %w", rigName, err)
 	}
 
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
@@ -503,17 +508,13 @@ func (c *DoltMetadataCheck) writeDoltMetadata(townRoot, rigName string) error {
 	existing["dolt_mode"] = "server"
 	existing["dolt_database"] = rigName
 
-	if _, ok := existing["jsonl_export"]; !ok {
-		existing["jsonl_export"] = "issues.jsonl"
-	}
+	// Always set jsonl_export to the canonical filename.
+	// Historical migrations may have left stale values (e.g., "beads.jsonl").
+	existing["jsonl_export"] = "issues.jsonl"
 
 	data, err := json.MarshalIndent(existing, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling metadata: %w", err)
-	}
-
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		return fmt.Errorf("creating beads directory: %w", err)
 	}
 
 	if err := util.AtomicWriteFile(metadataPath, append(data, '\n'), 0600); err != nil {
@@ -523,25 +524,14 @@ func (c *DoltMetadataCheck) writeDoltMetadata(townRoot, rigName string) error {
 	return nil
 }
 
-// findRigBeadsDir returns the canonical .beads directory for a rig.
+// findRigBeadsDir delegates to the canonical read-only implementation in doltserver.
 func (c *DoltMetadataCheck) findRigBeadsDir(townRoot, rigName string) string {
-	if rigName == "hq" {
-		return filepath.Join(townRoot, ".beads")
-	}
+	return doltserver.FindRigBeadsDir(townRoot, rigName)
+}
 
-	// Prefer mayor/rig/.beads (canonical)
-	mayorBeads := filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
-	if _, err := os.Stat(mayorBeads); err == nil {
-		return mayorBeads
-	}
-
-	// Fall back to rig-root .beads
-	rigBeads := filepath.Join(townRoot, rigName, ".beads")
-	if _, err := os.Stat(rigBeads); err == nil {
-		return rigBeads
-	}
-
-	return ""
+// findOrCreateRigBeadsDir delegates to the atomic resolve-and-create implementation.
+func (c *DoltMetadataCheck) findOrCreateRigBeadsDir(townRoot, rigName string) (string, error) {
+	return doltserver.FindOrCreateRigBeadsDir(townRoot, rigName)
 }
 
 // loadRigs loads the rigs configuration from rigs.json.

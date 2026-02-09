@@ -259,41 +259,41 @@ description = "The convoy ID to feed"
 required = true
 
 [vars.available_count]
-description = "Number of available polecats (computed during execution)"
+description = "Computed: number of available polecats"
 default = ""
 
 [vars.dispatch_count]
-description = "Number of issues dispatched (computed during execution)"
+description = "Computed: number of dispatched issues"
 default = ""
 
 [vars.error]
-description = "Error message for a failed dispatch (computed during execution)"
+description = "Computed: error message if dispatch fails"
 default = ""
 
 [vars.error_count]
-description = "Number of dispatch errors (computed during execution)"
+description = "Computed: number of errors during feed"
 default = ""
 
 [vars.issue_id]
-description = "Issue ID being dispatched (computed during execution)"
+description = "Computed: current issue being dispatched"
 default = ""
 
 [vars.polecat]
-description = "Polecat assigned to work (computed during execution)"
+description = "Computed: polecat assigned to current issue"
 default = ""
 
 [vars.ready_count]
-description = "Number of ready issues found (computed during execution)"
+description = "Computed: number of ready issues in convoy"
 default = ""
 
 [vars.report_summary]
-description = "Summary text for the feeding report (computed during execution)"
+description = "Computed: summary of feed results"
 default = ""
 
 [vars.rig]
-description = "Target rig for dispatch (computed during execution)"
+description = "Computed: rig name for dispatch"
 default = ""
 
 [vars.title]
-description = "Issue title (computed during execution)"
+description = "Computed: title of current issue"
 default = ""
