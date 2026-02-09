@@ -108,6 +108,34 @@ func runDone(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Deferred session kill: ensures selfKillSession runs on ANY exit path for polecats.
+	// This is the backstop that prevents zombie sessions when push/MR failures cause
+	// early returns before the explicit selfKillSession call.
+	//
+	// Flags control behavior:
+	// - sessionCleanupNeeded: set true after role detection confirms polecat
+	// - sessionKilled: set true after explicit selfKillSession succeeds
+	//
+	// Validation errors (bad flags, wrong role) return BEFORE sessionCleanupNeeded is set,
+	// so the defer is a no-op. Operational errors (push fail, MR fail) return AFTER the
+	// flag is set, so the defer kills the session.
+	//
+	// The defer does NOT nuke worktree — only kills session. Worktree cleanup is the
+	// Witness's job.
+	var sessionCleanupNeeded bool
+	var sessionKilled bool
+	var deferredTownRoot string
+	var deferredRoleInfo RoleInfo
+	defer func() {
+		if sessionCleanupNeeded && !sessionKilled {
+			fmt.Printf("%s Deferred session cleanup (backstop)\n", style.Bold.Render("→"))
+			if err := selfKillSession(deferredTownRoot, deferredRoleInfo); err != nil {
+				style.PrintWarning("deferred session kill failed: %v", err)
+			}
+			os.Exit(0)
+		}
+	}()
+
 	// Find workspace with fallback for deleted worktrees (hq-3xaxy)
 	// If the polecat's worktree was deleted by Witness before gt done finishes,
 	// getcwd will fail. We fall back to GT_TOWN_ROOT env var in that case.
@@ -239,6 +267,15 @@ func runDone(cmd *cobra.Command, args []string) error {
 			WorkDir:  cwd,
 		}
 		agentBeadID = getAgentBeadID(ctx)
+
+		// Enable deferred session kill for polecats.
+		// From this point forward, any return/error will trigger the defer
+		// to kill the session, preventing zombie sessions.
+		if roleInfo.Role == RolePolecat {
+			sessionCleanupNeeded = true
+			deferredTownRoot = townRoot
+			deferredRoleInfo = roleInfo
+		}
 	}
 
 	// If issue ID not set by flag or branch name, try agent's hook_bead.
@@ -251,6 +288,14 @@ func runDone(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Write done-intent label EARLY, before push/MR operations.
+	// If gt done crashes after this point, the Witness can detect the intent
+	// and auto-nuke the zombie polecat.
+	if agentBeadID != "" {
+		bd := beads.New(beads.ResolveBeadsDir(cwd))
+		setDoneIntentLabel(bd, agentBeadID, exitType)
+	}
+
 	// Get configured default branch for this rig
 	defaultBranch := "main" // fallback
 	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
@@ -259,6 +304,8 @@ func runDone(cmd *cobra.Command, args []string) error {
 
 	// For COMPLETED, we need an issue ID and branch must not be the default branch
 	var mrID string
+	var pushFailed bool
+	var doneErrors []string
 	if exitType == ExitCompleted {
 		if branch == defaultBranch || branch == "master" {
 			return fmt.Errorf("cannot submit %s/master branch to merge queue", defaultBranch)
@@ -350,7 +397,13 @@ func runDone(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Pushing branch to remote...\n")
 		refspec := branch + ":" + branch
 		if err := g.Push("origin", refspec, false); err != nil {
-			return fmt.Errorf("pushing branch '%s' to origin: %w\nCommits exist locally but failed to push. Fix the issue and retry.", branch, err)
+			// Non-fatal: record the error and skip to notifyWitness.
+			// The deferred session kill ensures the session still terminates.
+			pushFailed = true
+			errMsg := fmt.Sprintf("push failed for branch '%s': %v", branch, err)
+			doneErrors = append(doneErrors, errMsg)
+			style.PrintWarning("%s\nCommits exist locally but failed to push. Witness will be notified.", errMsg)
+			goto notifyWitness
 		}
 		fmt.Printf("%s Branch pushed to origin\n", style.Bold.Render("✓"))
 
@@ -452,7 +505,12 @@ func runDone(cmd *cobra.Command, args []string) error {
 				Ephemeral:   true,
 			})
 			if err != nil {
-				return fmt.Errorf("creating merge request bead: %w", err)
+				// Non-fatal: record the error and skip to notifyWitness.
+				// Push succeeded so branch is on remote, but MR bead failed.
+				errMsg := fmt.Sprintf("MR bead creation failed: %v", err)
+				doneErrors = append(doneErrors, errMsg)
+				style.PrintWarning("%s\nBranch is pushed but MR bead not created. Witness will be notified.", errMsg)
+				goto notifyWitness
 			}
 			mrID = mrIssue.ID
 
@@ -540,6 +598,9 @@ notifyWitness:
 		bodyLines = append(bodyLines, fmt.Sprintf("Gate: %s", doneGate))
 	}
 	bodyLines = append(bodyLines, fmt.Sprintf("Branch: %s", branch))
+	if len(doneErrors) > 0 {
+		bodyLines = append(bodyLines, fmt.Sprintf("Errors: %s", strings.Join(doneErrors, "; ")))
+	}
 
 	doneNotification := &mail.Message{
 		To:      witnessAddr,
@@ -586,8 +647,11 @@ notifyWitness:
 	if roleInfo, err := GetRoleWithContext(cwd, townRoot); err == nil && roleInfo.Role == RolePolecat {
 		selfCleanAttempted = true
 
-		// Step 1: Nuke the worktree (only for COMPLETED - other statuses preserve work)
-		if exitType == ExitCompleted {
+		// Step 1: Nuke the worktree (only for COMPLETED with successful push)
+		// If push failed, preserve the worktree so Witness/Refinery can still
+		// access the branch for recovery. selfNukePolecat also checks
+		// branch-on-remote, so this is defense-in-depth.
+		if exitType == ExitCompleted && !pushFailed {
 			if err := selfNukePolecat(roleInfo, townRoot); err != nil {
 				// Non-fatal: Witness will clean up if we fail
 				style.PrintWarning("worktree nuke failed: %v (Witness will clean up)", err)
@@ -603,6 +667,8 @@ notifyWitness:
 		if err := selfKillSession(townRoot, roleInfo); err != nil {
 			// If session kill fails, fall through to os.Exit
 			style.PrintWarning("session kill failed: %v", err)
+		} else {
+			sessionKilled = true // Prevent deferred kill from double-killing
 		}
 		// If selfKillSession succeeds, we won't reach here (process killed by tmux)
 	}
@@ -617,6 +683,55 @@ notifyWitness:
 	os.Exit(0)
 
 	return nil // unreachable, but keeps compiler happy
+}
+
+// setDoneIntentLabel writes a done-intent:<type>:<unix-ts> label on the agent bead
+// EARLY in gt done, before push/MR. This allows the Witness to detect polecats that
+// crashed mid-gt-done: if the session is dead but done-intent exists, the polecat was
+// trying to exit and should be auto-nuked.
+//
+// Follows the existing idle:N / backoff-until:TIMESTAMP label pattern.
+// Non-fatal: if this fails, gt done continues without the safety net.
+func setDoneIntentLabel(bd *beads.Beads, agentBeadID, exitType string) {
+	if agentBeadID == "" {
+		return
+	}
+	label := fmt.Sprintf("done-intent:%s:%d", exitType, time.Now().Unix())
+	if err := bd.Update(agentBeadID, beads.UpdateOptions{
+		AddLabels: []string{label},
+	}); err != nil {
+		// Non-fatal: warn but continue
+		fmt.Fprintf(os.Stderr, "Warning: couldn't set done-intent label on %s: %v\n", agentBeadID, err)
+	}
+}
+
+// clearDoneIntentLabel removes any done-intent:* label from the agent bead.
+// Called at the end of updateAgentStateOnDone on clean exit.
+// Uses read-modify-write pattern (same as clearAgentBackoffUntil).
+func clearDoneIntentLabel(bd *beads.Beads, agentBeadID string) {
+	if agentBeadID == "" {
+		return
+	}
+	issue, err := bd.Show(agentBeadID)
+	if err != nil {
+		return // Agent bead gone, nothing to clear
+	}
+
+	var toRemove []string
+	for _, label := range issue.Labels {
+		if strings.HasPrefix(label, "done-intent:") {
+			toRemove = append(toRemove, label)
+		}
+	}
+	if len(toRemove) == 0 {
+		return // No done-intent label to clear
+	}
+
+	if err := bd.Update(agentBeadID, beads.UpdateOptions{
+		RemoveLabels: toRemove,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: couldn't clear done-intent label on %s: %v\n", agentBeadID, err)
+	}
 }
 
 // updateAgentStateOnDone clears the agent's hook and reports cleanup status.
@@ -778,6 +893,11 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, _ string) { // issueID unus
 			}
 		}
 	}
+
+	// Clear done-intent label on clean exit — gt done completed successfully.
+	// If we don't reach here (crash/stuck), the Witness uses the lingering label
+	// to detect the zombie.
+	clearDoneIntentLabel(bd, agentBeadID)
 }
 
 // getIssueFromAgentHook retrieves the issue ID from an agent's hook_bead field.

@@ -386,6 +386,9 @@ func (m *Manager) loadState(name string) (*CrewWorker, error) {
 
 // Rename renames a crew worker from oldName to newName.
 func (m *Manager) Rename(oldName, newName string) error {
+	if err := validateCrewName(newName); err != nil {
+		return err
+	}
 	if !m.exists(oldName) {
 		return ErrCrewNotFound
 	}

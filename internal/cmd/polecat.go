@@ -1118,7 +1118,6 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 	}
 
 	// Nuke each polecat
-	t := tmux.NewTmux()
 	var nukeErrors []string
 	nuked := 0
 
@@ -1141,69 +1140,9 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Nuking %s/%s...\n", p.rigName, p.polecatName)
 		}
 
-		// Step 1: Kill session (force mode - no graceful shutdown)
-		polecatMgr := polecat.NewSessionManager(t, p.r)
-		running, _ := polecatMgr.IsRunning(p.polecatName)
-		if running {
-			if err := polecatMgr.Stop(p.polecatName, true); err != nil {
-				fmt.Printf("  %s session kill failed: %v\n", style.Warning.Render("⚠"), err)
-				// Continue anyway - worktree removal will still work
-			} else {
-				fmt.Printf("  %s killed session\n", style.Success.Render("✓"))
-			}
-		}
-
-		// Step 2: Get polecat info before deletion (for branch name)
-		polecatInfo, err := p.mgr.Get(p.polecatName)
-		var branchToDelete string
-		if err == nil && polecatInfo != nil {
-			branchToDelete = polecatInfo.Branch
-		}
-
-		// Step 3: Delete worktree (nuclear mode - bypass all safety checks)
-		// selfNuke=false because this is an external nuke command, not polecat self-deleting
-		if err := p.mgr.RemoveWithOptions(p.polecatName, true, true, false); err != nil {
-			if errors.Is(err, polecat.ErrPolecatNotFound) {
-				fmt.Printf("  %s worktree already gone\n", style.Dim.Render("○"))
-			} else {
-				nukeErrors = append(nukeErrors, fmt.Sprintf("%s/%s: worktree removal failed: %v", p.rigName, p.polecatName, err))
-				continue
-			}
-		} else {
-			fmt.Printf("  %s deleted worktree\n", style.Success.Render("✓"))
-		}
-
-		// Step 4: Delete branch (if we know it)
-		// Use bare repo if it exists (matches where worktree was created), otherwise mayor/rig
-		if branchToDelete != "" {
-			var repoGit *git.Git
-			bareRepoPath := filepath.Join(p.r.Path, ".repo.git")
-			if info, err := os.Stat(bareRepoPath); err == nil && info.IsDir() {
-				repoGit = git.NewGitWithDir(bareRepoPath, "")
-			} else {
-				repoGit = git.NewGit(filepath.Join(p.r.Path, "mayor", "rig"))
-			}
-			if err := repoGit.DeleteBranch(branchToDelete, true); err != nil {
-				// Non-fatal - branch might already be gone
-				fmt.Printf("  %s branch delete: %v\n", style.Dim.Render("○"), err)
-			} else {
-				fmt.Printf("  %s deleted branch %s\n", style.Success.Render("✓"), branchToDelete)
-			}
-		}
-
-		// Step 5: Close agent bead (if exists)
-		agentBeadID := polecatBeadIDForRig(p.r, p.rigName, p.polecatName)
-		closeArgs := []string{"close", agentBeadID, "--reason=nuked"}
-		if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {
-			closeArgs = append(closeArgs, "--session="+sessionID)
-		}
-		closeCmd := exec.Command("bd", closeArgs...)
-		closeCmd.Dir = filepath.Join(p.r.Path, "mayor", "rig")
-		if err := closeCmd.Run(); err != nil {
-			// Non-fatal - agent bead might not exist
-			fmt.Printf("  %s agent bead not found or already closed\n", style.Dim.Render("○"))
-		} else {
-			fmt.Printf("  %s closed agent bead %s\n", style.Success.Render("✓"), agentBeadID)
+		if err := nukePolecatFull(p.polecatName, p.rigName, p.mgr, p.r); err != nil {
+			nukeErrors = append(nukeErrors, fmt.Sprintf("%s/%s: %v", p.rigName, p.polecatName, err))
+			continue
 		}
 
 		nuked++
@@ -1234,6 +1173,77 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 
 	if len(nukeErrors) > 0 {
 		return fmt.Errorf("%d nuke(s) failed", len(nukeErrors))
+	}
+
+	return nil
+}
+
+// nukePolecatFull performs the complete cleanup sequence for a single polecat:
+// 1. Kill tmux session
+// 2. Delete worktree (via RemoveWithOptions with nuclear=true)
+// 3. Delete git branch
+// 4. Close agent bead
+// This is the canonical cleanup path used by both `polecat nuke` and `polecat stale --cleanup`.
+func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig) error {
+	t := tmux.NewTmux()
+
+	// Step 1: Kill tmux session
+	sessMgr := polecat.NewSessionManager(t, r)
+	running, _ := sessMgr.IsRunning(polecatName)
+	if running {
+		if err := sessMgr.Stop(polecatName, true); err != nil {
+			fmt.Printf("  %s session kill failed: %v\n", style.Warning.Render("⚠"), err)
+		} else {
+			fmt.Printf("  %s killed session\n", style.Success.Render("✓"))
+		}
+	}
+
+	// Step 2: Get polecat info before deletion (for branch name)
+	polecatInfo, getErr := mgr.Get(polecatName)
+	var branchToDelete string
+	if getErr == nil && polecatInfo != nil {
+		branchToDelete = polecatInfo.Branch
+	}
+
+	// Step 3: Delete worktree (nuclear=true to bypass safety checks for stale polecats)
+	if err := mgr.RemoveWithOptions(polecatName, true, true, false); err != nil {
+		if errors.Is(err, polecat.ErrPolecatNotFound) {
+			fmt.Printf("  %s worktree already gone\n", style.Dim.Render("○"))
+		} else {
+			return fmt.Errorf("worktree removal failed: %w", err)
+		}
+	} else {
+		fmt.Printf("  %s deleted worktree\n", style.Success.Render("✓"))
+	}
+
+	// Step 4: Delete branch (if we know it)
+	if branchToDelete != "" {
+		var repoGit *git.Git
+		bareRepoPath := filepath.Join(r.Path, ".repo.git")
+		if info, statErr := os.Stat(bareRepoPath); statErr == nil && info.IsDir() {
+			repoGit = git.NewGitWithDir(bareRepoPath, "")
+		} else {
+			repoGit = git.NewGit(filepath.Join(r.Path, "mayor", "rig"))
+		}
+		if err := repoGit.DeleteBranch(branchToDelete, true); err != nil {
+			fmt.Printf("  %s branch delete: %v\n", style.Dim.Render("○"), err)
+		} else {
+			fmt.Printf("  %s deleted branch %s\n", style.Success.Render("✓"), branchToDelete)
+		}
+	}
+
+	// Step 5: Close agent bead (if exists)
+	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
+	closeArgs := []string{"close", agentBeadID, "--reason=nuked"}
+	if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {
+		closeArgs = append(closeArgs, "--session="+sessionID)
+	}
+	closeCmd := exec.Command("bd", closeArgs...)
+	closeCmd.Dir = filepath.Join(r.Path, "mayor", "rig")
+	if err := closeCmd.Run(); err != nil {
+		fmt.Printf("  %s agent bead not found or already closed\n", style.Dim.Render("○"))
+	} else {
+		fmt.Printf("  %s closed agent bead %s\n", style.Success.Render("✓"), agentBeadID)
 	}
 
 	return nil
@@ -1370,15 +1380,17 @@ func runPolecatStale(cmd *cobra.Command, args []string) error {
 				if !info.IsStale {
 					continue
 				}
-				fmt.Printf("  Nuking %s...", info.Name)
-				if err := mgr.RemoveWithOptions(info.Name, true, false, false); err != nil {
-					fmt.Printf(" %s (%v)\n", style.Error.Render("failed"), err)
+				fmt.Printf("Nuking %s...\n", info.Name)
+				if err := nukePolecatFull(info.Name, rigName, mgr, r); err != nil {
+					fmt.Printf("  %s (%v)\n", style.Error.Render("failed"), err)
 				} else {
-					fmt.Printf(" %s\n", style.Success.Render("done"))
 					nuked++
 				}
 			}
 			fmt.Printf("\n%s Nuked %d stale polecat(s).\n", style.SuccessPrefix, nuked)
+
+			// Clean up any orphaned processes that survived session termination
+			cleanupOrphanedProcesses()
 		}
 	}
 

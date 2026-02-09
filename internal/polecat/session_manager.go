@@ -182,7 +182,11 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		}
 	}
 
-	runtimeConfig := config.LoadRuntimeConfig(m.rig.Path)
+	// Use ResolveRoleAgentConfig instead of deprecated LoadRuntimeConfig to properly
+	// resolve role_agents from town settings. This ensures EnsureSettingsForRole
+	// creates the correct settings/plugin for the configured agent (e.g., opencode).
+	townRoot := filepath.Dir(m.rig.Path)
+	runtimeConfig := config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
 
 	// Ensure runtime settings exist in polecat's home directory (polecats/<name>/).
 	// This keeps settings out of the git worktree while allowing runtime to find them
@@ -224,6 +228,10 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		command = config.PrependEnv(command, map[string]string{"BD_BRANCH": opts.DoltBranch})
 	}
 
+	// Disable Dolt auto-commit for polecats to prevent manifest contention
+	// under concurrent load (gt-5cc2p). Changes merge at gt done time.
+	command = config.PrependEnv(command, map[string]string{"BD_DOLT_AUTO_COMMIT": "off"})
+
 	// Create session with command directly to avoid send-keys race condition.
 	// See: https://github.com/anthropics/gastown/issues/280
 	if err := m.tmux.NewSessionWithCommand(sessionID, workDir, command); err != nil {
@@ -232,7 +240,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 	// Set environment (non-fatal: session works without these)
 	// Use centralized AgentEnv for consistency across all role startup paths
-	townRoot := filepath.Dir(m.rig.Path)
+	// Note: townRoot already defined above for ResolveRoleAgentConfig
 	envVars := config.AgentEnv(config.AgentEnvConfig{
 		Role:             "polecat",
 		Rig:              m.rig.Name,
@@ -250,6 +258,10 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	if opts.DoltBranch != "" {
 		debugSession("SetEnvironment BD_BRANCH", m.tmux.SetEnvironment(sessionID, "BD_BRANCH", opts.DoltBranch))
 	}
+
+	// Disable Dolt auto-commit in tmux session environment (gt-5cc2p).
+	// This ensures respawned processes also inherit the setting.
+	debugSession("SetEnvironment BD_DOLT_AUTO_COMMIT", m.tmux.SetEnvironment(sessionID, "BD_DOLT_AUTO_COMMIT", "off"))
 
 	// Hook the issue to the polecat if provided via --issue flag
 	if opts.Issue != "" {
@@ -338,7 +350,7 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 	// Try graceful shutdown first
 	if !force {
 		_ = m.tmux.SendKeysRaw(sessionID, "C-c")
-		time.Sleep(100 * time.Millisecond)
+		session.WaitForSessionExit(m.tmux, sessionID, constants.GracefulShutdownTimeout)
 	}
 
 	// Use KillSessionWithProcesses to ensure all descendant processes are killed.

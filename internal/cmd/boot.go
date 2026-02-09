@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/boot"
+	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -278,6 +279,14 @@ func runBootTriage(cmd *cobra.Command, args []string) error {
 // runDegradedTriage performs basic Deacon health check without AI reasoning.
 // This is a mechanical fallback when full Claude sessions aren't available.
 func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
+	// Abort triage if a shutdown is in progress. Without this check, Boot could
+	// detect Deacon as "down" during the graceful shutdown window and restart it,
+	// creating a zombie Deacon that survives gt down.
+	townRoot, _ := workspace.FindFromCwd()
+	if townRoot != "" && daemon.IsShutdownInProgress(townRoot) {
+		return "nothing", "shutdown-in-progress", nil
+	}
+
 	tm := b.Tmux()
 
 	// Check if Deacon session exists
@@ -288,14 +297,23 @@ func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
 	}
 
 	if !hasDeacon {
-		// Deacon not running - this is unusual, daemon should have restarted it
-		// In degraded mode, we just report - let daemon handle restart
-		return "report", "deacon-missing", nil
+		// Deacon not running - start it immediately rather than waiting
+		// for the next daemon heartbeat cycle (up to 3 minutes away).
+		fmt.Println("Deacon session missing - starting Deacon")
+		townRoot, _ := workspace.FindFromCwd()
+		if townRoot != "" {
+			mgr := deacon.NewManager(townRoot)
+			if err := mgr.Start(""); err != nil && err != deacon.ErrAlreadyRunning {
+				fmt.Printf("Failed to start Deacon: %v\n", err)
+				return "error", "deacon-start-failed", fmt.Errorf("starting deacon: %w", err)
+			}
+			return "start", "deacon-restarted", nil
+		}
+		return "error", "deacon-missing", fmt.Errorf("cannot find town root to start deacon")
 	}
 
 	// Deacon exists - check heartbeat to detect stuck sessions
 	// A session can exist but be stuck (not making progress)
-	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
 		hb := deacon.ReadHeartbeat(townRoot)
 		if hb.ShouldPoke() {

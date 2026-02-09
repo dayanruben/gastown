@@ -12,6 +12,7 @@ import (
 	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
@@ -377,7 +378,9 @@ func stopSession(t *tmux.Tmux, sessionName string) (bool, error) {
 	// Try graceful shutdown first (Ctrl-C, best-effort interrupt)
 	if !downForce {
 		_ = t.SendKeysRaw(sessionName, "C-c")
-		time.Sleep(100 * time.Millisecond)
+		if session.WaitForSessionExit(t, sessionName, constants.GracefulShutdownTimeout) {
+			return true, nil // Process exited gracefully
+		}
 	}
 
 	// Kill the session (with explicit process termination to prevent orphans)

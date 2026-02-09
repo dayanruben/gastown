@@ -119,15 +119,18 @@ type DoltServerManager struct {
 	restarting      bool          // Whether a restart is in progress (guards against concurrent restarts)
 
 	// Test hooks (nil = use real implementations; set only in tests)
-	healthCheckFn    func() error
-	startFn          func() error
-	runningFn        func() (int, bool)
-	stopFn           func()
-	sleepFn          func(time.Duration)
-	nowFn            func() time.Time
-	escalateFn       func(int)
-	unhealthyAlertFn func(error)
-	crashAlertFn     func(int)
+	healthCheckFn      func() error
+	writeProbeCheckFn  func() error
+	startFn            func() error
+	runningFn          func() (int, bool)
+	stopFn             func()
+	sleepFn            func(time.Duration)
+	nowFn              func() time.Time
+	escalateFn         func(int)
+	unhealthyAlertFn   func(error)
+	readOnlyAlertFn    func(error)
+	crashAlertFn       func(int)
+	listDatabasesFn    func() ([]string, error)
 }
 
 // NewDoltServerManager creates a new Dolt server manager.
@@ -305,6 +308,17 @@ func (m *DoltServerManager) EnsureRunning() error {
 			m.logger("Dolt server unhealthy: %v, restarting...", err)
 			m.sendUnhealthyAlert(err)
 			m.writeUnhealthySignal("health_check_failed", err.Error())
+			m.stopLocked()
+			return m.restartWithBackoff()
+		}
+		// Check write capability (read-only detection).
+		// The SELECT 1 health check above only verifies read connectivity.
+		// Under concurrent write load, Dolt can enter a persistent read-only
+		// state that requires a server restart to clear.
+		if err := m.checkWriteHealthLocked(); err != nil {
+			m.logger("Dolt server read-only: %v, restarting...", err)
+			m.sendReadOnlyAlert(err)
+			m.writeUnhealthySignal("read_only", err.Error())
 			m.stopLocked()
 			return m.restartWithBackoff()
 		}
@@ -872,6 +886,106 @@ func (m *DoltServerManager) checkDiskUsage() {
 	if total > gb {
 		m.logger("Warning: Dolt data directory %s is %.1f GB", dataDir, float64(total)/float64(gb))
 	}
+}
+
+// checkWriteHealthLocked probes the Dolt server's write capability by attempting
+// a test write operation. If the server is in read-only mode (e.g., from concurrent
+// write contention on the manifest), the write probe will fail with a characteristic
+// error. Returns an error only if the server is confirmed read-only.
+// Must be called with m.mu held.
+func (m *DoltServerManager) checkWriteHealthLocked() error {
+	if m.writeProbeCheckFn != nil {
+		return m.writeProbeCheckFn()
+	}
+
+	// Get a database to test writes against
+	databases, err := m.getDatabases()
+	if err != nil || len(databases) == 0 {
+		return nil // Skip write probe if no databases available
+	}
+
+	db := databases[0]
+
+	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
+	defer cancel()
+
+	// Attempt a write operation to detect read-only mode.
+	// CREATE TABLE IF NOT EXISTS is idempotent (safe if table lingers from previous probe).
+	// REPLACE INTO always writes a row, testing the storage layer even if the table existed.
+	// DROP TABLE IF EXISTS cleans up.
+	// If ANY statement triggers "database is read only", the command fails and we detect it.
+	query := fmt.Sprintf(
+		"USE `%s`; CREATE TABLE IF NOT EXISTS `__gt_health_probe` (v INT PRIMARY KEY); REPLACE INTO `__gt_health_probe` VALUES (1); DROP TABLE IF EXISTS `__gt_health_probe`",
+		db,
+	)
+	cmd := exec.CommandContext(ctx, "dolt", "sql", "-q", query)
+	cmd.Dir = m.config.DataDir
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		errMsg := strings.TrimSpace(string(output))
+		if isReadOnlyError(errMsg) {
+			return fmt.Errorf("dolt server is in read-only mode: %s", errMsg)
+		}
+		// Non-read-only failures: log warning but don't fail health check.
+		// These could be transient issues (timeout, lock contention) that
+		// don't indicate a persistent read-only state.
+		m.logger("Warning: Dolt write probe failed (non-read-only): %v (%s)", err, errMsg)
+	}
+
+	return nil
+}
+
+// getDatabases returns the list of databases. Uses the test hook if set.
+func (m *DoltServerManager) getDatabases() ([]string, error) {
+	if m.listDatabasesFn != nil {
+		return m.listDatabasesFn()
+	}
+	return m.listDatabases()
+}
+
+// isReadOnlyError checks if an error message indicates a Dolt read-only state.
+func isReadOnlyError(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "read only") ||
+		strings.Contains(lower, "read-only") ||
+		strings.Contains(lower, "readonly")
+}
+
+// sendReadOnlyAlert sends an alert when the Dolt server enters read-only mode.
+// This is distinct from unhealthy alerts — the server is running and responding
+// to reads, but cannot accept writes. Runs asynchronously.
+func (m *DoltServerManager) sendReadOnlyAlert(readOnlyErr error) {
+	if m.readOnlyAlertFn != nil {
+		m.readOnlyAlertFn(readOnlyErr)
+		return
+	}
+	subject := "ALERT: Dolt server entered READ-ONLY mode"
+	body := fmt.Sprintf(`The Dolt server is running but has entered read-only mode.
+All write operations (beads create, update, close) will fail until the server is restarted.
+
+The daemon is restarting the server automatically.
+
+Error: %v
+
+Data dir: %s
+Log file: %s
+Host: %s:%d
+
+This typically occurs under heavy concurrent write load when multiple agents
+contend for the storage manifest. If it recurs frequently, consider reducing
+concurrent polecat count or staggering write-heavy operations.`,
+		readOnlyErr,
+		m.config.DataDir, m.config.LogFile,
+		m.config.Host, m.config.Port)
+
+	townRoot := m.townRoot
+	logger := m.logger
+
+	go func() {
+		sendDoltAlertMail(townRoot, "mayor/", subject, body, logger)
+		sendDoltAlertToWitnesses(townRoot, subject, body, logger)
+	}()
 }
 
 // getDoltVersion returns the Dolt server version.

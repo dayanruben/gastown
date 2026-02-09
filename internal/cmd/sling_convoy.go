@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/beads"
-	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -183,8 +182,11 @@ func createAutoConvoy(beadID, beadTitle string) (string, error) {
 	depCmd.Stderr = os.Stderr
 
 	if err := depCmd.Run(); err != nil {
-		// Convoy was created but tracking failed - log warning but continue
-		fmt.Printf("%s Could not add tracking relation: %v\n", style.Dim.Render("Warning:"), err)
+		// Tracking failed — delete the orphan convoy to prevent accumulation
+		delCmd := exec.Command("bd", "--no-daemon", "close", convoyID, "-r", "tracking dep failed")
+		delCmd.Dir = townRoot
+		_ = delCmd.Run()
+		return "", fmt.Errorf("adding tracking relation for %s: %w", beadID, err)
 	}
 
 	return convoyID, nil

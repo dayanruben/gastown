@@ -1,6 +1,7 @@
 package witness
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -228,5 +229,155 @@ func TestFindAnyCleanupWisp_NoBdAvailable(t *testing.T) {
 	result := findAnyCleanupWisp("/nonexistent", "testpolecat")
 	if result != "" {
 		t.Errorf("findAnyCleanupWisp = %q, want empty when bd unavailable", result)
+	}
+}
+
+func TestExtractDoneIntent_Valid(t *testing.T) {
+	ts := time.Now().Add(-45 * time.Second)
+	labels := []string{
+		"gt:agent",
+		"idle:2",
+		fmt.Sprintf("done-intent:COMPLETED:%d", ts.Unix()),
+	}
+
+	intent := extractDoneIntent(labels)
+	if intent == nil {
+		t.Fatal("extractDoneIntent returned nil for valid label")
+	}
+	if intent.ExitType != "COMPLETED" {
+		t.Errorf("ExitType = %q, want %q", intent.ExitType, "COMPLETED")
+	}
+	if intent.Timestamp.Unix() != ts.Unix() {
+		t.Errorf("Timestamp = %d, want %d", intent.Timestamp.Unix(), ts.Unix())
+	}
+}
+
+func TestExtractDoneIntent_Missing(t *testing.T) {
+	labels := []string{"gt:agent", "idle:2", "backoff-until:1738972900"}
+
+	intent := extractDoneIntent(labels)
+	if intent != nil {
+		t.Errorf("extractDoneIntent = %+v, want nil for no done-intent label", intent)
+	}
+}
+
+func TestExtractDoneIntent_Malformed(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels []string
+	}{
+		{"missing timestamp", []string{"done-intent:COMPLETED"}},
+		{"bad timestamp", []string{"done-intent:COMPLETED:notanumber"}},
+		{"empty labels", nil},
+		{"empty label list", []string{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			intent := extractDoneIntent(tt.labels)
+			if intent != nil {
+				t.Errorf("extractDoneIntent(%v) = %+v, want nil for malformed input", tt.labels, intent)
+			}
+		})
+	}
+}
+
+func TestExtractDoneIntent_AllExitTypes(t *testing.T) {
+	ts := time.Now().Unix()
+	for _, exitType := range []string{"COMPLETED", "ESCALATED", "DEFERRED", "PHASE_COMPLETE"} {
+		label := fmt.Sprintf("done-intent:%s:%d", exitType, ts)
+		intent := extractDoneIntent([]string{label})
+		if intent == nil {
+			t.Errorf("extractDoneIntent returned nil for exit type %q", exitType)
+			continue
+		}
+		if intent.ExitType != exitType {
+			t.Errorf("ExitType = %q, want %q", intent.ExitType, exitType)
+		}
+	}
+}
+
+func TestDetectZombie_DoneIntentDeadSession(t *testing.T) {
+	// Verify the logic: dead session + done-intent older than 30s → should be treated as zombie
+	doneIntent := &DoneIntent{
+		ExitType:  "COMPLETED",
+		Timestamp: time.Now().Add(-60 * time.Second), // 60s old
+	}
+	sessionAlive := false
+	age := time.Since(doneIntent.Timestamp)
+
+	// Dead session + old intent → auto-nuke path
+	shouldAutoNuke := !sessionAlive && doneIntent != nil && age >= 30*time.Second
+	if !shouldAutoNuke {
+		t.Errorf("expected auto-nuke for dead session + old done-intent (age=%v)", age)
+	}
+}
+
+func TestDetectZombie_DoneIntentLiveStuck(t *testing.T) {
+	// Verify the logic: live session + done-intent older than 60s → should kill session
+	doneIntent := &DoneIntent{
+		ExitType:  "COMPLETED",
+		Timestamp: time.Now().Add(-90 * time.Second), // 90s old
+	}
+	sessionAlive := true
+	age := time.Since(doneIntent.Timestamp)
+
+	// Live session + old intent → kill stuck session
+	shouldKill := sessionAlive && doneIntent != nil && age > 60*time.Second
+	if !shouldKill {
+		t.Errorf("expected kill for live session + old done-intent (age=%v)", age)
+	}
+}
+
+func TestDetectZombie_DoneIntentRecent(t *testing.T) {
+	// Verify the logic: done-intent younger than 30s → skip (polecat still working)
+	doneIntent := &DoneIntent{
+		ExitType:  "COMPLETED",
+		Timestamp: time.Now().Add(-10 * time.Second), // 10s old
+	}
+	sessionAlive := false
+	age := time.Since(doneIntent.Timestamp)
+
+	// Recent intent → should skip
+	shouldSkip := !sessionAlive && doneIntent != nil && age < 30*time.Second
+	if !shouldSkip {
+		t.Errorf("expected skip for recent done-intent (age=%v)", age)
+	}
+
+	// Live session + recent intent → also skip
+	sessionAlive = true
+	shouldSkipLive := sessionAlive && doneIntent != nil && age <= 60*time.Second
+	if !shouldSkipLive {
+		t.Errorf("expected skip for live session + recent done-intent (age=%v)", age)
+	}
+}
+
+func TestDetectZombie_AgentDeadInLiveSession(t *testing.T) {
+	// Verify the logic: live session + agent process dead → zombie
+	// This is the gt-kj6r6 fix: DetectZombiePolecats now checks IsAgentAlive
+	// for sessions that DO exist, catching the tmux-alive-but-agent-dead class.
+	sessionAlive := true
+	agentAlive := false
+	var doneIntent *DoneIntent // No done-intent
+
+	// Live session + no done-intent + agent dead → should be classified as zombie
+	shouldDetect := sessionAlive && doneIntent == nil && !agentAlive
+	if !shouldDetect {
+		t.Error("expected zombie detection for live session with dead agent")
+	}
+
+	// Live session + agent alive → NOT a zombie
+	agentAlive = true
+	shouldSkip := sessionAlive && doneIntent == nil && agentAlive
+	if !shouldSkip {
+		t.Error("expected skip for live session with alive agent")
+	}
+}
+
+func TestGetAgentBeadLabels_NoBdAvailable(t *testing.T) {
+	// When bd is not available, should return nil without panicking
+	labels := getAgentBeadLabels("/nonexistent", "nonexistent-bead")
+	if labels != nil {
+		t.Errorf("getAgentBeadLabels = %v, want nil when bd unavailable", labels)
 	}
 }

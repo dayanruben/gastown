@@ -28,6 +28,16 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		}
 	}
 
+	// Cross-rig guard: check all beads match the target rig before spawning (gt-myecw)
+	if !slingForce {
+		townRoot := filepath.Dir(townBeadsDir)
+		for _, beadID := range beadIDs {
+			if err := checkCrossRigGuard(beadID, rigName+"/polecats/_", townRoot); err != nil {
+				return err
+			}
+		}
+	}
+
 	if slingDryRun {
 		fmt.Printf("%s Batch slinging %d beads to rig '%s':\n", style.Bold.Render("🎯"), len(beadIDs), rigName)
 		fmt.Printf("  Would cook mol-polecat-work formula once\n")
@@ -129,7 +139,7 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		// Cook once (lazy), then instantiate for each bead
 		if !formulaCooked {
 			workDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
-			if err := CookFormula(formulaName, workDir); err != nil {
+			if err := CookFormula(formulaName, workDir, townRoot); err != nil {
 				fmt.Printf("  %s Could not cook formula %s: %v\n", style.Dim.Render("Warning:"), formulaName, err)
 				// Fall back to raw hook if formula cook fails
 			} else {

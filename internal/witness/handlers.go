@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -865,9 +866,11 @@ type DetectZombiePolecatsResult struct {
 }
 
 // DetectZombiePolecats cross-references polecat agent state with tmux session
-// existence to find zombie polecats. A zombie is a polecat whose tmux session
-// is dead but whose agent bead still shows agent_state="working", "running",
-// or "spawning", or has a hook_bead assigned.
+// existence and agent process liveness to find zombie polecats. Two zombie classes:
+//   - Session-dead: tmux session is dead but agent bead still shows agent_state=
+//     "working", "running", or "spawning", or has a hook_bead assigned.
+//   - Agent-dead: tmux session exists but the agent process (Claude/node) inside
+//     it has died. Detected via IsAgentAlive. See gt-kj6r6.
 //
 // Zombies cannot send POLECAT_DONE or other signals, so they sit undetected
 // by the reactive signal-based patrol. This function provides proactive detection.
@@ -925,14 +928,74 @@ func DetectZombiePolecats(workDir, rigName string, router *mail.Router) *DetectZ
 				fmt.Errorf("checking session %s: %w", sessionName, err))
 			continue
 		}
-		if sessionAlive {
-			continue // Session exists — not a zombie
-		}
-
-		// Session is dead. Check agent bead state.
+		// Read agent bead labels for done-intent detection.
+		// Done early because we need it for both live and dead session paths.
 		prefix := beads.GetPrefixForRig(townRoot, rigName)
 		agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
+		labels := getAgentBeadLabels(workDir, agentBeadID)
+		doneIntent := extractDoneIntent(labels)
 
+		if sessionAlive {
+			// Live session — normally not a zombie. But check for done-intent
+			// that's been stuck too long (polecat hung in gt done).
+			if doneIntent != nil && time.Since(doneIntent.Timestamp) > 60*time.Second {
+				// Polecat has been stuck in gt done for >60s — kill session.
+				zombie := ZombieResult{
+					PolecatName: polecatName,
+					AgentState:  "stuck-in-done",
+					Action:      fmt.Sprintf("killed-stuck-session (done-intent age=%v)", time.Since(doneIntent.Timestamp).Round(time.Second)),
+				}
+				if err := NukePolecat(workDir, rigName, polecatName); err != nil {
+					zombie.Error = err
+					zombie.Action = fmt.Sprintf("kill-stuck-session-failed: %v", err)
+				}
+				result.Zombies = append(result.Zombies, zombie)
+				continue
+			}
+
+			// Tmux session exists but agent process may have died inside it.
+			// This catches the "tmux-alive-but-agent-dead" zombie class that
+			// status.go detects but DetectZombiePolecats previously missed.
+			// See: gt-kj6r6
+			if !t.IsAgentAlive(sessionName) {
+				zombie := ZombieResult{
+					PolecatName: polecatName,
+					AgentState:  "agent-dead-in-session",
+					Action:      "killed-agent-dead-session",
+				}
+				if err := NukePolecat(workDir, rigName, polecatName); err != nil {
+					zombie.Error = err
+					zombie.Action = fmt.Sprintf("kill-agent-dead-session-failed: %v", err)
+				}
+				result.Zombies = append(result.Zombies, zombie)
+			}
+			continue // Either handled or not a zombie
+		}
+
+		// Session is dead. Check for done-intent first (faster path).
+		if doneIntent != nil {
+			age := time.Since(doneIntent.Timestamp)
+			if age < 30*time.Second {
+				// Recent done-intent — polecat is still working through gt done.
+				// Skip, don't interfere.
+				continue
+			}
+			// Old done-intent + dead session = polecat tried to exit but session
+			// died mid-gt-done. Auto-nuke without further checks.
+			zombie := ZombieResult{
+				PolecatName: polecatName,
+				AgentState:  "done-intent-dead",
+				Action:      fmt.Sprintf("auto-nuked (done-intent age=%v, type=%s)", age.Round(time.Second), doneIntent.ExitType),
+			}
+			if err := NukePolecat(workDir, rigName, polecatName); err != nil {
+				zombie.Error = err
+				zombie.Action = fmt.Sprintf("nuke-failed (done-intent): %v", err)
+			}
+			result.Zombies = append(result.Zombies, zombie)
+			continue
+		}
+
+		// No done-intent. Fall back to standard zombie detection.
 		agentState, hookBead := getAgentBeadState(workDir, agentBeadID)
 
 		// A zombie has a dead session but agent_state suggests it should be alive,
@@ -1056,6 +1119,53 @@ func getAgentBeadState(workDir, agentBeadID string) (agentState, hookBead string
 	}
 
 	return issues[0].AgentState, issues[0].HookBead
+}
+
+// DoneIntent represents a parsed done-intent label from an agent bead.
+type DoneIntent struct {
+	ExitType  string
+	Timestamp time.Time
+}
+
+// extractDoneIntent parses a done-intent:<type>:<unix-ts> label from a label list.
+// Returns nil if no done-intent label is found or if the label is malformed.
+func extractDoneIntent(labels []string) *DoneIntent {
+	for _, label := range labels {
+		if !strings.HasPrefix(label, "done-intent:") {
+			continue
+		}
+		// Format: done-intent:<type>:<unix-ts>
+		parts := strings.SplitN(label, ":", 3)
+		if len(parts) != 3 {
+			return nil // Malformed
+		}
+		ts, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil {
+			return nil // Malformed timestamp
+		}
+		return &DoneIntent{
+			ExitType:  parts[1],
+			Timestamp: time.Unix(ts, 0),
+		}
+	}
+	return nil
+}
+
+// getAgentBeadLabels reads the labels from an agent bead.
+func getAgentBeadLabels(workDir, agentBeadID string) []string {
+	output, err := util.ExecWithOutput(workDir, "bd", "show", agentBeadID, "--json")
+	if err != nil || output == "" {
+		return nil
+	}
+
+	var issues []struct {
+		Labels []string `json:"labels"`
+	}
+	if err := json.Unmarshal([]byte(output), &issues); err != nil || len(issues) == 0 {
+		return nil
+	}
+
+	return issues[0].Labels
 }
 
 // sessionRecreated checks whether a tmux session was (re)created after the

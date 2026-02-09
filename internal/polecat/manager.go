@@ -62,7 +62,9 @@ func isDoltOptimisticLockError(err error) bool {
 	return strings.Contains(msg, "optimistic lock") ||
 		strings.Contains(msg, "serialization failure") ||
 		strings.Contains(msg, "lock wait timeout") ||
-		strings.Contains(msg, "try restarting transaction")
+		strings.Contains(msg, "try restarting transaction") ||
+		strings.Contains(msg, "database is read only") ||
+		strings.Contains(msg, "cannot update manifest")
 }
 
 // Common errors
@@ -172,6 +174,7 @@ func (m *Manager) lockPool() (*flock.Flock, error) {
 // CheckDoltHealth verifies that the Dolt database is reachable before spawning.
 // Returns an error if Dolt exists but is unhealthy after retries.
 // Returns nil if beads is not configured (test/setup environments).
+// If read-only errors persist after retries, attempts server recovery (gt-chx92).
 func (m *Manager) CheckDoltHealth() error {
 	var lastErr error
 	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
@@ -196,6 +199,22 @@ func (m *Manager) CheckDoltHealth() error {
 			time.Sleep(backoff)
 		}
 	}
+
+	// If the persistent failure looks like read-only, attempt server recovery
+	// before giving up. This is the gt-level recovery path (gt-chx92).
+	if lastErr != nil && doltserver.IsReadOnlyError(lastErr.Error()) {
+		townRoot, err := workspace.Find(m.rig.Path)
+		if err == nil && townRoot != "" {
+			if recoverErr := doltserver.RecoverReadOnly(townRoot); recoverErr == nil {
+				// Recovery succeeded — verify health once more
+				_, err := m.beads.Show("__health_check_nonexistent__")
+				if err == nil || errors.Is(err, beads.ErrNotFound) || strings.Contains(err.Error(), "not found") {
+					return nil
+				}
+			}
+		}
+	}
+
 	return fmt.Errorf("%w: %v", ErrDoltUnhealthy, lastErr)
 }
 
@@ -203,7 +222,8 @@ func (m *Manager) CheckDoltHealth() error {
 // This is an admission control gate: if the server is near its max_connections limit,
 // spawning another polecat (which will make many bd calls) could overwhelm it.
 // Returns nil if capacity is available, ErrDoltAtCapacity if the server is overloaded.
-// Returns nil (optimistic) if the check cannot be performed (e.g., non-server mode).
+// Fails closed if the check errors — a server that can't report capacity is likely
+// already under stress (gt-lfc0d).
 func (m *Manager) CheckDoltServerCapacity() error {
 	townRoot, err := workspace.Find(m.rig.Path)
 	if err != nil || townRoot == "" {
@@ -212,8 +232,9 @@ func (m *Manager) CheckDoltServerCapacity() error {
 
 	hasCapacity, active, err := doltserver.HasConnectionCapacity(townRoot)
 	if err != nil {
-		// Can't check capacity — proceed optimistically
-		return nil
+		// Fail closed: if we can't check capacity, the server may be overloaded.
+		// Proceeding optimistically caused read-only mode under load (gt-lfc0d).
+		return fmt.Errorf("%w: capacity check failed: %v", ErrDoltAtCapacity, err)
 	}
 
 	if !hasCapacity {

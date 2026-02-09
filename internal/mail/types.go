@@ -305,7 +305,18 @@ type BeadsMessage struct {
 }
 
 // ParseLabels extracts metadata from the labels array.
+// Safe to call multiple times - resets parsed state before re-parsing.
 func (bm *BeadsMessage) ParseLabels() {
+	bm.sender = ""
+	bm.threadID = ""
+	bm.replyTo = ""
+	bm.msgType = ""
+	bm.cc = nil
+	bm.queue = ""
+	bm.channel = ""
+	bm.claimedBy = ""
+	bm.claimedAt = nil
+
 	for _, label := range bm.Labels {
 		if strings.HasPrefix(label, "from:") {
 			bm.sender = strings.TrimPrefix(label, "from:")
