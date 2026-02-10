@@ -409,11 +409,20 @@ func runSling(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("checking bead status: %w", err)
 	}
 	if (info.Status == "pinned" || info.Status == "hooked") && !slingForce {
-		assignee := info.Assignee
-		if assignee == "" {
-			assignee = "(unknown)"
+		// Auto-force when hooked agent's session is confirmed dead (gt-pqf9x).
+		// This eliminates the #1 friction in convoy feeding: stale hooks from
+		// dead polecats blocking re-sling without --force.
+		if info.Status == "hooked" && info.Assignee != "" && isHookedAgentDead(info.Assignee) {
+			fmt.Printf("%s Hooked agent %s has no active session, auto-forcing re-sling...\n",
+				style.Warning.Render("⚠"), info.Assignee)
+			slingForce = true
+		} else {
+			assignee := info.Assignee
+			if assignee == "" {
+				assignee = "(unknown)"
+			}
+			return fmt.Errorf("bead %s is already %s to %s\nUse --force to re-sling", beadID, info.Status, assignee)
 		}
-		return fmt.Errorf("bead %s is already %s to %s\nUse --force to re-sling", beadID, info.Status, assignee)
 	}
 
 	// Handle --force when bead is already hooked: send shutdown to old polecat and unhook

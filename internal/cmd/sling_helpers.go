@@ -533,3 +533,20 @@ func CookFormula(formulaName, workDir, townRoot string) error {
 	cookCmd.Stderr = os.Stderr
 	return cookCmd.Run()
 }
+
+// isHookedAgentDead checks if the tmux session for a hooked assignee is dead.
+// Used by sling to auto-force re-sling when the previous agent has no active session (gt-pqf9x).
+// Returns true if the session is confirmed dead. Returns false if alive or if we
+// can't determine liveness (conservative: don't auto-force on uncertainty).
+func isHookedAgentDead(assignee string) bool {
+	sessionName, _ := assigneeToSessionName(assignee)
+	if sessionName == "" {
+		return false // Unknown format, can't determine
+	}
+	t := tmux.NewTmux()
+	alive, err := t.HasSession(sessionName)
+	if err != nil {
+		return false // tmux not available or error, be conservative
+	}
+	return !alive
+}
