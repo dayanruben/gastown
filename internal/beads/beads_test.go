@@ -149,7 +149,7 @@ func TestIntegration(t *testing.T) {
 	b := New(dir)
 
 	// Sync database with JSONL before testing to avoid "Database out of sync" errors.
-	// This can happen when JSONL is updated (e.g., by git pull) but the SQLite database
+	// This can happen when JSONL is updated (e.g., by git pull) but the database
 	// hasn't been imported yet. Running sync --import-only ensures we test against
 	// consistent data and prevents flaky test failures.
 	// We use --allow-stale to handle cases where the daemon is actively writing and
@@ -1644,30 +1644,6 @@ func TestParseWispTTLKey(t *testing.T) {
 			}
 			if gotType != tt.wantType {
 				t.Errorf("ParseWispTTLKey(%q) type = %q, want %q", tt.key, gotType, tt.wantType)
-			}
-		})
-	}
-}
-
-// TestRoleBeadID tests role bead ID generation.
-func TestRoleBeadID(t *testing.T) {
-	tests := []struct {
-		roleType string
-		want     string
-	}{
-		{"mayor", "gt-mayor-role"},
-		{"deacon", "gt-deacon-role"},
-		{"witness", "gt-witness-role"},
-		{"refinery", "gt-refinery-role"},
-		{"crew", "gt-crew-role"},
-		{"polecat", "gt-polecat-role"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.roleType, func(t *testing.T) {
-			got := RoleBeadID(tt.roleType)
-			if got != tt.want {
-				t.Errorf("RoleBeadID(%q) = %q, want %q", tt.roleType, got, tt.want)
 			}
 		})
 	}

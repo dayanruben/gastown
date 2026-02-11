@@ -21,17 +21,36 @@ import (
 // sessionNudgeLocks serializes nudges to the same session.
 // This prevents interleaving when multiple nudges arrive concurrently,
 // which can cause garbled input and missed Enter keys.
-var sessionNudgeLocks sync.Map // map[string]*sync.Mutex
+// Uses channel-based semaphores instead of sync.Mutex to support
+// timed lock acquisition — preventing permanent lockout if a nudge hangs.
+var sessionNudgeLocks sync.Map // map[string]chan struct{}
+
+// nudgeLockTimeout is how long to wait to acquire the per-session nudge lock.
+// If a previous nudge is still holding the lock after this duration, we give up
+// rather than blocking forever. This prevents a hung tmux from permanently
+// blocking all future nudges to that session.
+const nudgeLockTimeout = 30 * time.Second
 
 // validSessionNameRe validates session names to prevent shell injection
 var validSessionNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // Common errors
 var (
-	ErrNoServer        = errors.New("no tmux server running")
-	ErrSessionExists   = errors.New("session already exists")
-	ErrSessionNotFound = errors.New("session not found")
+	ErrNoServer            = errors.New("no tmux server running")
+	ErrSessionExists       = errors.New("session already exists")
+	ErrSessionNotFound     = errors.New("session not found")
+	ErrInvalidSessionName  = errors.New("invalid session name")
 )
+
+// validateSessionName checks that a session name contains only safe characters.
+// Returns ErrInvalidSessionName if the name contains dots, colons, or other
+// characters that cause tmux to silently fail or produce cryptic errors.
+func validateSessionName(name string) error {
+	if name == "" || !validSessionNameRe.MatchString(name) {
+		return fmt.Errorf("%w %q: must match %s", ErrInvalidSessionName, name, validSessionNameRe.String())
+	}
+	return nil
+}
 
 // Tmux wraps tmux operations.
 type Tmux struct{}
@@ -86,6 +105,9 @@ func (t *Tmux) wrapError(err error, stderr string, args []string) error {
 
 // NewSession creates a new detached tmux session.
 func (t *Tmux) NewSession(name, workDir string) error {
+	if err := validateSessionName(name); err != nil {
+		return err
+	}
 	args := []string{"new-session", "-d", "-s", name}
 	if workDir != "" {
 		args = append(args, "-c", workDir)
@@ -100,6 +122,9 @@ func (t *Tmux) NewSession(name, workDir string) error {
 // initial process of the pane.
 // See: https://github.com/anthropics/gastown/issues/280
 func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
+	if err := validateSessionName(name); err != nil {
+		return err
+	}
 	args := []string{"new-session", "-d", "-s", name}
 	if workDir != "" {
 		args = append(args, "-c", workDir)
@@ -118,31 +143,45 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 // - The tmux session exists
 // - But Claude (node process) is not running in it
 //
-// Returns nil if session was created successfully.
+// Uses create-first approach to avoid TOCTOU race conditions in multi-agent
+// environments where another agent could create the same session between a
+// check and create call.
+//
+// Returns nil if session was created successfully or already exists with a running agent.
 func (t *Tmux) EnsureSessionFresh(name, workDir string) error {
-	// Check if session already exists
-	exists, err := t.HasSession(name)
-	if err != nil {
-		return fmt.Errorf("checking session: %w", err)
+	if err := validateSessionName(name); err != nil {
+		return err
 	}
 
-	if exists {
-		// Session exists - check if it's a zombie
-		if !t.IsAgentRunning(name) {
-			// Zombie session: tmux alive but Claude dead
-			// Kill it so we can create a fresh one
-			// Use KillSessionWithProcesses to ensure all descendant processes are killed
-			if err := t.KillSessionWithProcesses(name); err != nil {
-				return fmt.Errorf("killing zombie session: %w", err)
-			}
-		} else {
-			// Session is healthy (Claude running) - nothing to do
-			return nil
-		}
+	// Try to create the session first (atomic — avoids check-then-create race)
+	err := t.NewSession(name, workDir)
+	if err == nil {
+		return nil // Created successfully
+	}
+	if err != ErrSessionExists {
+		return fmt.Errorf("creating session: %w", err)
 	}
 
-	// Create fresh session
-	return t.NewSession(name, workDir)
+	// Session already exists — check if it's a zombie
+	if t.IsAgentRunning(name) {
+		// Session is healthy (agent running) — nothing to do
+		return nil
+	}
+
+	// Zombie session: tmux alive but agent dead
+	// Kill it so we can create a fresh one
+	// Use KillSessionWithProcesses to ensure all descendant processes are killed
+	if err := t.KillSessionWithProcesses(name); err != nil {
+		return fmt.Errorf("killing zombie session: %w", err)
+	}
+
+	// Create fresh session (handle race: another agent may have created it
+	// between our kill and this create — that's fine, treat as success)
+	err = t.NewSession(name, workDir)
+	if err == ErrSessionExists {
+		return nil
+	}
+	return err
 }
 
 // KillSession terminates a tmux session.
@@ -727,11 +766,35 @@ func (t *Tmux) SendKeysDelayedDebounced(session, keys string, preDelayMs, deboun
 	return t.SendKeysDebounced(session, keys, debounceMs)
 }
 
-// getSessionNudgeLock returns the mutex for serializing nudges to a session.
-// Creates a new mutex if one doesn't exist for this session.
-func getSessionNudgeLock(session string) *sync.Mutex {
-	actual, _ := sessionNudgeLocks.LoadOrStore(session, &sync.Mutex{})
-	return actual.(*sync.Mutex)
+// getSessionNudgeSem returns the channel semaphore for serializing nudges to a session.
+// Creates a new semaphore if one doesn't exist for this session.
+// The semaphore is a buffered channel of size 1 — send to acquire, receive to release.
+func getSessionNudgeSem(session string) chan struct{} {
+	sem := make(chan struct{}, 1)
+	actual, _ := sessionNudgeLocks.LoadOrStore(session, sem)
+	return actual.(chan struct{})
+}
+
+// acquireNudgeLock attempts to acquire the per-session nudge lock with a timeout.
+// Returns true if the lock was acquired, false if the timeout expired.
+func acquireNudgeLock(session string, timeout time.Duration) bool {
+	sem := getSessionNudgeSem(session)
+	select {
+	case sem <- struct{}{}:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// releaseNudgeLock releases the per-session nudge lock.
+func releaseNudgeLock(session string) {
+	sem := getSessionNudgeSem(session)
+	select {
+	case <-sem:
+	default:
+		// Lock wasn't held — shouldn't happen, but don't block
+	}
 }
 
 // IsSessionAttached returns true if the session has any clients attached.
@@ -778,10 +841,12 @@ func (t *Tmux) WakePaneIfDetached(target string) {
 // queue up and execute one at a time. This prevents garbled input when
 // SessionStart hooks and nudges arrive simultaneously.
 func (t *Tmux) NudgeSession(session, message string) error {
-	// Serialize nudges to this session to prevent interleaving
-	lock := getSessionNudgeLock(session)
-	lock.Lock()
-	defer lock.Unlock()
+	// Serialize nudges to this session to prevent interleaving.
+	// Use a timed lock to avoid permanent blocking if a previous nudge hung.
+	if !acquireNudgeLock(session, nudgeLockTimeout) {
+		return fmt.Errorf("nudge lock timeout for session %q: previous nudge may be hung", session)
+	}
+	defer releaseNudgeLock(session)
 
 	// Resolve the correct target: in multi-pane sessions, find the pane
 	// running the agent rather than sending to the focused pane.
@@ -825,10 +890,12 @@ func (t *Tmux) NudgeSession(session, message string) error {
 // After sending, triggers SIGWINCH to wake Claude in detached sessions.
 // Nudges to the same pane are serialized to prevent interleaving.
 func (t *Tmux) NudgePane(pane, message string) error {
-	// Serialize nudges to this pane to prevent interleaving
-	lock := getSessionNudgeLock(pane)
-	lock.Lock()
-	defer lock.Unlock()
+	// Serialize nudges to this pane to prevent interleaving.
+	// Use a timed lock to avoid permanent blocking if a previous nudge hung.
+	if !acquireNudgeLock(pane, nudgeLockTimeout) {
+		return fmt.Errorf("nudge lock timeout for pane %q: previous nudge may be hung", pane)
+	}
+	defer releaseNudgeLock(pane)
 
 	// 1. Send text in literal mode (handles special characters)
 	if _, err := t.run("send-keys", "-t", pane, "-l", message); err != nil {
@@ -1194,6 +1261,9 @@ func (t *Tmux) GetAllEnvironment(session string) (map[string]string, error) {
 
 // RenameSession renames a session.
 func (t *Tmux) RenameSession(oldName, newName string) error {
+	if err := validateSessionName(newName); err != nil {
+		return err
+	}
 	_, err := t.run("rename-session", "-t", oldName, newName)
 	return err
 }
@@ -1531,9 +1601,8 @@ func (t *Tmux) SetStatusFormat(session, rig, worker, role string) error {
 // SetDynamicStatus configures the right side with dynamic content.
 // Uses a shell command that tmux calls periodically to get current status.
 func (t *Tmux) SetDynamicStatus(session string) error {
-	// Validate session name to prevent shell injection
-	if !validSessionNameRe.MatchString(session) {
-		return fmt.Errorf("invalid session name %q: must match %s", session, validSessionNameRe.String())
+	if err := validateSessionName(session); err != nil {
+		return err
 	}
 
 	// tmux calls this command every status-interval seconds
@@ -1810,9 +1879,12 @@ func (t *Tmux) CleanupOrphanedSessions() (cleaned int, err error) {
 // When the pane exits, tmux runs the hook command with exit status info.
 // The agentID is used to identify the agent in crash logs (e.g., "gastown/Toast").
 func (t *Tmux) SetPaneDiedHook(session, agentID string) error {
-	// Sanitize inputs to prevent shell injection
-	session = strings.ReplaceAll(session, "'", "'\\''")
+	if err := validateSessionName(session); err != nil {
+		return err
+	}
+	// Sanitize agentID to prevent shell injection (session already validated by regex)
 	agentID = strings.ReplaceAll(agentID, "'", "'\\''")
+	session = strings.ReplaceAll(session, "'", "'\\''") // safe after validation, but keep for consistency
 
 	// Hook command logs the crash with exit status
 	// #{pane_dead_status} is the exit code of the process that died
@@ -1836,6 +1908,9 @@ func (t *Tmux) SetPaneDiedHook(session, agentID string) error {
 //
 // Requires remain-on-exit to be set first (called automatically by this function).
 func (t *Tmux) SetAutoRespawnHook(session string) error {
+	if err := validateSessionName(session); err != nil {
+		return err
+	}
 	// First, enable remain-on-exit so the pane stays after process exit
 	if err := t.SetRemainOnExit(session, true); err != nil {
 		return fmt.Errorf("setting remain-on-exit: %w", err)
