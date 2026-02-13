@@ -1033,7 +1033,7 @@ func lookupAgentConfigIfExists(name string, townSettings *TownSettings, rigSetti
 // If a configured agent is not found or its binary doesn't exist, a warning is
 // printed to stderr and it falls back to the default agent.
 //
-// role is one of: "mayor", "deacon", "witness", "refinery", "polecat", "crew".
+// role is one of: "mayor", "deacon", "witness", "refinery", "polecat", "crew", "boot".
 // townRoot is the path to the town directory (e.g., ~/gt).
 // rigPath is the path to the rig directory (e.g., ~/gt/gastown), or empty for town-level roles.
 func ResolveRoleAgentConfig(role, townRoot, rigPath string) *RuntimeConfig {
@@ -1557,6 +1557,8 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 		resolvedEnv[k] = v
 	}
 
+	SanitizeAgentEnv(resolvedEnv, envVars)
+
 	// Build environment export prefix
 	var exports []string
 	for k, v := range resolvedEnv {
@@ -1583,6 +1585,31 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 	}
 
 	return cmd
+}
+
+// SanitizeAgentEnv clears environment variables that are known to break agent
+// startup when inherited from the parent shell/tmux environment.
+//
+// This is a SUPPLEMENTAL guard for paths that don't use AgentEnv() (which is
+// the primary guard — see env.go). It protects: lifecycle.go's default path
+// (non-polecat/non-crew roles) and handoff.go's manual export building.
+// For callers that pass AgentEnv()-produced maps, this is a no-op since
+// AgentEnv() already sets NODE_OPTIONS="".
+//
+// callerEnv is the original env map from the caller (before rc.Env merging).
+// resolvedEnv is the post-merge map that may also contain values from rc.Env.
+// NODE_OPTIONS is only cleared if neither callerEnv nor resolvedEnv (via rc.Env)
+// explicitly provides it.
+func SanitizeAgentEnv(resolvedEnv, callerEnv map[string]string) {
+	// NODE_OPTIONS may contain debugger flags (e.g., --inspect from VSCode)
+	// that cause Claude's Node.js runtime to crash with "Debugger attached" errors.
+	// Only clear if not explicitly provided by the caller or agent config (rc.Env).
+	if _, ok := callerEnv["NODE_OPTIONS"]; !ok {
+		// Inner guard: preserve if rc.Env already set it in resolvedEnv
+		if _, ok := resolvedEnv["NODE_OPTIONS"]; !ok {
+			resolvedEnv["NODE_OPTIONS"] = ""
+		}
+	}
 }
 
 // PrependEnv prepends export statements to a command string.
@@ -1681,6 +1708,8 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	for k, v := range rc.Env {
 		resolvedEnv[k] = v
 	}
+
+	SanitizeAgentEnv(resolvedEnv, envVars)
 
 	// Build environment export prefix
 	var exports []string
