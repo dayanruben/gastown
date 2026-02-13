@@ -1618,14 +1618,25 @@ func TestSendKeysLiteralWithRetry_NonTransientFails(t *testing.T) {
 	}
 }
 
-func TestSendKeysLiteralWithRetry_Timeout(t *testing.T) {
-	// Test that the timeout is respected even with a mock scenario.
-	// We test this with a nonexistent session that returns a transient-like error.
-	// Since real "not in a mode" requires a specific tmux state, we test the
-	// timeout behavior via the non-transient fast-fail path above and the
-	// immediate-success path. The retry logic itself is exercised through
-	// integration testing (gt nudge after gt crew at).
-	t.Log("timeout behavior covered by integration tests")
+func TestSendKeysLiteralWithRetry_NonTransientFailsFast(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	tm := NewTmux()
+	// Use a nonexistent session — tmux returns "session not found" which is
+	// non-transient, so the function should fail fast (well under the timeout).
+	start := time.Now()
+	err := tm.sendKeysLiteralWithRetry("gt-nonexistent-session-fast-fail", "hello", 5*time.Second)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error for nonexistent session, got nil")
+	}
+	// Non-transient errors should fail immediately, not wait for timeout.
+	if elapsed > 2*time.Second {
+		t.Errorf("non-transient error took %v — should have failed fast, not retried until timeout", elapsed)
+	}
 }
 
 func TestNudgeSession_WithRetry(t *testing.T) {

@@ -900,10 +900,21 @@ func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Durati
 			return err // non-transient (session gone, no server) — fail fast
 		}
 		lastErr = err
-		time.Sleep(interval)
-		// Cap interval at 2s to stay responsive
-		if interval < 2*time.Second {
-			interval = interval * 3 / 2 // 500ms → 750ms → 1125ms → 1687ms → 2s cap
+		// Clamp sleep to remaining time so we don't overshoot the deadline.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		sleep := interval
+		if sleep > remaining {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+		// Grow interval by 1.5x, capped at 2s to stay responsive.
+		// 500ms → 750ms → 1125ms → 1687ms → 2s (capped)
+		interval = interval * 3 / 2
+		if interval > 2*time.Second {
+			interval = 2 * time.Second
 		}
 	}
 	return fmt.Errorf("agent not ready for input after %s: %w", timeout, lastErr)
