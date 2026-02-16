@@ -2,6 +2,7 @@ package web
 
 import (
 	"errors"
+	"html/template"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -571,8 +572,11 @@ func TestConvoyHandler_HTMXAutoRefresh(t *testing.T) {
 	if !strings.Contains(body, "hx-trigger") {
 		t.Error("Response should contain hx-trigger attribute for HTMX")
 	}
-	if !strings.Contains(body, "every 10s") {
-		t.Error("Response should contain 'every 10s' trigger interval")
+	if !strings.Contains(body, "sse:dashboard-update") {
+		t.Error("Response should contain 'sse:dashboard-update' trigger for SSE")
+	}
+	if !strings.Contains(body, "every 30s") {
+		t.Error("Response should contain 'every 30s' polling fallback")
 	}
 }
 
@@ -738,7 +742,7 @@ func TestE2E_Server_FullDashboard(t *testing.T) {
 		{"PR repo", "roxas"},
 		{"Workers section", "Workers"},
 		{"Polecat name", "furiosa"},
-		{"HTMX auto-refresh", `hx-trigger="every 10s`}, // trigger has conditional suffix
+		{"HTMX SSE trigger", `hx-trigger="sse:dashboard-update`},
 	}
 
 	for _, check := range checks {
@@ -1053,6 +1057,51 @@ func (m *MockConvoyFetcherWithErrors) FetchIssues() ([]IssueRow, error) {
 
 func (m *MockConvoyFetcherWithErrors) FetchActivity() ([]ActivityRow, error) {
 	return nil, nil
+}
+
+// TestConvoyHandler_TemplateErrorReturns500 verifies that template execution errors
+// return a proper 500 status code, not 200 (which would happen if we wrote directly
+// to the ResponseWriter and it failed mid-execution).
+func TestConvoyHandler_TemplateErrorReturns500(t *testing.T) {
+	// Create a template that writes some output, then fails
+	failingFuncCalled := false
+	tmpl := template.Must(template.New("convoy.html").Funcs(template.FuncMap{
+		"failAfterOutput": func() (string, error) {
+			failingFuncCalled = true
+			return "", errors.New("intentional template error")
+		},
+	}).Parse(`<!DOCTYPE html><html>{{failAfterOutput}}</html>`))
+
+	// Create handler with the failing template
+	handler := &ConvoyHandler{
+		fetcher:  &MockConvoyFetcher{Convoys: []ConvoyRow{}},
+		template: tmpl,
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if !failingFuncCalled {
+		t.Fatal("Template function was not called")
+	}
+
+	// The key assertion: status should be 500, not 200
+	// If we write directly to ResponseWriter and it fails mid-execution,
+	// headers (with 200) are already sent, so http.Error can't change it
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("Status = %d, want %d (template error should return 500, not 200)", w.Code, http.StatusInternalServerError)
+	}
+
+	// Error message should be in the body, not partial template content
+	body := w.Body.String()
+	if !strings.Contains(body, "Failed to render template") {
+		t.Errorf("Response should contain error message, got: %q", body)
+	}
+	if strings.Contains(body, "<!DOCTYPE") {
+		t.Error("Error response should not contain partial template output")
+	}
 }
 
 func TestConvoyHandler_NonFatalErrors(t *testing.T) {

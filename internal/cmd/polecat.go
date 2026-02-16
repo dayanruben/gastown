@@ -384,7 +384,7 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 
 	// Collect polecats from all rigs
 	t := tmux.NewTmux()
-	var allPolecats []PolecatListItem
+	allPolecats := make([]PolecatListItem, 0)
 
 	for _, r := range rigs {
 		polecatGit := git.NewGit(r.Path)
@@ -1195,15 +1195,15 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig) error {
 	t := tmux.NewTmux()
 
-	// Step 1: Kill tmux session
+	// Step 1: Kill tmux session unconditionally to prevent ghost sessions
+	// when IsRunning fails to detect the session.
 	sessMgr := polecat.NewSessionManager(t, r)
-	running, _ := sessMgr.IsRunning(polecatName)
-	if running {
-		if err := sessMgr.Stop(polecatName, true); err != nil {
+	if err := sessMgr.Stop(polecatName, true); err != nil {
+		if !errors.Is(err, polecat.ErrSessionNotFound) {
 			fmt.Printf("  %s session kill failed: %v\n", style.Warning.Render("⚠"), err)
-		} else {
-			fmt.Printf("  %s killed session\n", style.Success.Render("✓"))
 		}
+	} else {
+		fmt.Printf("  %s killed session\n", style.Success.Render("✓"))
 	}
 
 	// Step 2: Get polecat info before deletion (for branch name)
@@ -1222,6 +1222,22 @@ func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.R
 		}
 	} else {
 		fmt.Printf("  %s deleted worktree\n", style.Success.Render("✓"))
+	}
+
+	// Step 3.5: Reject any open MRs for this branch before deleting it.
+	// Prevents MQ/git sync inconsistency where MR exists but branch is gone.
+	if branchToDelete != "" {
+		bd := beads.New(r.Path)
+		mr, findErr := bd.FindMRForBranch(branchToDelete)
+		if findErr != nil {
+			fmt.Printf("  %s MR lookup failed: %v\n", style.Dim.Render("○"), findErr)
+		} else if mr != nil {
+			if err := bd.CloseWithReason("rejected: polecat nuked", mr.ID); err != nil {
+				fmt.Printf("  %s MR close failed for %s: %v\n", style.Warning.Render("⚠"), mr.ID, err)
+			} else {
+				fmt.Printf("  %s rejected MR %s (polecat nuked)\n", style.Warning.Render("⚠"), mr.ID)
+			}
+		}
 	}
 
 	// Step 4: Delete branch (if we know it)

@@ -49,6 +49,9 @@ state.json
 # Clone-specific CLAUDE.md (regenerated locally per clone)
 CLAUDE.md
 
+# Junie
+.junie
+
 # Embedded formulas are committed so `go install @latest` works
 # Run `go generate ./...` after modifying .beads/formulas/
 
@@ -59,6 +62,4 @@ logs/
 settings/
 .events.jsonl
 .sqlhistory
-
-# Junie
-.junie
+.fork-integration.json
