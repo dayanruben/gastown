@@ -8,6 +8,32 @@ import { themes as prismThemes } from "prism-react-renderer";
 
 // This runs in Node.js - Don't use client-side code here (browser APIs, JSX...)
 
+const isLowercaseLabel = (label) => label === label.toLowerCase();
+
+const titleCaseLabel = (label) =>
+  label
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+
+const normalizeSidebarCategoryLabels = (items) =>
+  items.map((item) => {
+    if (item.type !== "category") {
+      return item;
+    }
+
+    const normalizedLabel = isLowercaseLabel(item.label)
+      ? titleCaseLabel(item.label)
+      : item.label;
+
+    return {
+      ...item,
+      label: normalizedLabel,
+      items: normalizeSidebarCategoryLabels(item.items),
+    };
+  });
+
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: "Gas Town",
@@ -52,6 +78,13 @@ const config = {
           path: "../docs",
           sidebarPath: "./sidebars.js",
           editUrl: "https://github.com/steveyegge/gastown/tree/main/website/",
+          sidebarItemsGenerator: async ({
+            defaultSidebarItemsGenerator,
+            ...args
+          }) => {
+            const generatedSidebar = await defaultSidebarItemsGenerator(args);
+            return normalizeSidebarCategoryLabels(generatedSidebar);
+          },
         },
         blog: false,
         theme: {
