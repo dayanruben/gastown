@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 const doltCmdTimeout = 15 * time.Second
@@ -1095,7 +1097,7 @@ func (m *DoltServerManager) listDatabases() ([]string, error) {
 
 	var databases []string
 	for _, row := range result.Rows {
-		if row.Database != "" && row.Database != "information_schema" {
+		if row.Database != "" && !doltserver.IsSystemDatabase(row.Database) {
 			databases = append(databases, row.Database)
 		}
 	}

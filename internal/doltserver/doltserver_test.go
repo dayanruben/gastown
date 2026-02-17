@@ -2568,7 +2568,7 @@ func TestMergePolecatBranch_ValidBranchName(t *testing.T) {
 // =============================================================================
 
 func TestParseShowDatabases_JSON(t *testing.T) {
-	input := `{"rows":[{"Database":"hq"},{"Database":"gastown"},{"Database":"information_schema"}]}`
+	input := `{"rows":[{"Database":"hq"},{"Database":"gastown"},{"Database":"information_schema"},{"Database":"mysql"},{"Database":"dolt_cluster"}]}`
 	got, err := parseShowDatabases([]byte(input))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -2576,10 +2576,10 @@ func TestParseShowDatabases_JSON(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("expected 2 databases, got %d: %v", len(got), got)
 	}
-	// Check that information_schema is filtered out.
+	// Check that all system databases are filtered out.
 	for _, db := range got {
-		if db == "information_schema" {
-			t.Error("information_schema should be filtered out")
+		if IsSystemDatabase(db) {
+			t.Errorf("system database %q should be filtered out", db)
 		}
 	}
 	// Both hq and gastown should be present.
@@ -2668,7 +2668,7 @@ func TestParseShowDatabases_LineFallback(t *testing.T) {
 
 func TestParseShowDatabases_PlainText(t *testing.T) {
 	// Plain-text output (no JSON, no table formatting).
-	input := "hq\ngastown\ninformation_schema\n"
+	input := "hq\ngastown\ninformation_schema\nmysql\ndolt_cluster\n"
 	got, err := parseShowDatabases([]byte(input))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -2682,6 +2682,28 @@ func TestParseShowDatabases_PlainText(t *testing.T) {
 	}
 	if !found["hq"] || !found["gastown"] {
 		t.Errorf("expected hq and gastown, got %v", got)
+	}
+}
+
+func TestIsSystemDatabase(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"information_schema", true},
+		{"mysql", true},
+		{"dolt_cluster", true},
+		{"INFORMATION_SCHEMA", true}, // case-insensitive
+		{"MySQL", true},
+		{"hq", false},
+		{"gastown", false},
+		{"beads", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := IsSystemDatabase(tt.name); got != tt.want {
+			t.Errorf("IsSystemDatabase(%q) = %v, want %v", tt.name, got, tt.want)
+		}
 	}
 }
 
