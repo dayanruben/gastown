@@ -1773,14 +1773,11 @@ func (t *Tmux) SetStatusFormat(session, rig, worker, role string) error {
 	// Polecat: 😺 gastown/Toast
 	var left string
 	if rig == "" {
-		// Town-level agent (Mayor, Deacon)
+		// Town-level agent (Mayor, Deacon) - keep as-is
 		left = fmt.Sprintf("%s %s ", icon, worker)
-	} else if role == "crew" {
-		// Crew member - show full path: rig/crew/name
-		left = fmt.Sprintf("%s %s/crew/%s ", icon, rig, worker)
 	} else {
-		// Rig-level agent - show rig/worker
-		left = fmt.Sprintf("%s %s/%s ", icon, rig, worker)
+		// Rig agents - use session name (already in prefix format: gt-crew-gus)
+		left = fmt.Sprintf("%s %s ", icon, session)
 	}
 
 	if _, err := t.run("set-option", "-t", session, "status-left-length", "25"); err != nil {
