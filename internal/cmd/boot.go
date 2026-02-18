@@ -510,27 +510,10 @@ func executeWarrants(warrantDir string, tm *tmux.Tmux) {
 			continue
 		}
 
-		sessionName, err := targetToSessionName(w.Target)
-		if err != nil {
-			fmt.Printf("Warning: warrant for %s has invalid target: %v\n", w.Target, err)
+		if err := executeOneWarrant(&w, path, tm); err != nil {
+			fmt.Printf("Warning: executing warrant for %s: %v\n", w.Target, err)
 			continue
 		}
-
-		if has, _ := tm.HasSession(sessionName); has {
-			if err := tm.KillSession(sessionName); err != nil {
-				fmt.Printf("Warning: killing session %s for warrant %s: %v\n", sessionName, w.Target, err)
-				continue
-			}
-			fmt.Printf("Warrant executed: terminated session %s (%s)\n", sessionName, w.Target)
-		} else {
-			fmt.Printf("Warrant executed: session %s already dead (%s)\n", sessionName, w.Target)
-		}
-
-		now := time.Now()
-		w.Executed = true
-		w.ExecutedAt = &now
-		data, _ = json.MarshalIndent(w, "", "  ")
-		_ = os.WriteFile(path, data, 0644)
 	}
 }
 
