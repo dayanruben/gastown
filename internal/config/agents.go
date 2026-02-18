@@ -61,10 +61,15 @@ type AgentPresetInfo struct {
 	// Used for resuming sessions across restarts.
 	SessionIDEnv string `json:"session_id_env,omitempty"`
 
-	// ResumeFlag is the flag/subcommand for resuming sessions.
+	// ResumeFlag is the flag/subcommand for resuming a specific session.
 	// For claude/gemini: "--resume"
 	// For codex: "resume" (subcommand)
 	ResumeFlag string `json:"resume_flag,omitempty"`
+
+	// ContinueFlag is the flag for auto-resuming the most recent session.
+	// For claude: "--continue" (--resume without args opens interactive picker)
+	// If empty, --resume without a session ID is rejected with a clear error.
+	ContinueFlag string `json:"continue_flag,omitempty"`
 
 	// ResumeStyle indicates how to invoke resume:
 	// "flag" - pass as --resume <id> argument
@@ -98,7 +103,7 @@ type AgentPresetInfo struct {
 	// Empty or "none" means no hooks support.
 	HooksProvider string `json:"hooks_provider,omitempty"`
 
-	// HooksDir is the directory for hooks/settings (e.g., ".claude", ".opencode/plugin").
+	// HooksDir is the directory for hooks/settings (e.g., ".claude", ".opencode/plugins").
 	HooksDir string `json:"hooks_dir,omitempty"`
 
 	// HooksSettingsFile is the settings/plugin filename (e.g., "settings.json", "gastown.js").
@@ -159,6 +164,7 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ProcessNames:        []string{"node", "claude"}, // Claude runs as Node.js
 		SessionIDEnv:        "CLAUDE_SESSION_ID",
 		ResumeFlag:          "--resume",
+		ContinueFlag:        "--continue",
 		ResumeStyle:         "flag",
 		SupportsHooks:       true,
 		SupportsForkSession: true,
@@ -275,17 +281,17 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		SessionIDEnv:        "",                                   // OpenCode manages sessions internally
 		ResumeFlag:          "",                                   // No resume support yet
 		ResumeStyle:         "",
-		SupportsHooks:       true, // Uses .opencode/plugin/gastown.js
+		SupportsHooks:       true, // Uses .opencode/plugins/gastown.js
 		SupportsForkSession: false,
 		NonInteractive: &NonInteractiveConfig{
 			Subcommand: "run",
 			OutputFlag: "--format json",
 		},
 		// Runtime defaults
-		PromptMode:        "none",
+		PromptMode:        "arg",
 		ConfigDir:         ".opencode",
 		HooksProvider:     "opencode",
-		HooksDir:          ".opencode/plugin",
+		HooksDir:          ".opencode/plugins",
 		HooksSettingsFile: "gastown.js",
 		ReadyDelayMs:      8000,
 		InstructionsFile:  "AGENTS.md",

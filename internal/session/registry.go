@@ -56,6 +56,18 @@ func (r *PrefixRegistry) PrefixForRig(rigName string) string {
 	return DefaultPrefix
 }
 
+// AllRigs returns a copy of the rig-name → prefix mapping for all registered rigs.
+// Callers can iterate it to find known rig names embedded in session strings.
+func (r *PrefixRegistry) AllRigs() map[string]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]string, len(r.rigToPrefix))
+	for rig, prefix := range r.rigToPrefix {
+		out[rig] = prefix
+	}
+	return out
+}
+
 // Prefixes returns all registered prefixes, sorted longest-first for matching.
 func (r *PrefixRegistry) Prefixes() []string {
 	r.mu.RLock()
@@ -171,7 +183,9 @@ func IsKnownSession(sess string) bool {
 // matchPrefix finds the prefix in a session name suffix using the registry.
 // Returns the prefix and the remaining string after the prefix dash.
 // Tries longest prefix match first.
-// Falls back to splitting on the first dash if no registry match.
+// Only matches sessions with registered prefixes - does NOT fall back to
+// splitting on dashes, as that would incorrectly match non-gastown sessions
+// (e.g., "gs-1923" or "dotfiles-main" would be parsed as gastown sessions).
 func (r *PrefixRegistry) matchPrefix(session string) (prefix, rest string, matched bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -182,12 +196,6 @@ func (r *PrefixRegistry) matchPrefix(session string) (prefix, rest string, match
 		if strings.HasPrefix(session, candidate) {
 			return p, session[len(candidate):], true
 		}
-	}
-
-	// Fallback: split on first dash
-	idx := strings.Index(session, "-")
-	if idx > 0 && idx < len(session)-1 {
-		return session[:idx], session[idx+1:], false
 	}
 
 	return "", "", false

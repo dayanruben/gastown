@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -359,6 +360,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	var pushFailed bool
 	var doneErrors []string
 	var convoyInfo *ConvoyInfo // Populated if issue is tracked by a convoy
+	var noCommitsNeedClose bool // Set when aheadCount==0; defers close to after Dolt merge
 	if exitType == ExitCompleted {
 		if branch == defaultBranch || branch == "master" {
 			return fmt.Errorf("cannot submit %s/master branch to merge queue", defaultBranch)
@@ -423,28 +425,15 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// in HOOKED state with assignee pointing to the nuked polecat.
 			// Normally the Refinery closes after merge, but with no MR, nothing
 			// would ever close the issue.
-			if issueID != "" {
-				bd := beads.New(beads.ResolveBeadsDir(cwd))
-				closeReason := "Completed with no code changes (already fixed or pushed directly to main)"
-				// G15 fix: Force-close bypasses molecule dependency checks.
-				// The polecat is about to be nuked — open wisps should not block closure.
-				// Retry with backoff handles transient dolt lock contention (A2).
-				var closeErr error
-				for attempt := 1; attempt <= 3; attempt++ {
-					closeErr = bd.ForceCloseWithReason(closeReason, issueID)
-					if closeErr == nil {
-						fmt.Printf("%s Issue %s closed (no MR needed)\n", style.Bold.Render("✓"), issueID)
-						break
-					}
-					if attempt < 3 {
-						style.PrintWarning("close attempt %d/3 failed: %v (retrying in %ds)", attempt, closeErr, attempt*2)
-						time.Sleep(time.Duration(attempt*2) * time.Second)
-					}
-				}
-				if closeErr != nil {
-					style.PrintWarning("could not close issue %s after 3 attempts: %v (issue may be left HOOKED)", issueID, closeErr)
-				}
-			}
+			//
+			// Defer the close to after Dolt branch merge + BD_BRANCH unset.
+			// If we close here, BD_BRANCH is still set so ForceCloseWithReason
+			// writes status=closed to the polecat's Dolt branch. The subsequent
+			// MergePolecatBranch can then hit merge conflicts (main has
+			// status=hooked from a different base state), leaving the bead
+			// permanently stuck as HOOKED. By deferring, the close writes
+			// directly to main after BD_BRANCH is unset.
+			noCommitsNeedClose = true
 
 			// Skip straight to witness notification (no MR needed)
 			goto notifyWitness
@@ -825,6 +814,37 @@ notifyWitness:
 	}
 
 afterDoltMerge:
+	// Ensure BD_BRANCH is unset before any post-merge bead operations.
+	// The normal path unsets it above after MergePolecatBranch, but the
+	// checkpoint-resume path (goto afterDoltMerge) bypasses that code.
+	os.Unsetenv("BD_BRANCH")
+
+	// Deferred close for no-commits-ahead path (G15 fix).
+	// The close is deferred to here because BD_BRANCH has now been unset,
+	// so ForceCloseWithReason writes directly to Dolt main. Closing earlier
+	// (while BD_BRANCH is set) writes status=closed to the polecat branch,
+	// and MergePolecatBranch can hit merge conflicts when main still has
+	// status=hooked from a different base state — leaving the bead stuck.
+	if noCommitsNeedClose && issueID != "" {
+		bd := beads.New(beads.ResolveBeadsDir(cwd))
+		closeReason := "Completed with no code changes (already fixed or pushed directly to main)"
+		var closeErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			closeErr = bd.ForceCloseWithReason(closeReason, issueID)
+			if closeErr == nil {
+				fmt.Printf("%s Issue %s closed (no MR needed)\n", style.Bold.Render("✓"), issueID)
+				break
+			}
+			if attempt < 3 {
+				style.PrintWarning("close attempt %d/3 failed: %v (retrying in %ds)", attempt, closeErr, attempt*2)
+				time.Sleep(time.Duration(attempt*2) * time.Second)
+			}
+		}
+		if closeErr != nil {
+			style.PrintWarning("could not close issue %s after 3 attempts: %v (issue may be left HOOKED)", issueID, closeErr)
+		}
+	}
+
 	// Nudge refinery AFTER the Dolt merge so MR bead is visible on main.
 	// Skip nudge only if merge was attempted and failed — MR bead is stranded
 	// on the polecat branch and refinery won't find it on main.
@@ -1186,13 +1206,21 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, _ string) { // issueID unus
 						break
 					} else {
 						lastErr = err
+						// If the molecule doesn't exist (already burned/deleted),
+						// treat it as already closed and stop retrying.
+						if errors.Is(err, beads.ErrNotFound) {
+							moleculeClosed = true
+							fmt.Fprintf(os.Stderr, "Warning: attached molecule %s not found (already burned/deleted), treating as closed\n", attachment.AttachedMolecule)
+							break
+						}
 						if attempt < 2 {
 							time.Sleep(time.Duration(100<<attempt) * time.Millisecond) // 100ms, 200ms
 						}
 					}
 				}
 				if !moleculeClosed {
-					// All retries failed - skip closing hooked bead (it's blocked by the molecule)
+					// All retries failed with non-"not found" errors - skip closing
+					// hooked bead (it's blocked by the molecule)
 					fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s after 3 attempts: %v\n", attachment.AttachedMolecule, lastErr)
 					// Don't try to close hookedBeadID - it will fail because it's still blocked
 					// The Witness will clean up orphaned state

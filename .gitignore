@@ -61,5 +61,6 @@ CLAUDE.md
 logs/
 settings/
 .events.jsonl
+.events.jsonl.lock
 .sqlhistory
 .fork-integration.json
