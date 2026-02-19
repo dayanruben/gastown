@@ -1460,10 +1460,29 @@ func (e *Engineer) postMergeConvoyCheck(_ *MRInfo) {
 		e.landConvoySwarm(townRoot, convoy)
 	}
 
-	// Step 3: Clean up stale branches from completed work.
+	// Step 3: Nudge the deacon to check for stranded convoys that now have
+	// ready work (e.g., after closing one issue, the next issue in the convoy
+	// becomes ready). This avoids waiting for the next patrol cycle (gt-rnzje).
+	e.nudgeDeaconForStrandedConvoys(townRoot)
+
+	// Step 4: Clean up stale branches from completed work.
 	// Prune remote tracking refs that no longer exist on origin.
 	if e.config.DeleteMergedBranches {
 		e.pruneStaleRemoteRefs()
+	}
+}
+
+// nudgeDeaconForStrandedConvoys sends a lightweight nudge to the deacon so it
+// checks for stranded convoys on its next turn boundary. After a merge, the
+// closed issue may unblock the next issue in a convoy — this avoids waiting
+// up to 10 minutes for the deacon's regular patrol cycle.
+func (e *Engineer) nudgeDeaconForStrandedConvoys(townRoot string) {
+	mailCmd := exec.Command("gt", "mail", "send", "deacon/",
+		"-s", "Merge completed — check stranded convoys",
+		"-m", fmt.Sprintf("Refinery (%s) merged a PR. Run `gt convoy stranded` to check for ready work.", e.rig.Name))
+	mailCmd.Dir = townRoot
+	if err := mailCmd.Run(); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not nudge deacon for stranded convoys: %v\n", err)
 	}
 }
 
