@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -131,7 +132,7 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 
 	// Ensure .gitignore has required Gas Town patterns
 	if err := rig.EnsureGitignorePatterns(witnessDir); err != nil {
-		fmt.Printf("Warning: could not update witness .gitignore: %v\n", err)
+		style.PrintWarning("could not update witness .gitignore: %v", err)
 	}
 
 	roleConfig, err := m.roleConfig()
@@ -239,7 +240,7 @@ func buildWitnessStartCommand(rigPath, rigName, townRoot, agentOverride string, 
 		return beads.ExpandRolePattern(roleConfig.StartCommand, townRoot, rigName, "", "witness"), nil
 	}
 	initialPrompt := session.BuildStartupPrompt(session.BeaconConfig{
-		Recipient: fmt.Sprintf("%s/witness", rigName),
+		Recipient: session.BeaconRecipient("witness", "", rigName),
 		Sender:    "deacon",
 		Topic:     "patrol",
 	}, "Run `gt prime --hook` and begin patrol.")

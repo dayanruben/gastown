@@ -2637,6 +2637,91 @@ func TestFillRuntimeDefaults(t *testing.T) {
 			t.Errorf("Tmux.ReadyDelayMs should be 0 (unfilled), got %d", result.Tmux.ReadyDelayMs)
 		}
 	})
+
+	t.Run("pi command gets hooks and tmux defaults", func(t *testing.T) {
+		t.Parallel()
+		input := &RuntimeConfig{
+			Command: "pi",
+		}
+
+		result := fillRuntimeDefaults(input)
+
+		// Hooks should be auto-filled for pi
+		if result.Hooks == nil {
+			t.Fatal("Hooks should be auto-filled for pi command")
+		}
+		if result.Hooks.Provider != "pi" {
+			t.Errorf("Hooks.Provider = %q, want pi", result.Hooks.Provider)
+		}
+		if result.Hooks.Dir != ".pi/extensions" {
+			t.Errorf("Hooks.Dir = %q, want .pi/extensions", result.Hooks.Dir)
+		}
+		if result.Hooks.SettingsFile != "gastown-hooks.js" {
+			t.Errorf("Hooks.SettingsFile = %q, want gastown-hooks.js", result.Hooks.SettingsFile)
+		}
+
+		// Tmux should be auto-filled for pi
+		if result.Tmux == nil {
+			t.Fatal("Tmux should be auto-filled for pi command")
+		}
+		if len(result.Tmux.ProcessNames) != 3 {
+			t.Errorf("Tmux.ProcessNames length = %d, want 3", len(result.Tmux.ProcessNames))
+		}
+		expectedNames := []string{"pi", "node", "bun"}
+		for i, want := range expectedNames {
+			if i < len(result.Tmux.ProcessNames) && result.Tmux.ProcessNames[i] != want {
+				t.Errorf("Tmux.ProcessNames[%d] = %q, want %q", i, result.Tmux.ProcessNames[i], want)
+			}
+		}
+		if result.Tmux.ReadyDelayMs != 3000 {
+			t.Errorf("Tmux.ReadyDelayMs = %d, want 3000", result.Tmux.ReadyDelayMs)
+		}
+
+		// PromptMode should default to "arg" for pi
+		if result.PromptMode != "arg" {
+			t.Errorf("PromptMode = %q, want arg", result.PromptMode)
+		}
+	})
+
+	t.Run("pi preserves user-specified hooks", func(t *testing.T) {
+		t.Parallel()
+		input := &RuntimeConfig{
+			Command: "pi",
+			Hooks: &RuntimeHooksConfig{
+				Provider:     "custom",
+				Dir:          "custom-dir",
+				SettingsFile: "custom.js",
+			},
+		}
+
+		result := fillRuntimeDefaults(input)
+
+		// User-specified hooks should be preserved
+		if result.Hooks.Provider != "custom" {
+			t.Errorf("Hooks.Provider = %q, want custom (user-specified)", result.Hooks.Provider)
+		}
+	})
+
+	t.Run("pi preserves user-specified tmux", func(t *testing.T) {
+		t.Parallel()
+		input := &RuntimeConfig{
+			Command: "pi",
+			Tmux: &RuntimeTmuxConfig{
+				ProcessNames: []string{"custom-pi"},
+				ReadyDelayMs: 5000,
+			},
+		}
+
+		result := fillRuntimeDefaults(input)
+
+		// User-specified tmux should be preserved
+		if result.Tmux.ProcessNames[0] != "custom-pi" {
+			t.Errorf("Tmux.ProcessNames[0] = %q, want custom-pi (user-specified)", result.Tmux.ProcessNames[0])
+		}
+		if result.Tmux.ReadyDelayMs != 5000 {
+			t.Errorf("Tmux.ReadyDelayMs = %d, want 5000 (user-specified)", result.Tmux.ReadyDelayMs)
+		}
+	})
 }
 
 // TestLookupAgentConfigPreservesCustomFields verifies that custom agents
@@ -4058,5 +4143,280 @@ func TestMergeQueueConfig_PartialJSON_NilPointers(t *testing.T) {
 	}
 	if cfg.IntegrationBranchAutoLand != nil {
 		t.Errorf("IntegrationBranchAutoLand should be nil when omitted, got %v", *cfg.IntegrationBranchAutoLand)
+	}
+}
+
+// --- Ephemeral Cost Tier Tests ---
+
+func TestTryResolveFromEphemeralTier(t *testing.T) {
+	t.Run("no env var returns not handled", func(t *testing.T) {
+		t.Setenv("GT_COST_TIER", "")
+		rc, handled := tryResolveFromEphemeralTier("witness")
+		if handled {
+			t.Error("expected handled=false when GT_COST_TIER not set")
+		}
+		if rc != nil {
+			t.Errorf("expected nil rc when GT_COST_TIER not set, got %+v", rc)
+		}
+	})
+
+	t.Run("invalid tier returns not handled", func(t *testing.T) {
+		t.Setenv("GT_COST_TIER", "premium")
+		rc, handled := tryResolveFromEphemeralTier("witness")
+		if handled {
+			t.Error("expected handled=false for invalid tier")
+		}
+		if rc != nil {
+			t.Errorf("expected nil rc for invalid tier, got %+v", rc)
+		}
+	})
+
+	t.Run("budget tier witness gets haiku", func(t *testing.T) {
+		t.Setenv("GT_COST_TIER", "budget")
+		rc, handled := tryResolveFromEphemeralTier("witness")
+		if !handled {
+			t.Fatal("expected handled=true for witness in budget tier")
+		}
+		if rc == nil {
+			t.Fatal("expected RuntimeConfig for witness in budget tier")
+		}
+		if !isClaudeCommand(rc.Command) {
+			t.Errorf("Command = %q, want claude", rc.Command)
+		}
+		found := false
+		for i, arg := range rc.Args {
+			if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "haiku" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Args %v missing --model haiku", rc.Args)
+		}
+	})
+
+	t.Run("economy tier polecat returns handled with nil rc (use default)", func(t *testing.T) {
+		t.Setenv("GT_COST_TIER", "economy")
+		rc, handled := tryResolveFromEphemeralTier("polecat")
+		if !handled {
+			t.Error("expected handled=true for polecat in economy tier (tier manages this role)")
+		}
+		if rc != nil {
+			t.Errorf("expected nil rc for polecat in economy tier (should use default), got %+v", rc)
+		}
+	})
+
+	t.Run("economy tier mayor gets sonnet", func(t *testing.T) {
+		t.Setenv("GT_COST_TIER", "economy")
+		rc, handled := tryResolveFromEphemeralTier("mayor")
+		if !handled {
+			t.Fatal("expected handled=true for mayor in economy tier")
+		}
+		if rc == nil {
+			t.Fatal("expected RuntimeConfig for mayor in economy tier")
+		}
+		found := false
+		for i, arg := range rc.Args {
+			if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "sonnet" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Args %v missing --model sonnet", rc.Args)
+		}
+	})
+
+	t.Run("standard tier returns handled with nil rc for all roles", func(t *testing.T) {
+		t.Setenv("GT_COST_TIER", "standard")
+		for _, role := range []string{"mayor", "deacon", "witness", "refinery", "polecat", "crew"} {
+			rc, handled := tryResolveFromEphemeralTier(role)
+			if !handled {
+				t.Errorf("standard tier should return handled=true for %s", role)
+			}
+			if rc != nil {
+				t.Errorf("standard tier should return nil rc for %s (use default), got %+v", role, rc)
+			}
+		}
+	})
+}
+
+func TestResolveRoleAgentConfig_WithEphemeralTier(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Create minimal town settings
+	townSettings := NewTownSettings()
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	t.Setenv("GT_COST_TIER", "budget")
+
+	rc := ResolveRoleAgentConfig("witness", townRoot, "")
+	if rc == nil {
+		t.Fatal("expected RuntimeConfig for witness with ephemeral budget tier")
+	}
+	if !isClaudeCommand(rc.Command) {
+		t.Errorf("Command = %q, want claude", rc.Command)
+	}
+	found := false
+	for i, arg := range rc.Args {
+		if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "haiku" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Args %v missing --model haiku for budget witness", rc.Args)
+	}
+}
+
+func TestResolveRoleAgentConfig_EphemeralOverridesPersistent(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Create town settings with economy tier persisted
+	townSettings := NewTownSettings()
+	if err := ApplyCostTier(townSettings, TierEconomy); err != nil {
+		t.Fatalf("ApplyCostTier: %v", err)
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	// Set ephemeral to budget — should override
+	t.Setenv("GT_COST_TIER", "budget")
+
+	// witness is sonnet in economy, haiku in budget
+	rc := ResolveRoleAgentConfig("witness", townRoot, "")
+	if rc == nil {
+		t.Fatal("expected RuntimeConfig for witness")
+	}
+	found := false
+	for i, arg := range rc.Args {
+		if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "haiku" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("ephemeral budget should override persistent economy; witness Args %v missing --model haiku", rc.Args)
+	}
+}
+
+func TestResolveRoleAgentConfig_EphemeralStandardSkipsPersisted(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Create town settings with budget tier persisted (haiku for witness)
+	townSettings := NewTownSettings()
+	if err := ApplyCostTier(townSettings, TierBudget); err != nil {
+		t.Fatalf("ApplyCostTier: %v", err)
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	// Set ephemeral to standard — should skip persisted budget config
+	t.Setenv("GT_COST_TIER", "standard")
+
+	// polecat was claude-sonnet in budget, should now use default (opus/claude)
+	rc := ResolveRoleAgentConfig("polecat", townRoot, "")
+	if rc == nil {
+		t.Fatal("expected RuntimeConfig for polecat")
+	}
+	// Should be default claude (opus), NOT claude-sonnet from stale budget config
+	for i, arg := range rc.Args {
+		if arg == "--model" && i+1 < len(rc.Args) {
+			model := rc.Args[i+1]
+			if model == "sonnet" || model == "haiku" {
+				t.Errorf("ephemeral standard should not use stale budget model; got --model %s", model)
+			}
+		}
+	}
+}
+
+func TestResolveRoleAgentConfig_EphemeralRespectsNonClaudeOverride(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := t.TempDir()
+
+	// Create rig settings with gemini as witness (non-Claude agent)
+	rigSettingsDir := filepath.Join(rigPath, ".settings")
+	if err := os.MkdirAll(rigSettingsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	rigSettings := &RigSettings{
+		Type:    "rig-settings",
+		Version: 1,
+		RoleAgents: map[string]string{
+			"witness": "gemini",
+		},
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	// Create town settings with gemini agent defined
+	townSettings := NewTownSettings()
+	townSettings.Agents["gemini"] = &RuntimeConfig{
+		Command: "gemini",
+		Args:    []string{},
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	// Set ephemeral budget tier — should NOT override the gemini witness
+	t.Setenv("GT_COST_TIER", "budget")
+
+	rc := ResolveRoleAgentConfig("witness", townRoot, rigPath)
+	if rc == nil {
+		t.Fatal("expected RuntimeConfig for witness")
+	}
+	// Should still be gemini, not claude-haiku from budget tier
+	if rc.Command != "gemini" {
+		t.Errorf("expected gemini for witness (non-Claude rig override), got Command=%q", rc.Command)
+	}
+}
+
+func TestResolveRoleAgentConfig_EphemeralDefaultPreservesNonClaudeOverride(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := t.TempDir()
+
+	// Create rig settings with gemini as polecat (non-Claude agent)
+	rigSettingsDir := filepath.Join(rigPath, ".settings")
+	if err := os.MkdirAll(rigSettingsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	rigSettings := &RigSettings{
+		Type:    "rig-settings",
+		Version: 1,
+		RoleAgents: map[string]string{
+			"polecat": "gemini",
+		},
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), rigSettings); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	// Create town settings with gemini agent defined
+	townSettings := NewTownSettings()
+	townSettings.Agents["gemini"] = &RuntimeConfig{
+		Command: "gemini",
+		Args:    []string{},
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	// Economy tier maps polecat to "" (use default) — should NOT override gemini
+	t.Setenv("GT_COST_TIER", "economy")
+
+	rc := ResolveRoleAgentConfig("polecat", townRoot, rigPath)
+	if rc == nil {
+		t.Fatal("expected RuntimeConfig for polecat")
+	}
+	// Should still be gemini, not default claude — the nil-rc path must
+	// preserve explicit non-Claude overrides
+	if rc.Command != "gemini" {
+		t.Errorf("expected gemini for polecat (non-Claude rig override with tier default), got Command=%q", rc.Command)
 	}
 }

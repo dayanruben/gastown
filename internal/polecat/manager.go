@@ -22,6 +22,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -221,7 +222,7 @@ func (m *Manager) CheckDoltHealth() error {
 		lastErr = err
 		if attempt < doltMaxRetries {
 			backoff := doltBackoff(attempt)
-			fmt.Printf("Warning: Dolt health check attempt %d failed, retrying in %v...\n", attempt, backoff)
+			style.PrintWarning("Dolt health check attempt %d failed, retrying in %v...", attempt, backoff)
 			time.Sleep(backoff)
 		}
 	}
@@ -287,7 +288,7 @@ func (m *Manager) createAgentBeadWithRetry(agentID string, fields *beads.AgentFi
 		lastErr = err
 		// If beads directory doesn't exist, this is a test/setup env — warn only
 		if strings.Contains(err.Error(), "does not exist") || errors.Is(err, beads.ErrNotInstalled) {
-			fmt.Printf("Warning: could not create agent bead (beads not configured): %v\n", err)
+			style.PrintWarning("could not create agent bead (beads not configured): %v", err)
 			return nil
 		}
 		// Fail fast on config/init errors — retrying won't help (gt-2ra)
@@ -296,7 +297,7 @@ func (m *Manager) createAgentBeadWithRetry(agentID string, fields *beads.AgentFi
 		}
 		if attempt < doltMaxRetries {
 			backoff := doltBackoff(attempt)
-			fmt.Printf("Warning: agent bead creation attempt %d failed, retrying in %v: %v\n", attempt, backoff, err)
+			style.PrintWarning("agent bead creation attempt %d failed, retrying in %v: %v", attempt, backoff, err)
 			time.Sleep(backoff)
 		}
 	}
@@ -323,7 +324,7 @@ func (m *Manager) SetAgentStateWithRetry(name string, state string) error {
 		}
 		if attempt < doltMaxRetries {
 			backoff := doltBackoff(attempt)
-			fmt.Printf("Warning: SetAgentState attempt %d failed, retrying in %v: %v\n", attempt, backoff, err)
+			style.PrintWarning("SetAgentState attempt %d failed, retrying in %v: %v", attempt, backoff, err)
 			time.Sleep(backoff)
 		}
 	}
@@ -429,6 +430,14 @@ func (m *Manager) repoBase() (*git.Git, error) {
 // This is polecats/<name>/ - the polecat's home directory.
 func (m *Manager) polecatDir(name string) string {
 	return filepath.Join(m.rig.Path, "polecats", name)
+}
+
+// pendingPath returns the path of the allocation reservation marker for a name.
+// Written inside the pool lock by AllocateName; removed by AddWithOptions after
+// the polecat directory is created. Prevents concurrent processes from allocating
+// the same name during the window between pool save and directory creation.
+func (m *Manager) pendingPath(name string) string {
+	return filepath.Join(m.rig.Path, "polecats", name+".pending")
 }
 
 // clonePath returns the path where the git worktree lives.
@@ -617,6 +626,11 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (*Polecat, error)
 		return nil, fmt.Errorf("creating polecat dir: %w", err)
 	}
 
+	// Directory created — remove the allocation reservation marker.
+	// reconcilePoolInternal will now find the directory directly and treat the
+	// name as in-use without needing the .pending file.
+	_ = os.Remove(m.pendingPath(name))
+
 	// cleanupOnError removes polecatDir if worktree creation fails.
 	// This ensures exists() returns false for incomplete polecats, preventing
 	// a partial state where polecatDir exists but the worktree doesn't.
@@ -635,7 +649,7 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (*Polecat, error)
 	// Fetch latest from origin to ensure worktree starts from up-to-date code
 	if err := repoGit.Fetch("origin"); err != nil {
 		// Non-fatal - proceed with potentially stale code
-		fmt.Printf("Warning: could not fetch origin: %v\n", err)
+		style.PrintWarning("could not fetch origin: %v", err)
 	}
 
 	// Determine the start point for the new worktree
@@ -682,7 +696,7 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (*Polecat, error)
 	if err := m.setupSharedBeads(clonePath); err != nil {
 		// Non-fatal - polecat can still work with local beads
 		// Log warning but don't fail the spawn
-		fmt.Printf("Warning: could not set up shared beads: %v\n", err)
+		style.PrintWarning("could not set up shared beads: %v", err)
 	}
 
 	// Provision PRIME.md with Gas Town context for this worker.
@@ -690,19 +704,19 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (*Polecat, error)
 	// always have GUPP and essential Gas Town context.
 	if err := beads.ProvisionPrimeMDForWorktree(clonePath); err != nil {
 		// Non-fatal - polecat can still work via hook, warn but don't fail
-		fmt.Printf("Warning: could not provision PRIME.md: %v\n", err)
+		style.PrintWarning("could not provision PRIME.md: %v", err)
 	}
 
 	// Copy overlay files from .runtime/overlay/ to polecat root.
 	// This allows services to have .env and other config files at their root.
 	if err := rig.CopyOverlay(m.rig.Path, clonePath); err != nil {
 		// Non-fatal - log warning but continue
-		fmt.Printf("Warning: could not copy overlay files: %v\n", err)
+		style.PrintWarning("could not copy overlay files: %v", err)
 	}
 
 	// Ensure .gitignore has required Gas Town patterns
 	if err := rig.EnsureGitignorePatterns(clonePath); err != nil {
-		fmt.Printf("Warning: could not update .gitignore: %v\n", err)
+		style.PrintWarning("could not update .gitignore: %v", err)
 	}
 
 	// Install runtime settings in the shared polecats parent directory.
@@ -712,14 +726,14 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (*Polecat, error)
 	polecatSettingsDir := config.RoleSettingsDir("polecat", m.rig.Path)
 	if err := runtime.EnsureSettingsForRole(polecatSettingsDir, clonePath, "polecat", runtimeConfig); err != nil {
 		// Non-fatal - log warning but continue
-		fmt.Printf("Warning: could not install runtime settings: %v\n", err)
+		style.PrintWarning("could not install runtime settings: %v", err)
 	}
 
 	// Run setup hooks from .runtime/setup-hooks/.
 	// These hooks can inject local git config, copy secrets, or perform other setup tasks.
 	if err := rig.RunSetupHooks(m.rig.Path, clonePath); err != nil {
 		// Non-fatal - log warning but continue
-		fmt.Printf("Warning: could not run setup hooks: %v\n", err)
+		style.PrintWarning("could not run setup hooks: %v", err)
 	}
 
 	// NOTE: Slash commands (.claude/commands/) are provisioned at town level by gt install.
@@ -843,7 +857,7 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	if err := m.beads.ResetAgentBeadForReuse(agentID, "polecat removed"); err != nil {
 		// Only log if not "not found" - it's ok if it doesn't exist
 		if !errors.Is(err, beads.ErrNotFound) {
-			fmt.Printf("Warning: could not reset agent bead %s: %v\n", agentID, err)
+			style.PrintWarning("could not reset agent bead %s: %v", agentID, err)
 		}
 	}
 
@@ -920,7 +934,7 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// The above removal attempts may fail silently on permissions, symlinks, or busy files
 	if err := verifyRemovalComplete(polecatDir, clonePath); err != nil {
 		// Log warning but don't fail - the polecat is effectively "removed" from Gas Town's perspective
-		fmt.Printf("Warning: incomplete removal for %s: %v\n", name, err)
+		style.PrintWarning("incomplete removal for %s: %v", name, err)
 	}
 
 	// Release name back to pool if it's a pooled name (non-fatal: state file update)
@@ -1009,6 +1023,22 @@ func (m *Manager) AllocateName() (string, error) {
 
 	if err := m.namePool.Save(); err != nil {
 		return "", fmt.Errorf("saving pool state: %w", err)
+	}
+
+	// Write a reservation marker inside the pool lock scope.
+	// This closes the TOCTOU window between pool save and directory creation:
+	// reconcilePoolInternal uses directories as the source of truth for in-use
+	// names, so a concurrent process calling AllocateName (after this lock is
+	// released but before AddWithOptions creates the directory) would see the
+	// name as available and reallocate it. The marker acts as a stand-in
+	// directory until AddWithOptions removes it after os.MkdirAll succeeds.
+	// Stale markers (process crashed before AddWithOptions) are cleaned up by
+	// cleanupOrphanPolecatState after pendingMaxAge.
+	if err := os.MkdirAll(filepath.Join(m.rig.Path, "polecats"), 0755); err != nil {
+		return "", fmt.Errorf("creating polecats dir for reservation marker: %w", err)
+	}
+	if err := os.WriteFile(m.pendingPath(name), []byte(fmt.Sprintf("%d", os.Getpid())), 0644); err != nil {
+		return "", fmt.Errorf("writing reservation marker: %w", err)
 	}
 
 	// Kill any lingering tmux session for this name (gt-pqf9x).
@@ -1141,12 +1171,12 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 	}
 
 	// Reset agent bead AFTER old worktree is confirmed removed.
-	// NOTE: We use ResetAgentBeadForReuse instead of CloseAndClearAgentBead to avoid
-	// the close/reopen cycle that fails on Dolt backend (gt-14b8o).
+	// NOTE: We use ResetAgentBeadForReuse to avoid the close/reopen cycle
+	// that fails on Dolt backend (gt-14b8o).
 	agentID := m.agentBeadID(name)
 	if err := m.beads.ResetAgentBeadForReuse(agentID, "polecat repair"); err != nil {
 		if !errors.Is(err, beads.ErrNotFound) {
-			fmt.Printf("Warning: could not reset old agent bead %s: %v\n", agentID, err)
+			style.PrintWarning("could not reset old agent bead %s: %v", agentID, err)
 		}
 	}
 
@@ -1164,17 +1194,17 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 
 	// Set up shared beads
 	if err := m.setupSharedBeads(newClonePath); err != nil {
-		fmt.Printf("Warning: could not set up shared beads: %v\n", err)
+		style.PrintWarning("could not set up shared beads: %v", err)
 	}
 
 	// Copy overlay files from .runtime/overlay/ to polecat root.
 	if err := rig.CopyOverlay(m.rig.Path, newClonePath); err != nil {
-		fmt.Printf("Warning: could not copy overlay files: %v\n", err)
+		style.PrintWarning("could not copy overlay files: %v", err)
 	}
 
 	// Ensure .gitignore has required Gas Town patterns
 	if err := rig.EnsureGitignorePatterns(newClonePath); err != nil {
-		fmt.Printf("Warning: could not update .gitignore: %v\n", err)
+		style.PrintWarning("could not update .gitignore: %v", err)
 	}
 
 	// NOTE: Slash commands inherited from town level - no per-workspace copies needed.
@@ -1239,6 +1269,19 @@ func (m *Manager) reconcilePoolInternal() {
 	var namesWithDirs []string
 	for _, p := range polecats {
 		namesWithDirs = append(namesWithDirs, p.Name)
+	}
+
+	// Include names with pending reservation markers.
+	// A .pending file means AllocateName has claimed the name but AddWithOptions
+	// hasn't created the directory yet. Without this, Reconcile would see no
+	// directory and treat the name as available, causing a duplicate allocation.
+	polecatsDir := filepath.Join(m.rig.Path, "polecats")
+	if entries, err := os.ReadDir(polecatsDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".pending") {
+				namesWithDirs = append(namesWithDirs, strings.TrimSuffix(e.Name(), ".pending"))
+			}
+		}
 	}
 
 	// Get names with tmux sessions
@@ -1322,11 +1365,17 @@ func isSessionProcessDead(t *tmux.Tmux, sessionName string) bool {
 	return false
 }
 
+// pendingMaxAge is how long a .pending reservation marker may exist before
+// it is considered stale. gt sling completes in seconds, so 5 minutes is
+// a conservative bound that avoids false positives on slow machines.
+const pendingMaxAge = 5 * time.Minute
+
 // cleanupOrphanPolecatState removes partial/broken polecat state during allocation.
 // This handles the race condition where worktree creation fails mid-way, leaving:
 // - Empty polecat directories without .git
 // - Directories with invalid/corrupt .git files
 // - Stale git worktree registrations
+// - Stale .pending reservation markers (gt sling crashed before AddWithOptions)
 func (m *Manager) cleanupOrphanPolecatState() {
 	polecatsDir := filepath.Join(m.rig.Path, "polecats")
 
@@ -1336,6 +1385,18 @@ func (m *Manager) cleanupOrphanPolecatState() {
 	}
 
 	for _, entry := range entries {
+		// Clean up stale allocation reservation markers.
+		// A .pending file older than pendingMaxAge means gt sling crashed after
+		// AllocateName but before AddWithOptions created the directory. Remove it
+		// so the name can be reallocated on the next reconcile.
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".pending") {
+			info, err := entry.Info()
+			if err == nil && time.Since(info.ModTime()) > pendingMaxAge {
+				_ = os.Remove(filepath.Join(polecatsDir, entry.Name()))
+			}
+			continue
+		}
+
 		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
@@ -1654,7 +1715,7 @@ func (m *Manager) CleanupStaleBranches() (int, error) {
 		// Delete orphaned branch
 		if err := repoGit.DeleteBranch(branch, true); err != nil {
 			// Log but continue - non-fatal
-			fmt.Printf("Warning: could not delete branch %s: %v\n", branch, err)
+			style.PrintWarning("could not delete branch %s: %v", branch, err)
 			continue
 		}
 		deleted++

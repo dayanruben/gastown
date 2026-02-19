@@ -31,6 +31,8 @@ const (
 	AgentOpenCode AgentPreset = "opencode"
 	// AgentCopilot is GitHub Copilot CLI.
 	AgentCopilot AgentPreset = "copilot"
+	// AgentPi is Pi Coding Agent (extension-based lifecycle).
+	AgentPi AgentPreset = "pi"
 )
 
 // AgentPresetInfo contains the configuration details for an agent preset.
@@ -319,6 +321,24 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ReadyPromptPrefix:  "❯ ",
 		ReadyDelayMs:       5000,
 		InstructionsFile:   "AGENTS.md",
+	},
+	AgentPi: {
+		Name:                AgentPi,
+		Command:             "pi",
+		Args:                []string{}, // Extension loaded via -e flag in town settings
+		ProcessNames:        []string{"pi", "node", "bun"}, // Pi runs as Node.js
+		SessionIDEnv:        "PI_SESSION_ID",
+		ResumeFlag:          "",    // No resume support yet
+		ResumeStyle:         "",
+		SupportsHooks:       true,  // Uses .pi/extensions/gastown-hooks.js
+		HooksProvider:       "pi",
+		HooksDir:            ".pi/extensions",
+		HooksSettingsFile:   "gastown-hooks.js",
+		SupportsForkSession: false,
+		NonInteractive: &NonInteractiveConfig{
+			PromptFlag: "-p",
+			OutputFlag: "--no-session",
+		},
 	},
 }
 

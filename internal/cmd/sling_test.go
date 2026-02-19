@@ -1354,16 +1354,16 @@ func TestCheckCrossRigGuard(t *testing.T) {
 			wantErr:     true,
 		},
 		{
-			name:        "town-level: hq bead to any rig (allowed)",
+			name:        "town-level: hq bead to rig (rejected — belongs to town root)",
 			beadID:      "hq-abc123",
 			targetAgent: "gastown/polecats/Toast",
-			wantErr:     false,
+			wantErr:     true,
 		},
 		{
-			name:        "unknown prefix: allowed (no route to check)",
+			name:        "unknown prefix: rejected (no route maps to target rig)",
 			beadID:      "xx-unknown",
 			targetAgent: "gastown/polecats/Toast",
-			wantErr:     false,
+			wantErr:     true,
 		},
 		{
 			name:        "empty bead prefix: allowed",
@@ -1380,11 +1380,15 @@ func TestCheckCrossRigGuard(t *testing.T) {
 				t.Errorf("checkCrossRigGuard(%q, %q) error = %v, wantErr %v", tc.beadID, tc.targetAgent, err, tc.wantErr)
 			}
 			if err != nil && tc.wantErr {
-				if !strings.Contains(err.Error(), "cross-rig mismatch") {
-					t.Errorf("expected cross-rig mismatch error, got: %v", err)
+				errMsg := err.Error()
+				if !strings.Contains(errMsg, "cross-rig mismatch") && !strings.Contains(errMsg, "town root") {
+					t.Errorf("expected cross-rig or town-root error, got: %v", err)
 				}
-				if !strings.Contains(err.Error(), "--force") {
+				if !strings.Contains(errMsg, "--force") {
 					t.Errorf("error should mention --force override, got: %v", err)
+				}
+				if !strings.Contains(errMsg, "bd create") {
+					t.Errorf("error should mention bd create, got: %v", err)
 				}
 			}
 		})
@@ -2030,5 +2034,96 @@ exit /b 0
 	err = runSling(nil, []string{"gt-test-pinned-dot", "."})
 	if err != nil {
 		t.Fatalf("expected no-op nil return for pinned bead with dot target, got error: %v", err)
+	}
+}
+
+// TestSlingPolecatEnvCheck verifies that the polecat guard in runSling uses
+// GT_ROLE as the authoritative check, so coordinators with a stale GT_POLECAT
+// in their environment are not blocked from slinging (GH #664).
+func TestSlingPolecatEnvCheck(t *testing.T) {
+	tests := []struct {
+		name      string
+		role      string
+		polecat   string
+		wantBlock bool
+	}{
+		{
+			name:      "bare polecat role is blocked",
+			role:      "polecat",
+			polecat:   "alpha",
+			wantBlock: true,
+		},
+		{
+			name:      "compound polecat role is blocked",
+			role:      "gastown/polecats/Toast",
+			polecat:   "Toast",
+			wantBlock: true,
+		},
+		{
+			name:      "mayor with stale GT_POLECAT is NOT blocked",
+			role:      "mayor",
+			polecat:   "alpha",
+			wantBlock: false,
+		},
+		{
+			name:      "compound witness with stale GT_POLECAT is NOT blocked",
+			role:      "gastown/witness",
+			polecat:   "alpha",
+			wantBlock: false,
+		},
+		{
+			name:      "crew with stale GT_POLECAT is NOT blocked",
+			role:      "crew",
+			polecat:   "alpha",
+			wantBlock: false,
+		},
+		{
+			name:      "compound crew with stale GT_POLECAT is NOT blocked",
+			role:      "gastown/crew/den",
+			polecat:   "alpha",
+			wantBlock: false,
+		},
+		{
+			name:      "no GT_ROLE with GT_POLECAT set is blocked",
+			role:      "",
+			polecat:   "alpha",
+			wantBlock: true,
+		},
+		{
+			name:      "no GT_ROLE and no GT_POLECAT is not blocked",
+			role:      "",
+			polecat:   "",
+			wantBlock: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GT_ROLE", tt.role)
+			t.Setenv("GT_POLECAT", tt.polecat)
+
+			// We only test the polecat guard, so we call runSling with no args.
+			// It will either fail at the guard or panic/fail later (missing args).
+			// We only care whether the error is the polecat-block message.
+			var blocked bool
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// Panic means we got past the guard — not blocked
+						blocked = false
+					}
+				}()
+				err := runSling(nil, nil)
+				blocked = err != nil && strings.Contains(err.Error(), "polecats cannot sling")
+			}()
+
+			if blocked != tt.wantBlock {
+				if tt.wantBlock {
+					t.Errorf("expected polecat block but was not blocked (GT_ROLE=%q GT_POLECAT=%q)", tt.role, tt.polecat)
+				} else {
+					t.Errorf("unexpected polecat block with GT_ROLE=%q GT_POLECAT=%q", tt.role, tt.polecat)
+				}
+			}
+		})
 	}
 }
