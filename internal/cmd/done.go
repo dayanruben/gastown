@@ -1423,30 +1423,52 @@ func parseCleanupStatus(s string) polecat.CleanupStatus {
 // polecat (with stale branch state from a prior assignment) from force-closing
 // a bead that has been reassigned to another polecat.
 //
-// Two independent checks, either of which catches the stale state:
-//  1. Hook mismatch: agent's hook_bead points to a different issue than the branch
-//  2. Assignee mismatch: bead is assigned to a different polecat
+// Fail-closed: if bead reads fail, we assume stale and skip force-close. A false
+// "stale" leaves the bead HOOKED (recoverable by witness), while a false "not stale"
+// causes the original gt-frf61 bug. Fail-closed is safer.
 //
-// Returns (true, reason) if stale, (false, "") if the polecat legitimately owns the bead.
+// Returns (true, reason) if stale or unverifiable, (false, "") if ownership confirmed.
 func isStalePolecatDone(bd *beads.Beads, agentBeadID, issueID, polecatName string) (bool, string) {
 	// Check 1: Agent hook mismatch (most reliable).
 	// The agent's hook_bead is the authoritative source of current work.
 	// If it points to a different issue, this gt done is from stale branch state.
+	var agentHookBead string
 	if agentBeadID != "" {
-		if agentBead, err := bd.Show(agentBeadID); err == nil {
-			if agentBead.HookBead != "" && agentBead.HookBead != issueID {
-				return true, fmt.Sprintf("agent hook is %s but branch references %s (stale branch state)", agentBead.HookBead, issueID)
-			}
+		agentBead, err := bd.Show(agentBeadID)
+		if err != nil {
+			style.PrintWarning("ownership check: failed to read agent bead %s: %v (assuming stale)", agentBeadID, err)
+			return true, fmt.Sprintf("cannot verify ownership: agent bead %s read failed: %v", agentBeadID, err)
 		}
+		agentHookBead = agentBead.HookBead
 	}
 
 	// Check 2: Assignee mismatch (backup for when hook is cleared).
 	// If the bead is assigned to a different polecat, we shouldn't close it.
+	var assignee string
 	if polecatName != "" && issueID != "" {
-		if issue, err := bd.Show(issueID); err == nil {
-			if issue.Assignee != "" && !strings.Contains(issue.Assignee, polecatName) {
-				return true, fmt.Sprintf("%s is assigned to %s, not %s", issueID, issue.Assignee, polecatName)
-			}
+		issue, err := bd.Show(issueID)
+		if err != nil {
+			style.PrintWarning("ownership check: failed to read bead %s: %v (assuming stale)", issueID, err)
+			return true, fmt.Sprintf("cannot verify ownership: bead %s read failed: %v", issueID, err)
+		}
+		assignee = issue.Assignee
+	}
+
+	return isStalePolecatDoneCheck(agentHookBead, issueID, assignee, polecatName)
+}
+
+// isStalePolecatDoneCheck is the pure guard logic, separated from bd I/O for testability.
+// Two independent checks, either of which catches the stale state:
+//  1. Hook mismatch: agent's hook_bead points to a different issue than the branch
+//  2. Assignee mismatch: bead is assigned to a different polecat
+func isStalePolecatDoneCheck(agentHookBead, issueID, assignee, polecatName string) (bool, string) {
+	if agentHookBead != "" && agentHookBead != issueID {
+		return true, fmt.Sprintf("agent hook is %s but branch references %s (stale branch state)", agentHookBead, issueID)
+	}
+
+	if polecatName != "" && issueID != "" {
+		if assignee != "" && !strings.HasSuffix(assignee, "/"+polecatName) {
+			return true, fmt.Sprintf("%s is assigned to %s, not %s", issueID, assignee, polecatName)
 		}
 	}
 
