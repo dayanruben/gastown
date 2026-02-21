@@ -260,6 +260,12 @@ func (d *Daemon) Run() error {
 
 	d.logger.Printf("Daemon running, recovery heartbeat interval %v", recoveryHeartbeatInterval)
 
+	// Ensure tmux keybindings have the current rig-prefix pattern.
+	// This auto-corrects stale bindings when new rigs are registered.
+	if err := d.tmux.RefreshKeyBindings(); err != nil {
+		d.logger.Printf("Warning: failed to refresh key bindings: %v", err)
+	}
+
 	// Start feed curator goroutine
 	d.curator = feed.NewCurator(d.config.TownRoot)
 	if err := d.curator.Start(); err != nil {
@@ -1119,6 +1125,9 @@ func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return
 		d.krcPruner.Stop()
 		d.logger.Println("KRC pruner stopped")
 	}
+
+	// Push Dolt remotes before stopping the server (if patrol is enabled)
+	d.pushDoltRemotes()
 
 	// Stop Dolt server if we're managing it
 	if d.doltServer != nil && d.doltServer.IsEnabled() && !d.doltServer.IsExternal() {
