@@ -499,6 +499,13 @@ func nudgeRefinery(rigName, message string) {
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to queue nudge for %s: %v\n", refinerySession, err)
 		}
+
+		// Also emit a file event so the refinery's await-event unblocks instantly.
+		// This is the programmatic bridge between mq submit and the event system.
+		_, _ = EmitEventToTown(townRoot, "refinery", "MQ_SUBMIT", []string{
+			"source=sling",
+			"message=" + message,
+		})
 	} else {
 		// Fallback to direct nudge if town root unavailable
 		t := tmux.NewTmux()
