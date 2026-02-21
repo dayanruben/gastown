@@ -1019,3 +1019,296 @@ func TestDispatchIssue_Failure(t *testing.T) {
 		t.Fatal("dispatchIssue should return error when gt exits 1")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// DS-07: CheckConvoysForIssue skips staged:ready convoys
+// ---------------------------------------------------------------------------
+
+func TestCheckConvoysForIssue_SkipsStagedReady(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Create a convoy as open first (SDK validates status on create),
+	// then transition to "staged:ready" via UpdateIssue.
+	convoy := &beadsdk.Issue{
+		ID:        "test-cv-staged1",
+		Title:     "Staged Ready Convoy",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	// Create a tracked issue (closed, to trigger the event path)
+	tracked := &beadsdk.Issue{
+		ID:        "test-trk-stg1",
+		Title:     "Tracked Issue",
+		Status:    beadsdk.StatusClosed,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	for _, iss := range []*beadsdk.Issue{convoy, tracked} {
+		if err := store.CreateIssue(ctx, iss, "test"); err != nil {
+			t.Fatalf("CreateIssue %s: %v", iss.ID, err)
+		}
+	}
+
+	// Transition convoy to "staged:ready" (SDK validates status on create,
+	// so we create as open first and update).
+	if err := store.UpdateIssue(ctx, convoy.ID, map[string]interface{}{
+		"status": "staged:ready",
+	}, "test"); err != nil {
+		t.Fatalf("UpdateIssue to staged:ready: %v", err)
+	}
+
+	// Add tracks dependency: convoy tracks the closed issue
+	dep := &beadsdk.Dependency{
+		IssueID:     convoy.ID,
+		DependsOnID: tracked.ID,
+		Type:        beadsdk.DependencyType("tracks"),
+		CreatedAt:   now,
+		CreatedBy:   "test",
+	}
+	if err := store.AddDependency(ctx, dep, "test"); err != nil {
+		t.Fatalf("AddDependency: %v", err)
+	}
+
+	townRoot := setupTownRoot(t)
+	gtPath, _ := makeGTStub(t, 0)
+	logger, logMsgs := makeLogger()
+
+	// Call CheckConvoysForIssue with the tracked issue's ID (simulating close event)
+	result := CheckConvoysForIssue(ctx, store, townRoot, tracked.ID, "DS-07", logger, gtPath, nil)
+
+	// The convoy should be returned (it was found as a tracker)
+	if len(result) == 0 {
+		t.Skipf("no tracking convoys found — GetDependentsWithMetadata may not work in embedded Dolt")
+	}
+
+	// Verify the staged convoy was skipped via log messages
+	foundStagedSkip := false
+	for _, msg := range *logMsgs {
+		if strings.Contains(msg, "staged") && strings.Contains(msg, "skipping") {
+			foundStagedSkip = true
+			break
+		}
+	}
+	if !foundStagedSkip {
+		t.Errorf("expected log message about staged convoy being skipped, got: %v", *logMsgs)
+	}
+
+	// Verify "checking convoy" was NOT logged (convoy should be skipped before check)
+	for _, msg := range *logMsgs {
+		if strings.Contains(msg, "checking convoy") && strings.Contains(msg, convoy.ID) {
+			t.Errorf("staged convoy should not have been checked, but found log: %s", msg)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DS-08: CheckConvoysForIssue skips staged:warnings convoys
+// ---------------------------------------------------------------------------
+
+func TestCheckConvoysForIssue_SkipsStagedWarnings(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Create a convoy as open first, then transition to "staged:warnings".
+	convoy := &beadsdk.Issue{
+		ID:        "test-cv-staged2",
+		Title:     "Staged Warnings Convoy",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	tracked := &beadsdk.Issue{
+		ID:        "test-trk-stg2",
+		Title:     "Tracked Issue",
+		Status:    beadsdk.StatusClosed,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	for _, iss := range []*beadsdk.Issue{convoy, tracked} {
+		if err := store.CreateIssue(ctx, iss, "test"); err != nil {
+			t.Fatalf("CreateIssue %s: %v", iss.ID, err)
+		}
+	}
+
+	// Transition convoy to "staged:warnings"
+	if err := store.UpdateIssue(ctx, convoy.ID, map[string]interface{}{
+		"status": "staged:warnings",
+	}, "test"); err != nil {
+		t.Fatalf("UpdateIssue to staged:warnings: %v", err)
+	}
+
+	dep := &beadsdk.Dependency{
+		IssueID:     convoy.ID,
+		DependsOnID: tracked.ID,
+		Type:        beadsdk.DependencyType("tracks"),
+		CreatedAt:   now,
+		CreatedBy:   "test",
+	}
+	if err := store.AddDependency(ctx, dep, "test"); err != nil {
+		t.Fatalf("AddDependency: %v", err)
+	}
+
+	townRoot := setupTownRoot(t)
+	gtPath, _ := makeGTStub(t, 0)
+	logger, logMsgs := makeLogger()
+
+	result := CheckConvoysForIssue(ctx, store, townRoot, tracked.ID, "DS-08", logger, gtPath, nil)
+
+	if len(result) == 0 {
+		t.Skipf("no tracking convoys found — GetDependentsWithMetadata may not work in embedded Dolt")
+	}
+
+	// Verify the staged convoy was skipped
+	foundStagedSkip := false
+	for _, msg := range *logMsgs {
+		if strings.Contains(msg, "staged") && strings.Contains(msg, "skipping") {
+			foundStagedSkip = true
+			break
+		}
+	}
+	if !foundStagedSkip {
+		t.Errorf("expected log message about staged convoy being skipped, got: %v", *logMsgs)
+	}
+
+	// Verify "checking convoy" was NOT logged
+	for _, msg := range *logMsgs {
+		if strings.Contains(msg, "checking convoy") && strings.Contains(msg, convoy.ID) {
+			t.Errorf("staged convoy should not have been checked, but found log: %s", msg)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DS-10: After staged:ready→open transition, daemon feeds normally
+// ---------------------------------------------------------------------------
+
+func TestCheckConvoysForIssue_FeedsAfterStagedToOpenTransition(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Create a convoy as open first, then transition to "staged:ready"
+	convoy := &beadsdk.Issue{
+		ID:        "test-cv-launch",
+		Title:     "Launched Convoy",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	// Create a tracked issue that is closed (triggers event path)
+	tracked := &beadsdk.Issue{
+		ID:        "test-trk-lnch",
+		Title:     "Tracked Closed",
+		Status:    beadsdk.StatusClosed,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	for _, iss := range []*beadsdk.Issue{convoy, tracked} {
+		if err := store.CreateIssue(ctx, iss, "test"); err != nil {
+			t.Fatalf("CreateIssue %s: %v", iss.ID, err)
+		}
+	}
+
+	// Transition convoy to "staged:ready"
+	if err := store.UpdateIssue(ctx, convoy.ID, map[string]interface{}{
+		"status": "staged:ready",
+	}, "test"); err != nil {
+		t.Fatalf("UpdateIssue to staged:ready: %v", err)
+	}
+
+	dep := &beadsdk.Dependency{
+		IssueID:     convoy.ID,
+		DependsOnID: tracked.ID,
+		Type:        beadsdk.DependencyType("tracks"),
+		CreatedAt:   now,
+		CreatedBy:   "test",
+	}
+	if err := store.AddDependency(ctx, dep, "test"); err != nil {
+		t.Fatalf("AddDependency: %v", err)
+	}
+
+	// Phase 1: While staged, verify it's skipped
+	logger1, logMsgs1 := makeLogger()
+	townRoot := setupTownRoot(t)
+	gtPath, _ := makeGTStub(t, 0)
+
+	result1 := CheckConvoysForIssue(ctx, store, townRoot, tracked.ID, "DS-10-staged", logger1, gtPath, nil)
+	if len(result1) == 0 {
+		t.Skipf("no tracking convoys found — GetDependentsWithMetadata may not work in embedded Dolt")
+	}
+
+	foundStagedSkip := false
+	for _, msg := range *logMsgs1 {
+		if strings.Contains(msg, "staged") && strings.Contains(msg, "skipping") {
+			foundStagedSkip = true
+			break
+		}
+	}
+	if !foundStagedSkip {
+		t.Fatalf("convoy should have been skipped while staged, logs: %v", *logMsgs1)
+	}
+
+	// Phase 2: Transition convoy to "open" (launch it)
+	if err := store.UpdateIssue(ctx, convoy.ID, map[string]interface{}{
+		"status": string(beadsdk.StatusOpen),
+	}, "test"); err != nil {
+		t.Fatalf("UpdateIssue staged->open: %v", err)
+	}
+
+	// Verify it's no longer staged
+	if isConvoyStaged(ctx, store, convoy.ID) {
+		t.Fatal("convoy should not be staged after transition to open")
+	}
+
+	// Phase 3: Call CheckConvoysForIssue again — now the convoy should be processed
+	logger2, logMsgs2 := makeLogger()
+	_ = CheckConvoysForIssue(ctx, store, townRoot, tracked.ID, "DS-10-open", logger2, gtPath, nil)
+
+	// Verify "checking convoy" WAS logged (convoy is now open and being processed)
+	foundChecking := false
+	for _, msg := range *logMsgs2 {
+		if strings.Contains(msg, "checking convoy") && strings.Contains(msg, convoy.ID) {
+			foundChecking = true
+			break
+		}
+	}
+	if !foundChecking {
+		t.Errorf("expected convoy to be checked after staged->open transition, logs: %v", *logMsgs2)
+	}
+
+	// Verify it was NOT skipped as staged
+	for _, msg := range *logMsgs2 {
+		if strings.Contains(msg, "staged") && strings.Contains(msg, "skipping") {
+			t.Errorf("convoy should NOT be skipped after transition to open, but found: %s", msg)
+		}
+	}
+}

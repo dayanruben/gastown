@@ -80,8 +80,10 @@ var (
 )
 
 const (
-	convoyStatusOpen   = "open"
-	convoyStatusClosed = "closed"
+	convoyStatusOpen           = "open"
+	convoyStatusClosed         = "closed"
+	convoyStatusStagedReady    = "staged:ready"
+	convoyStatusStagedWarnings = "staged:warnings"
 )
 
 func normalizeConvoyStatus(status string) string {
@@ -90,16 +92,23 @@ func normalizeConvoyStatus(status string) string {
 
 func ensureKnownConvoyStatus(status string) error {
 	switch normalizeConvoyStatus(status) {
-	case convoyStatusOpen, convoyStatusClosed:
+	case convoyStatusOpen, convoyStatusClosed, convoyStatusStagedReady, convoyStatusStagedWarnings:
 		return nil
 	default:
 		return fmt.Errorf(
-			"unsupported convoy status %q (expected %q or %q)",
+			"unsupported convoy status %q (expected %q, %q, %q, or %q)",
 			status,
 			convoyStatusOpen,
 			convoyStatusClosed,
+			convoyStatusStagedReady,
+			convoyStatusStagedWarnings,
 		)
 	}
+}
+
+// isStagedStatus reports whether the given normalized status is a staged status.
+func isStagedStatus(status string) bool {
+	return strings.HasPrefix(status, "staged:")
 }
 
 func validateConvoyStatusTransition(currentStatus, targetStatus string) error {
@@ -115,13 +124,26 @@ func validateConvoyStatusTransition(currentStatus, targetStatus string) error {
 	if current == target {
 		return nil
 	}
+
+	// Original open ↔ closed transitions.
 	if (current == convoyStatusOpen && target == convoyStatusClosed) ||
 		(current == convoyStatusClosed && target == convoyStatusOpen) {
 		return nil
 	}
-	// With only two valid statuses, identity and both cross-transitions are
-	// covered above. This is unreachable unless new statuses are added to
-	// ensureKnownConvoyStatus without updating this function.
+
+	// Staged → open (launch) and staged → closed (cancel) are allowed.
+	if isStagedStatus(current) && (target == convoyStatusOpen || target == convoyStatusClosed) {
+		return nil
+	}
+
+	// Staged ↔ staged transitions (re-stage with different result).
+	if isStagedStatus(current) && isStagedStatus(target) {
+		return nil
+	}
+
+	// REJECT: open → staged:* and closed → staged:* are not allowed.
+	// (Falls through to the error below.)
+
 	return fmt.Errorf("illegal convoy status transition %q -> %q", currentStatus, targetStatus)
 }
 
@@ -365,6 +387,8 @@ func init() {
 	convoyCmd.AddCommand(convoyStrandedCmd)
 	convoyCmd.AddCommand(convoyCloseCmd)
 	convoyCmd.AddCommand(convoyLandCmd)
+	convoyCmd.AddCommand(convoyStageCmd)
+	convoyCmd.AddCommand(convoyLaunchCmd)
 
 	rootCmd.AddCommand(convoyCmd)
 }
