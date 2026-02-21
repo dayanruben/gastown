@@ -145,7 +145,8 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 	// The agent already has role docs in compressed memory — just restore
 	// identity, hook status, and any new mail.
 	if isCompactResume() {
-		return runPrimeCompactResume(ctx, cwd)
+		runPrimeCompactResume(ctx, cwd)
+		return nil
 	}
 
 	if err := outputRoleContext(ctx); err != nil {
@@ -174,7 +175,7 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 // runPrimeCompactResume runs a lighter prime after compaction or resume.
 // The agent already has full role context in compressed memory. This just
 // restores identity, checks hook/work status, and injects any new mail.
-func runPrimeCompactResume(ctx RoleContext, cwd string) error {
+func runPrimeCompactResume(ctx RoleContext, cwd string) {
 	// Brief identity confirmation
 	actor := getAgentIdentity(ctx)
 	fmt.Printf("\n> **Recovery**: Context %s complete. You are **%s** (%s).\n",
@@ -198,8 +199,6 @@ func runPrimeCompactResume(ctx RoleContext, cwd string) error {
 	if !hasSlungWork {
 		outputStartupDirective(ctx)
 	}
-
-	return nil
 }
 
 // validatePrimeFlags checks that CLI flag combinations are valid.
