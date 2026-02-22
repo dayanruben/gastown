@@ -96,9 +96,13 @@ func runMoleculeBurn(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("detaching molecule: %w", err)
 	}
-	// Close the molecule root after detach so the audit sees original status
+	// Close the molecule root after detach so the audit sees original status.
+	// Without this, the wisp root stays in "hooked" status indefinitely,
+	// causing patrol molecule leaks (issue #1828).
+	rootClosed := true
 	if closeErr := b.ForceCloseWithReason("burned", moleculeID); closeErr != nil {
 		style.PrintWarning("could not close molecule root %s: %v", moleculeID, closeErr)
+		rootClosed = false
 	}
 
 	if moleculeJSON {
@@ -107,6 +111,7 @@ func runMoleculeBurn(cmd *cobra.Command, args []string) error {
 			"from":            target,
 			"handoff_id":      handoff.ID,
 			"children_closed": childrenClosed,
+			"root_closed":     rootClosed,
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -301,9 +306,13 @@ squashed_at: %s
 		return fmt.Errorf("detaching molecule: %w", err)
 	}
 
-	// Close the molecule root after detach so the audit sees original status
+	// Close the molecule root after detach so the audit sees original status.
+	// Without this, the wisp root stays in "hooked" status indefinitely,
+	// causing patrol molecule leaks (issue #1828).
+	rootClosed := true
 	if closeErr := b.ForceCloseWithReason("squashed", moleculeID); closeErr != nil {
 		style.PrintWarning("could not close molecule root %s: %v", moleculeID, closeErr)
+		rootClosed = false
 	}
 
 	if moleculeJSON {
@@ -313,6 +322,7 @@ squashed_at: %s
 			"handoff_id":      handoff.ID,
 			"children_closed": childrenClosed,
 			"digest_skipped":  moleculeNoDigest,
+			"root_closed":     rootClosed,
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
