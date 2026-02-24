@@ -65,6 +65,14 @@ func (c *PatrolMoleculesExistCheck) Run(ctx *CheckContext) *CheckResult {
 	var details []string
 	for _, rigName := range rigs {
 		rigPath := filepath.Join(ctx.TownRoot, rigName)
+		// If rigPath doesn't exist, fall back to TownRoot. This handles the case
+		// where gt doctor runs from a mayor's canonical clone, where TownRoot
+		// resolves to the clone itself (e.g. gastown/mayor/rig) rather than the
+		// actual town root. The rig directory won't be a subdirectory of the clone,
+		// but patrol formulas are town-level and accessible from TownRoot itself.
+		if _, statErr := os.Stat(rigPath); os.IsNotExist(statErr) {
+			rigPath = ctx.TownRoot
+		}
 		missing := c.checkPatrolFormulas(rigPath)
 		if len(missing) > 0 {
 			c.missingFormulas[rigName] = missing
