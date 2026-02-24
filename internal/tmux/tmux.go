@@ -1807,6 +1807,29 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 	return ErrIdleTimeout
 }
 
+// IsAtPrompt checks if the agent is currently at an idle prompt (non-blocking).
+// Returns true if the pane shows the ReadyPromptPrefix, indicating the agent is
+// idle and ready for input. Used by startup nudge verification to detect whether
+// a nudge was lost (agent returned to prompt without processing it).
+func (t *Tmux) IsAtPrompt(session string, rc *config.RuntimeConfig) bool {
+	promptPrefix := DefaultReadyPromptPrefix
+	if rc != nil && rc.Tmux != nil && rc.Tmux.ReadyPromptPrefix != "" {
+		promptPrefix = rc.Tmux.ReadyPromptPrefix
+	}
+
+	lines, err := t.CapturePaneLines(session, 10)
+	if err != nil {
+		return false
+	}
+
+	for _, line := range lines {
+		if matchesPromptPrefix(line, promptPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // GetSessionInfo returns detailed information about a session.
 func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
 	format := "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}|#{session_last_attached}"
