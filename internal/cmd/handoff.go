@@ -459,12 +459,19 @@ func runHandoffCycle() error {
 		fmt.Fprintf(os.Stderr, "handoff --cycle: saved state to %s\n", beadID)
 	}
 
-	// Write handoff marker so post-cycle prime knows it's post-handoff
+	// Write handoff marker so post-cycle prime knows it's post-handoff.
+	// Format: "session_id\nreason" — the reason enables isCompactResume()
+	// to detect compaction-triggered cycles and use a lighter continuation
+	// directive instead of full re-initialization. (GH#1965)
 	if cwd, err := os.Getwd(); err == nil {
 		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
 		_ = os.MkdirAll(runtimeDir, 0755)
 		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
-		_ = os.WriteFile(markerPath, []byte(currentSession), 0644)
+		markerContent := currentSession
+		if handoffReason != "" {
+			markerContent += "\n" + handoffReason
+		}
+		_ = os.WriteFile(markerPath, []byte(markerContent), 0644)
 	}
 
 	// Log cycle event
