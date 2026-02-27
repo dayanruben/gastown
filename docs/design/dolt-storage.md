@@ -51,29 +51,26 @@ gt dolt list           # List all databases
 If the server isn't running, `bd` fails fast with a clear message
 pointing to `gt dolt start`.
 
-## Write Concurrency: Branch-Per-Polecat
+## Write Concurrency: All-on-Main
 
-Each polecat gets its own Dolt branch at sling time. Branches are
-independent root pointers — zero contention between concurrent writers.
-Merges happen sequentially at `gt done` time.
+All agents — polecats, crew, witness, refinery, deacon — write directly
+to `main`. Concurrency is managed through transaction discipline: every
+write wraps `BEGIN` / `DOLT_COMMIT` / `COMMIT` atomically.
 
 ```
-gt sling <bead> <rig>
-  → CALL DOLT_BRANCH('polecat-<name>-<timestamp>')
-  → Polecat env: BD_BRANCH=polecat-<name>-<timestamp>
-  → All bd writes go to the polecat's branch
-
-gt done
-  → DOLT_CHECKOUT('main')
-  → DOLT_MERGE('polecat-<name>-<timestamp>')
-  → DOLT_BRANCH('-D', 'polecat-<name>-<timestamp>')
+bd update <bead> --status=in_progress
+  → BEGIN
+  → UPDATE issues SET status='in_progress' ...
+  → CALL DOLT_COMMIT('-Am', 'update status')
+  → COMMIT
 ```
 
-**Tested**: 50 concurrent writers, 250 Dolt commits, 100% success rate.
-Sequential merge of 50 branches completes in ~300ms.
+This eliminates the former branch-per-worker strategy (BD_BRANCH,
+per-polecat Dolt branches, merge-at-done). All writes are immediately
+visible to all agents — no cross-agent visibility gaps.
 
-Crew, witness, refinery, and deacon write to `main` directly (low
-contention — few concurrent writers in those roles).
+Multi-statement `bd` commands batch their writes inside a single
+transaction to maintain atomicity.
 
 ## Schema
 
@@ -124,9 +121,9 @@ These are available to agents via SQL and used throughout Gas Town:
 | `AS OF` queries | Time-travel: "what did this look like yesterday?" |
 | `dolt_diff()` | "What changed between these two points?" |
 | `DOLT_COMMIT` | Explicit commit with message (auto-commit is the default) |
-| `DOLT_MERGE` | Merge branches (used by `gt done`) |
+| `DOLT_MERGE` | Merge branches (integration branches, federation) |
 | `dolt_conflicts` table | Programmatic conflict resolution after merge |
-| `DOLT_BRANCH` | Create/delete branches (used by `gt sling`, `gt polecat nuke`) |
+| `DOLT_BRANCH` | Create/delete branches (integration branches) |
 
 **Auto-commit** is on by default: every write gets a Dolt commit. Agents
 can batch writes by disabling auto-commit temporarily.
@@ -149,11 +146,120 @@ and design planes federate via DoltHub using the Highway Operations
 Protocol — Gas Town's public federation layer built on Dolt's native
 push/pull remotes.
 
+## Ephemeral Data Lifecycle (CRITICAL)
+
+Dolt is sensitive to row volume and versioning overhead. Every row change
+creates a new chunk in Dolt's content-addressed storage. Without active
+garbage collection, databases bloat rapidly.
+
+### Two Data Streams
+
+```
+EPHEMERAL (wisps, patrol data)          SACRED (issues, molecules, mail, agents)
+  CREATE                                  CREATE
+  → work                                  → work
+  → CLOSE (>24h)                          → CLOSE
+  → SQUASH to digest summary              → JSONL export (scrubbed)
+  → DELETE original rows                  → git push to GitHub
+  → digest into git                       → never delete from Dolt
+```
+
+**Ephemeral data** (wisps, wisp_events, wisp_labels, wisp_deps) is
+high-volume patrol exhaust. It's valuable in real-time but worthless
+after 24 hours. The Reaper Dog squashes it into digest summaries
+(aggregate stats per cycle), then DELETES the original rows. Without
+this, wisp tables grow without bound and Dolt performance degrades.
+
+**Sacred data** (issues, molecules, agents, mail, dependencies, labels)
+is the permanent ledger. It's backed up via JSONL exports (scrubbed of
+test artifacts and pollution) and pushed to GitHub. Never deleted from
+Dolt unless corrupted.
+
+### Dolt GC (Non-Negotiable)
+
+`dolt gc` compacts old chunk data. Without it, databases bloat by 10-50x.
+The Doctor Dog runs gc at least daily. This is the single most important
+maintenance operation.
+
+```bash
+# Manual gc (stop server first for exclusive access)
+gt dolt stop
+cd ~/.dolt-data/<db> && dolt gc
+gt dolt start
+
+# Or: Doctor Dog runs it automatically via daemon
+```
+
+### Pollution Prevention
+
+Pollution enters Dolt via:
+1. **Test artifacts**: test code creates issues on production server
+2. **Wisp accumulation**: wisps closed but never deleted
+3. **Orphan databases**: test DBs that survive cleanup
+4. **Zombie servers**: test dolt-server processes in /tmp
+
+Prevention is layered:
+- **Firewall** (store.go): refuses test-prefixed CREATE DATABASE on port 3307
+- **Reaper Dog**: deletes closed wisps, auto-closes stale issues
+- **Doctor Dog**: runs gc, kills zombie servers, detects orphan DBs
+- **JSONL Dog**: scrubs exports, rejects pollution, spike-detects before commit
+- **Janitor Dog**: cleans test server (port 3308)
+
 ## Standalone Beads Note
 
 The `bd` CLI retains an embedded Dolt option for standalone use (outside
 Gas Town). Server-only mode applies to Gas Town exclusively — standalone
 users may not have a Dolt server running.
+
+## Remote Push (Git Protocol)
+
+Gas Town pushes Dolt databases to GitHub remotes via `gt dolt sync`. These
+use git SSH protocol (`git+ssh://git@github.com/...`), not DoltHub's native
+protocol.
+
+### Git Remote Cache
+
+Dolt maintains a cache at `.dolt-data/<db>/.dolt/git-remote-cache/` that
+stores git objects built from Dolt's internal format. Per the Dolt team
+(Dustin Brown, 2026-02-26):
+
+- **The cache is necessary** — Dolt uses it to build git objects for push/pull
+- **Accumulates garbage** (orphaned refs) and is not cleaned up automatically
+- **Safe to delete** between pushes, but causes a full rebuild on next push
+  (beads: ~20 min rebuild, gastown: even longer)
+- **Orphaned refs** can be pruned without deleting the whole cache — better balance
+- **Grows over time** as the database grows — inherent to git-protocol remotes
+
+**Guidance**: Do NOT routinely delete the cache. Prefer pruning orphaned refs.
+Full deletion should only be done when disk pressure is critical and a long
+rebuild is acceptable.
+
+### Sync Procedure
+
+`gt dolt sync` parks all rigs (stops witnesses/refineries), stops the Dolt
+server, runs `dolt push` for each database with a configured remote, then
+restarts the server and unparks rigs. The parking prevents witnesses from
+detecting the server outage and restarting it mid-push.
+
+### Force Push
+
+After data recovery (e.g., Clown Show #13), local and remote histories
+diverge. Use `gt dolt sync --force` for the first push to overwrite the
+remote with local state. Subsequent pushes should work without `--force`.
+
+### Known Limitations
+
+- **Slow**: Git-protocol remotes are orders of magnitude slower than DoltHub
+  native remotes. A 71MB database takes ~90s; larger ones take 20+ minutes.
+- **Cache growth**: No automatic garbage collection. Orphan pruning TBD.
+- **Server downtime**: Push requires exclusive access to the data directory,
+  so the server must be stopped during push. This creates a maintenance window.
+
+### Future: DoltHub Remotes
+
+DoltHub's native protocol (`https://doltremoteapi.dolthub.com/...`) avoids
+the git-remote-cache entirely and is much faster. Migration requires DoltHub
+accounts and reconfiguring remotes with `dolt remote set-url`.
 
 ## File Layout
 

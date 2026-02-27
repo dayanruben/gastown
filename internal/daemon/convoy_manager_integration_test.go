@@ -30,24 +30,6 @@ func TestConvoyManager_FullLifecycle(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	now := time.Now().UTC()
-
-	// Create and close an issue so the event poll has something to detect.
-	issue := &beadsdk.Issue{
-		ID:        "gt-integ1",
-		Title:     "Integration Test Issue",
-		Status:    beadsdk.StatusOpen,
-		Priority:  2,
-		IssueType: beadsdk.TypeTask,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
-		t.Fatalf("CreateIssue: %v", err)
-	}
-	if err := store.CloseIssue(ctx, issue.ID, "done", "test", ""); err != nil {
-		t.Fatalf("CloseIssue: %v", err)
-	}
 
 	// Set up mock gt that returns stranded convoys and logs all calls.
 	binDir := t.TempDir()
@@ -94,7 +76,29 @@ exit 0
 		t.Fatalf("double Start: %v", err)
 	}
 
-	// Wait for at least one event poll tick (5s) and one stranded scan (500ms).
+	// Wait for the seed poll to complete (first event poll tick at ~5s).
+	// The first poll advances high-water marks without processing events.
+	time.Sleep(6 * time.Second)
+
+	// Create and close an issue AFTER seeding so the next poll detects it.
+	now := time.Now().UTC()
+	issue := &beadsdk.Issue{
+		ID:        "gt-integ1",
+		Title:     "Integration Test Issue",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if err := store.CloseIssue(ctx, issue.ID, "done", "test", ""); err != nil {
+		t.Fatalf("CloseIssue: %v", err)
+	}
+
+	// Wait for the next event poll tick to detect the close event (~5s).
 	time.Sleep(6 * time.Second)
 
 	// Stop and verify bounded completion (S-09: context cancellation).
@@ -274,9 +278,12 @@ exit 0
 	}
 
 	// Start manager with short scan interval; event poll is 5s (fixed).
-	m := NewConvoyManager(townRoot, logger, gtPath, 1*time.Hour, map[string]beadsdk.Storage{"hq": store}, nil, nil)
+	stores := map[string]beadsdk.Storage{"hq": store}
+	m := NewConvoyManager(townRoot, logger, gtPath, 1*time.Hour, stores, nil, nil)
+	// Skip seeding so pollStoresSnapshot processes events immediately.
+	m.seeded.Store(true)
 	// Drive one poll manually instead of waiting for the 5s ticker.
-	m.pollAllStores()
+	m.pollStoresSnapshot(stores)
 
 	mu.Lock()
 	snapshot := make([]string, len(logged))
@@ -386,8 +393,11 @@ exit 0
 		logged = append(logged, fmt.Sprintf(format, args...))
 	}
 
-	m := NewConvoyManager(townRoot, logger, gtPath, 1*time.Hour, map[string]beadsdk.Storage{"hq": store}, nil, nil)
-	m.pollAllStores()
+	stores := map[string]beadsdk.Storage{"hq": store}
+	m := NewConvoyManager(townRoot, logger, gtPath, 1*time.Hour, stores, nil, nil)
+	// Skip seeding so pollStoresSnapshot processes events immediately.
+	m.seeded.Store(true)
+	m.pollStoresSnapshot(stores)
 
 	mu.Lock()
 	snapshot := make([]string, len(logged))
@@ -498,8 +508,11 @@ exit 0
 		logged = append(logged, fmt.Sprintf(format, args...))
 	}
 
-	m := NewConvoyManager(townRoot, logger, gtPath, 1*time.Hour, map[string]beadsdk.Storage{"hq": store}, nil, nil)
-	m.pollAllStores()
+	stores := map[string]beadsdk.Storage{"hq": store}
+	m := NewConvoyManager(townRoot, logger, gtPath, 1*time.Hour, stores, nil, nil)
+	// Skip seeding so pollStoresSnapshot processes events immediately.
+	m.seeded.Store(true)
+	m.pollStoresSnapshot(stores)
 
 	mu.Lock()
 	snapshot := make([]string, len(logged))
@@ -621,8 +634,11 @@ exit 0
 
 	// isRigParked returns true for "gt" rig
 	parked := func(rig string) bool { return rig == "gt" }
-	m := NewConvoyManager(townRoot, logger, gtPath, 1*time.Hour, map[string]beadsdk.Storage{"hq": store}, nil, parked)
-	m.pollAllStores()
+	stores := map[string]beadsdk.Storage{"hq": store}
+	m := NewConvoyManager(townRoot, logger, gtPath, 1*time.Hour, stores, nil, parked)
+	// Skip seeding so pollStoresSnapshot processes events immediately.
+	m.seeded.Store(true)
+	m.pollStoresSnapshot(stores)
 
 	mu.Lock()
 	snapshot := make([]string, len(logged))

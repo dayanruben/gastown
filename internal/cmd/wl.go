@@ -3,7 +3,7 @@ package cmd
 import (
 	"fmt"
 	"path/filepath"
-	"time"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
@@ -73,8 +73,8 @@ func init() {
 func runWlJoin(cmd *cobra.Command, args []string) error {
 	upstream := args[0]
 
-	// Parse upstream path
-	upstreamOrg, upstreamDB, err := wasteland.ParseUpstream(upstream)
+	// Parse upstream path (validate early)
+	_, _, err := wasteland.ParseUpstream(upstream)
 	if err != nil {
 		return err
 	}
@@ -96,15 +96,20 @@ func runWlJoin(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	// Check if already joined
-	if existing, err := wasteland.LoadConfig(townRoot); err == nil {
-		fmt.Printf("%s Already joined wasteland: %s\n", style.Dim.Render("⚠"), existing.Upstream)
-		fmt.Printf("  Fork: %s/%s\n", existing.ForkOrg, existing.ForkDB)
-		fmt.Printf("  Local: %s\n", existing.LocalDir)
-		return nil
+	// Fast path: check if already joined before loading town config.
+	// This avoids failing on unrelated town-config errors for the no-op case.
+	if existing, loadErr := wasteland.LoadConfig(townRoot); loadErr == nil {
+		if existing.Upstream == upstream {
+			fmt.Printf("%s Already joined wasteland: %s\n", style.Bold.Render("⚠"), upstream)
+			fmt.Printf("  Handle: %s\n", existing.RigHandle)
+			fmt.Printf("  Fork: %s/%s\n", existing.ForkOrg, existing.ForkDB)
+			fmt.Printf("  Local: %s\n", existing.LocalDir)
+			return nil
+		}
+		return fmt.Errorf("already joined to %s; run gt wl leave first", existing.Upstream)
 	}
 
-	// Load town config for identity
+	// Load town config for identity (only needed for fresh join)
 	townConfigPath := filepath.Join(townRoot, workspace.PrimaryMarker)
 	townCfg, err := config.LoadTownConfig(townConfigPath)
 	if err != nil {
@@ -114,7 +119,7 @@ func runWlJoin(cmd *cobra.Command, args []string) error {
 	// Determine town handle
 	handle := wlJoinHandle
 	if handle == "" {
-		handle = forkOrg // default to DoltHub org as handle
+		handle = forkOrg
 	}
 
 	displayName := wlJoinDisplayName
@@ -127,64 +132,23 @@ func runWlJoin(cmd *cobra.Command, args []string) error {
 	}
 
 	ownerEmail := townCfg.Owner
-
-	// Get gt version (best-effort from build info)
 	gtVersion := "dev"
 
-	localDir := wasteland.LocalCloneDir(townRoot, upstreamOrg, upstreamDB)
-
-	// Step 1: Fork the commons
-	fmt.Printf("Forking %s to %s/%s...\n", upstream, forkOrg, upstreamDB)
-	if err := wasteland.ForkDoltHubRepo(upstreamOrg, upstreamDB, forkOrg, token); err != nil {
-		return fmt.Errorf("forking commons: %w", err)
+	svc := wasteland.NewService()
+	svc.OnProgress = func(step string) {
+		fmt.Printf("  %s\n", step)
 	}
-	fmt.Printf("  %s Fork created (or already exists)\n", style.Bold.Render("✓"))
 
-	// Step 2: Clone the fork locally
-	fmt.Printf("Cloning fork to %s...\n", localDir)
-	if err := wasteland.CloneLocally(forkOrg, upstreamDB, localDir); err != nil {
-		return fmt.Errorf("cloning fork: %w", err)
-	}
-	fmt.Printf("  %s Clone complete\n", style.Bold.Render("✓"))
-
-	// Step 3: Add upstream remote
-	fmt.Printf("Adding upstream remote...\n")
-	if err := wasteland.AddUpstreamRemote(localDir, upstreamOrg, upstreamDB); err != nil {
-		return fmt.Errorf("adding upstream remote: %w", err)
-	}
-	fmt.Printf("  %s Upstream remote configured\n", style.Bold.Render("✓"))
-
-	// Step 4: Register rig in the rigs table
-	fmt.Printf("Registering rig '%s' in the commons...\n", handle)
-	if err := wasteland.RegisterRig(localDir, handle, forkOrg, displayName, ownerEmail, gtVersion); err != nil {
-		return fmt.Errorf("registering rig: %w", err)
-	}
-	fmt.Printf("  %s Rig registered\n", style.Bold.Render("✓"))
-
-	// Step 5: Push to origin (the fork)
-	fmt.Printf("Pushing registration to fork...\n")
-	if err := wasteland.PushToOrigin(localDir); err != nil {
-		return fmt.Errorf("pushing to fork: %w", err)
-	}
-	fmt.Printf("  %s Registration pushed\n", style.Bold.Render("✓"))
-
-	// Step 6: Save wasteland config
-	cfg := &wasteland.Config{
-		Upstream:   upstream,
-		ForkOrg:    forkOrg,
-		ForkDB:     upstreamDB,
-		LocalDir:   localDir,
-		RigHandle: handle,
-		JoinedAt:   time.Now(),
-	}
-	if err := wasteland.SaveConfig(townRoot, cfg); err != nil {
-		return fmt.Errorf("saving wasteland config: %w", err)
+	fmt.Printf("Joining wasteland %s (fork to %s/%s)...\n", upstream, forkOrg, upstream[strings.Index(upstream, "/")+1:])
+	cfg, err := svc.Join(upstream, forkOrg, token, handle, displayName, ownerEmail, gtVersion, townRoot)
+	if err != nil {
+		return err
 	}
 
 	fmt.Printf("\n%s Joined wasteland: %s\n", style.Bold.Render("✓"), upstream)
-	fmt.Printf("  Handle: %s\n", handle)
-	fmt.Printf("  Fork: %s/%s\n", forkOrg, upstreamDB)
-	fmt.Printf("  Local: %s\n", localDir)
+	fmt.Printf("  Handle: %s\n", cfg.RigHandle)
+	fmt.Printf("  Fork: %s/%s\n", cfg.ForkOrg, cfg.ForkDB)
+	fmt.Printf("  Local: %s\n", cfg.LocalDir)
 	fmt.Printf("\n  %s\n", style.Dim.Render("Next: gt wl browse  — browse the wanted board"))
 	return nil
 }

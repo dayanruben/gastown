@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
@@ -1019,13 +1020,16 @@ func (c *BeadsRedirectCheck) Fix(ctx *CheckContext) error {
 
 		// Run bd init with the configured prefix (Dolt is the only backend since bd v0.51.0).
 		// Gas Town rigs use Dolt server mode via the shared town Dolt sql-server.
-		cmd := exec.Command("bd", "init", "--prefix", prefix, "--server")
+		initArgs := []string{"init"}
+		if prefix != "" {
+			initArgs = append(initArgs, "--prefix", prefix)
+		}
+		initArgs = append(initArgs, "--server")
+		cmd := exec.Command("bd", initArgs...)
 		cmd.Dir = rigPath
 		if output, err := cmd.CombinedOutput(); err != nil {
-			// bd might not be installed - create minimal config.yaml
-			configPath := filepath.Join(rigBeadsDir, "config.yaml")
-			configContent := fmt.Sprintf("prefix: %s\n", prefix)
-			if writeErr := os.WriteFile(configPath, []byte(configContent), 0644); writeErr != nil {
+			// bd might not be installed — create config.yaml via shared helper.
+			if writeErr := beads.EnsureConfigYAML(rigBeadsDir, prefix); writeErr != nil {
 				return fmt.Errorf("bd init failed (%v) and fallback config creation failed: %w", err, writeErr)
 			}
 			// Continue - minimal config created
@@ -1063,11 +1067,11 @@ func (c *BeadsRedirectCheck) Fix(ctx *CheckContext) error {
 	return nil
 }
 
-// hasBeadsData checks if a beads directory has actual data (issues.jsonl, issues.db, config.yaml)
+// hasBeadsData checks if a beads directory has actual data (issues.db, config.yaml)
 // as opposed to just being a redirect-only directory.
 func hasBeadsData(beadsDir string) bool {
-	// Check for actual beads data files
-	dataFiles := []string{"issues.jsonl", "issues.db", "config.yaml"}
+	// Check for actual beads data files (Dolt-only — issues.jsonl is no longer supported)
+	dataFiles := []string{"issues.db", "config.yaml"}
 	for _, f := range dataFiles {
 		if _, err := os.Stat(filepath.Join(beadsDir, f)); err == nil {
 			return true
@@ -1255,8 +1259,8 @@ func (c *DefaultBranchExistsCheck) Run(ctx *CheckContext) *CheckResult {
 	cmd := exec.Command("git", "-C", bareRepoPath, "rev-parse", "--verify", ref)
 	if err := cmd.Run(); err != nil {
 		return &CheckResult{
-			Name:   c.Name(),
-			Status: StatusError,
+			Name:    c.Name(),
+			Status:  StatusError,
 			Message: fmt.Sprintf("default_branch %q not found on remote", cfg.DefaultBranch),
 			Details: []string{
 				fmt.Sprintf("Ref %s does not exist in bare repo", ref),
@@ -1680,29 +1684,22 @@ func (c *BareRepoExistsCheck) Fix(ctx *CheckContext) error {
 			return fmt.Errorf("config.json has no git_url, cannot recreate .repo.git")
 		}
 
-		// Clone bare repo
-		cmd := exec.Command("git", "clone", "--bare", cfg.GitURL, bareRepoPath)
+		// Clone bare repo (shallow, single-branch for efficiency on repos with many branches)
+		cmd := exec.Command("git", "clone", "--bare", "--single-branch", "--depth", "1", cfg.GitURL, bareRepoPath)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("cloning bare repo: %s", strings.TrimSpace(stderr.String()))
 		}
 
-		// Configure refspec so worktrees can fetch origin/* refs
+		// Configure refspec so worktrees can fetch origin/* refs.
+		// Skip full fetch — the shallow single-branch clone already has the default branch.
 		stderr.Reset()
 		configCmd := exec.Command("git", "-C", bareRepoPath, "config",
 			"remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
 		configCmd.Stderr = &stderr
 		if err := configCmd.Run(); err != nil {
 			return fmt.Errorf("configuring refspec: %s", strings.TrimSpace(stderr.String()))
-		}
-
-		// Fetch to populate remote refs
-		stderr.Reset()
-		fetchCmd := exec.Command("git", "-C", bareRepoPath, "fetch", "origin")
-		fetchCmd.Stderr = &stderr
-		if err := fetchCmd.Run(); err != nil {
-			return fmt.Errorf("fetching origin: %s", strings.TrimSpace(stderr.String()))
 		}
 
 		// Restore push URL if configured (for read-only upstream repos)

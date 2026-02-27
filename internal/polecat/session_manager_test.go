@@ -7,7 +7,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -366,6 +368,138 @@ func TestSessionManager_resolveBeadsDir(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAgentEnvOmitsGTAgent_FallbackRequired verifies that the AgentEnv path
+// used by session_manager.Start does NOT include GT_AGENT when opts.Agent is
+// empty (the default dispatch path). This confirms the session_manager must
+// fall back to runtimeConfig.ResolvedAgent for setting GT_AGENT in the tmux
+// session table.
+//
+// Without the fallback, GT_AGENT is never written to the tmux session table,
+// and the post-startup validation kills the session with:
+//   "GT_AGENT not set in session ... witness patrol will misidentify this polecat"
+//
+// Regression test for the bug introduced in PR #1776 which removed the
+// unconditional runtimeConfig.ResolvedAgent → SetEnvironment("GT_AGENT") logic
+// and replaced it with an AgentEnv-only path that requires opts.Agent to be set.
+func TestAgentEnvOmitsGTAgent_FallbackRequired(t *testing.T) {
+	t.Parallel()
+
+	// Simulate what session_manager.Start calls for each dispatch scenario.
+	cases := []struct {
+		name       string
+		agent      string // opts.Agent value
+		wantGTAgent bool  // whether GT_AGENT should be in AgentEnv output
+	}{
+		{
+			name:       "default dispatch (no --agent flag)",
+			agent:      "",
+			wantGTAgent: false, // fallback needed
+		},
+		{
+			name:       "explicit --agent codex",
+			agent:      "codex",
+			wantGTAgent: true,
+		},
+		{
+			name:       "explicit --agent gemini",
+			agent:      "gemini",
+			wantGTAgent: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := config.AgentEnv(config.AgentEnvConfig{
+				Role:      "polecat",
+				Rig:       "gastown",
+				AgentName: "Toast",
+				TownRoot:  "/tmp/town",
+				Agent:     tc.agent,
+			})
+			_, hasGTAgent := env["GT_AGENT"]
+			if hasGTAgent != tc.wantGTAgent {
+				t.Errorf("AgentEnv(Agent=%q): GT_AGENT present=%v, want %v",
+					tc.agent, hasGTAgent, tc.wantGTAgent)
+			}
+		})
+	}
+}
+
+// TestVerifyStartupNudgeDelivery_IdleAgent tests that verifyStartupNudgeDelivery
+// detects an idle agent (at prompt) and retries the nudge. Uses a real tmux session
+// with a shell prompt that matches the ReadyPromptPrefix.
+func TestVerifyStartupNudgeDelivery_IdleAgent(t *testing.T) {
+	requireTmux(t)
+
+	tm := tmux.NewTmux()
+	sessionName := "gt-test-nudge-verify-" + t.Name()
+
+	// Create a tmux session with a shell
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+
+	// Configure the shell to show the Claude prompt prefix, simulating an idle agent.
+	// The prompt "❯ " is what Claude Code shows when idle.
+	time.Sleep(300 * time.Millisecond) // Let shell initialize
+	_ = tm.SendKeys(sessionName, "export PS1='❯ '")
+	time.Sleep(300 * time.Millisecond)
+
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	m := NewSessionManager(tm, r)
+
+	rc := &config.RuntimeConfig{
+		Tmux: &config.RuntimeTmuxConfig{
+			ReadyPromptPrefix: "❯ ",
+		},
+	}
+
+	// IsAtPrompt should detect the idle prompt
+	if !tm.IsAtPrompt(sessionName, rc) {
+		t.Log("Warning: prompt not detected (tmux timing); skipping idle verification")
+		t.Skip("prompt detection unreliable in test environment")
+	}
+
+	// verifyStartupNudgeDelivery should detect idle state and retry.
+	// We can't easily assert the retry happened, but we verify it doesn't panic/hang.
+	// Use a goroutine with timeout to prevent test hanging.
+	done := make(chan struct{})
+	go func() {
+		m.verifyStartupNudgeDelivery(sessionName, rc)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - function completed
+	case <-time.After(30 * time.Second):
+		t.Fatal("verifyStartupNudgeDelivery hung (exceeded 30s timeout)")
+	}
+}
+
+// TestVerifyStartupNudgeDelivery_NilConfig verifies that verifyStartupNudgeDelivery
+// exits immediately when runtime config has no prompt detection.
+func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
+	requireTmux(t)
+
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	m := NewSessionManager(tmux.NewTmux(), r)
+
+	// Should return immediately without error for nil config
+	m.verifyStartupNudgeDelivery("nonexistent-session", nil)
+
+	// And for config without prompt prefix
+	rc := &config.RuntimeConfig{
+		Tmux: &config.RuntimeTmuxConfig{
+			ReadyPromptPrefix: "",
+			ReadyDelayMs:      1000,
+		},
+	}
+	m.verifyStartupNudgeDelivery("nonexistent-session", rc)
 }
 
 func TestValidateSessionName(t *testing.T) {

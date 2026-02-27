@@ -17,8 +17,8 @@ import (
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
-	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -34,6 +34,11 @@ type Manager struct {
 	rig     *rig.Rig
 	workDir string
 	output  io.Writer // Output destination for user-facing messages
+}
+
+type scoredIssue struct {
+	issue *beads.Issue
+	score float64
 }
 
 // NewManager creates a new refinery manager for a rig.
@@ -156,15 +161,16 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		Topic:     "patrol",
 	}, "Run `gt prime --hook` and begin patrol.")
 
-	var command string
-	if agentOverride != "" {
-		var err error
-		command, err = config.BuildAgentStartupCommandWithAgentOverride("refinery", m.rig.Name, townRoot, m.rig.Path, initialPrompt, agentOverride)
-		if err != nil {
-			return fmt.Errorf("building startup command with agent override: %w", err)
-		}
-	} else {
-		command = config.BuildAgentStartupCommand("refinery", m.rig.Name, townRoot, m.rig.Path, initialPrompt)
+	command, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
+		Role:        "refinery",
+		Rig:         m.rig.Name,
+		TownRoot:    townRoot,
+		Prompt:      initialPrompt,
+		Topic:       "patrol",
+		SessionName: sessionID,
+	}, m.rig.Path, initialPrompt, agentOverride)
+	if err != nil {
+		return fmt.Errorf("building startup command: %w", err)
 	}
 
 	// Create session with command directly to avoid send-keys race condition.
@@ -179,7 +185,9 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		Role:     "refinery",
 		Rig:      m.rig.Name,
 		TownRoot: townRoot,
+		Agent:    agentOverride,
 	})
+	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 
 	// Add refinery-specific flag
 	envVars["GT_REFINERY"] = "1"
@@ -193,9 +201,9 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	theme := tmux.AssignTheme(m.rig.Name)
 	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, "refinery", "refinery")
 
-	// Accept bypass permissions warning dialog if it appears.
+	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
 	// Must be before WaitForRuntimeReady to avoid race where dialog blocks prompt detection.
-	_ = t.AcceptBypassPermissionsWarning(sessionID)
+	_ = t.AcceptStartupDialogs(sessionID)
 
 	// Wait for Claude to start and show its prompt - fatal if Claude fails to launch
 	// WaitForRuntimeReady waits for the runtime to be ready
@@ -205,8 +213,6 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		return fmt.Errorf("waiting for refinery to start: %w", err)
 	}
 
-	// Wait for runtime to be fully ready
-	runtime.SleepForReadyDelay(runtimeConfig)
 	_ = runtime.RunStartupFallback(t, sessionID, "refinery", runtimeConfig)
 
 	return nil
@@ -246,10 +252,6 @@ func (m *Manager) Queue() ([]QueueItem, error) {
 
 	// Score and sort issues by priority score (highest first)
 	now := time.Now()
-	type scoredIssue struct {
-		issue *beads.Issue
-		score float64
-	}
 	scored := make([]scoredIssue, 0, len(issues))
 	for _, issue := range issues {
 		// Defensive filter: bd status filters can drift; queue must only include open MRs.
@@ -261,7 +263,7 @@ func (m *Manager) Queue() ([]QueueItem, error) {
 	}
 
 	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].score > scored[j].score
+		return compareScoredIssues(scored[i], scored[j])
 	})
 
 	// Convert scored issues to queue items
@@ -280,6 +282,16 @@ func (m *Manager) Queue() ([]QueueItem, error) {
 	}
 
 	return items, nil
+}
+
+func compareScoredIssues(a, b scoredIssue) bool {
+	if a.score != b.score {
+		return a.score > b.score
+	}
+	if a.issue == nil || b.issue == nil {
+		return a.issue != nil
+	}
+	return a.issue.ID < b.issue.ID
 }
 
 // calculateIssueScore computes the priority score for an MR issue.

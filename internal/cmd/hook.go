@@ -460,7 +460,6 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 	}
 
 	b := beads.New(workDir)
-
 	// Query for hooked beads assigned to the target
 	hookedBeads, err := b.List(beads.ListOptions{
 		Status:   beads.StatusHooked,

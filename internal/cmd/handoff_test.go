@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -97,6 +98,167 @@ func TestSessionWorkDir(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildRestartCommand_UsesRoleAgentsWhenNoAgentOverride(t *testing.T) {
+	setupHandoffTestRegistry(t)
+
+	origCwd, _ := os.Getwd()
+	origGTAgent := os.Getenv("GT_AGENT")
+	origTownRoot := os.Getenv("GT_TOWN_ROOT")
+	origRoot := os.Getenv("GT_ROOT")
+
+	// TempDir must be called BEFORE registering the Chdir cleanup so that
+	// LIFO ordering restores the working directory before TempDir removal.
+	// On Windows the directory cannot be deleted while the process CWD is
+	// inside it.
+	townRoot := t.TempDir()
+
+	t.Cleanup(func() {
+		_ = os.Chdir(origCwd)
+		_ = os.Setenv("GT_AGENT", origGTAgent)
+		_ = os.Setenv("GT_TOWN_ROOT", origTownRoot)
+		_ = os.Setenv("GT_ROOT", origRoot)
+	})
+	rigPath := filepath.Join(townRoot, "gastown")
+	witnessDir := filepath.Join(rigPath, "witness")
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := os.MkdirAll(witnessDir, 0755); err != nil {
+		t.Fatalf("mkdir witness dir: %v", err)
+	}
+
+	townSettings := config.NewTownSettings()
+	townSettings.DefaultAgent = "claude"
+	townSettings.Agents = map[string]*config.RuntimeConfig{
+		"claude-sonnet": {
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions", "--model", "sonnet"},
+		},
+	}
+	townSettings.RoleAgents = map[string]string{
+		"witness": "claude-sonnet",
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), config.NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	if err := os.Setenv("GT_AGENT", ""); err != nil {
+		t.Fatalf("Setenv GT_AGENT: %v", err)
+	}
+	if err := os.Setenv("GT_TOWN_ROOT", ""); err != nil {
+		t.Fatalf("Setenv GT_TOWN_ROOT: %v", err)
+	}
+	if err := os.Setenv("GT_ROOT", ""); err != nil {
+		t.Fatalf("Setenv GT_ROOT: %v", err)
+	}
+	if err := os.Chdir(witnessDir); err != nil {
+		t.Fatalf("chdir witness dir: %v", err)
+	}
+
+	cmd, err := buildRestartCommand("gt-witness")
+	if err != nil {
+		t.Fatalf("buildRestartCommand: %v", err)
+	}
+
+	if !strings.Contains(cmd, "--model sonnet") {
+		t.Errorf("expected role_agents witness model flag in restart command, got: %q", cmd)
+	}
+}
+
+func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
+	setupHandoffTestRegistry(t)
+
+	origCwd, _ := os.Getwd()
+	origGTAgent := os.Getenv("GT_AGENT")
+	origTownRoot := os.Getenv("GT_TOWN_ROOT")
+	origRoot := os.Getenv("GT_ROOT")
+
+	townRoot := t.TempDir()
+
+	t.Cleanup(func() {
+		_ = os.Chdir(origCwd)
+		_ = os.Setenv("GT_AGENT", origGTAgent)
+		_ = os.Setenv("GT_TOWN_ROOT", origTownRoot)
+		_ = os.Setenv("GT_ROOT", origRoot)
+	})
+	rigPath := filepath.Join(townRoot, "gastown")
+	crewDir := filepath.Join(rigPath, "crew", "bear")
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := os.MkdirAll(crewDir, 0755); err != nil {
+		t.Fatalf("mkdir crew dir: %v", err)
+	}
+
+	townSettings := config.NewTownSettings()
+	townSettings.DefaultAgent = "claude"
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), config.NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	_ = os.Setenv("GT_AGENT", "")
+	_ = os.Setenv("GT_TOWN_ROOT", "")
+	_ = os.Setenv("GT_ROOT", "")
+	_ = os.Chdir(crewDir)
+
+	t.Run("custom ContinuePrompt overrides default", func(t *testing.T) {
+		cmd, err := buildRestartCommandWithOpts("gt-crew-bear", buildRestartCommandOpts{
+			ContinueSession: true,
+			ContinuePrompt:  "Context compacted. Continue your previous task.",
+		})
+		if err != nil {
+			t.Fatalf("buildRestartCommandWithOpts: %v", err)
+		}
+		if !strings.Contains(cmd, "--continue") {
+			t.Errorf("expected --continue flag in restart command, got: %q", cmd)
+		}
+		if !strings.Contains(cmd, "Context compacted") {
+			t.Errorf("expected custom prompt in restart command, got: %q", cmd)
+		}
+	})
+
+	t.Run("empty ContinuePrompt falls back to default", func(t *testing.T) {
+		cmd, err := buildRestartCommandWithOpts("gt-crew-bear", buildRestartCommandOpts{
+			ContinueSession: true,
+		})
+		if err != nil {
+			t.Fatalf("buildRestartCommandWithOpts: %v", err)
+		}
+		if !strings.Contains(cmd, "--continue") {
+			t.Errorf("expected --continue flag in restart command, got: %q", cmd)
+		}
+		if !strings.Contains(cmd, "Continue your previous task") {
+			t.Errorf("expected default continuation message when ContinuePrompt is empty, got: %q", cmd)
+		}
+	})
+
+	t.Run("ContinueSession false uses beacon", func(t *testing.T) {
+		cmd, err := buildRestartCommandWithOpts("gt-crew-bear", buildRestartCommandOpts{
+			ContinueSession: false,
+		})
+		if err != nil {
+			t.Fatalf("buildRestartCommandWithOpts: %v", err)
+		}
+		if strings.Contains(cmd, "--continue") {
+			t.Errorf("expected no --continue flag when ContinueSession is false, got: %q", cmd)
+		}
+	})
 }
 
 func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {
@@ -439,6 +601,129 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 		})
 		if output != "" {
 			t.Errorf("expected no output with --no-git-check, got: %q", output)
+		}
+	})
+}
+
+func TestHandoffProcessNames(t *testing.T) {
+	t.Run("same-agent restart preserves GT_PROCESS_NAMES from env", func(t *testing.T) {
+		setupHandoffTestRegistry(t)
+
+		tmpTown := t.TempDir()
+		mayorDir := filepath.Join(tmpTown, "mayor")
+		os.MkdirAll(mayorDir, 0755)
+		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644)
+
+		t.Setenv("GT_ROOT", tmpTown)
+		t.Setenv("GT_AGENT", "claude")
+		t.Setenv("GT_PROCESS_NAMES", "node,claude")
+		origCwd, _ := os.Getwd()
+		os.Chdir(os.TempDir())
+		t.Cleanup(func() { os.Chdir(origCwd) })
+
+		// Same-agent restart should preserve existing process names from env
+		cmd, err := buildRestartCommand("gt-crew-propane")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(cmd, "GT_PROCESS_NAMES=node,claude") {
+			t.Errorf("expected GT_PROCESS_NAMES=node,claude preserved from env, got: %q", cmd)
+		}
+	})
+
+	t.Run("first boot without GT_PROCESS_NAMES computes from config", func(t *testing.T) {
+		setupHandoffTestRegistry(t)
+
+		tmpTown := t.TempDir()
+		mayorDir := filepath.Join(tmpTown, "mayor")
+		os.MkdirAll(mayorDir, 0755)
+		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644)
+
+		t.Setenv("GT_ROOT", tmpTown)
+		t.Setenv("GT_AGENT", "claude")
+		// Explicitly clear GT_PROCESS_NAMES to simulate first boot
+		t.Setenv("GT_PROCESS_NAMES", "")
+		origCwd, _ := os.Getwd()
+		os.Chdir(os.TempDir())
+		t.Cleanup(func() { os.Chdir(origCwd) })
+
+		// No GT_PROCESS_NAMES in env — should compute from agent config
+		cmd, err := buildRestartCommand("gt-crew-propane")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Claude's default process names are "node,claude"
+		if !strings.Contains(cmd, "GT_PROCESS_NAMES=node,claude") {
+			t.Errorf("expected GT_PROCESS_NAMES=node,claude computed from config, got: %q", cmd)
+		}
+	})
+}
+
+// TestCollectGitState verifies that collectGitState returns deterministic
+// workspace state from a git repo without shelling out to gt/bd. (GH#1996)
+func TestCollectGitState(t *testing.T) {
+	t.Run("returns_state_from_git_repo", func(t *testing.T) {
+		// Create a temp git repo
+		tmpDir := t.TempDir()
+		cmds := [][]string{
+			{"git", "init"},
+			{"git", "config", "user.email", "test@test.com"},
+			{"git", "config", "user.name", "Test"},
+		}
+		for _, args := range cmds {
+			cmd := exec.Command(args[0], args[1:]...)
+			cmd.Dir = tmpDir
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%v failed: %s", args, out)
+			}
+		}
+
+		// Create a file and commit
+		if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("hello"), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		for _, args := range [][]string{
+			{"git", "add", "file.txt"},
+			{"git", "commit", "-m", "initial commit"},
+		} {
+			cmd := exec.Command(args[0], args[1:]...)
+			cmd.Dir = tmpDir
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%v failed: %s", args, out)
+			}
+		}
+
+		// Modify a file to create uncommitted changes
+		if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("modified"), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		// Run collectGitState from the temp repo
+		t.Chdir(tmpDir)
+
+		state := collectGitState()
+
+		if state == "" {
+			t.Fatal("collectGitState() returned empty string for a git repo with changes")
+		}
+		if !strings.Contains(state, "## Workspace State") {
+			t.Errorf("expected '## Workspace State' header, got: %s", state)
+		}
+		if !strings.Contains(state, "Modified") {
+			t.Errorf("expected 'Modified' in state, got: %s", state)
+		}
+		if !strings.Contains(state, "initial commit") {
+			t.Errorf("expected recent commit in state, got: %s", state)
+		}
+	})
+
+	t.Run("returns_empty_outside_git_repo", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		t.Chdir(tmpDir)
+
+		state := collectGitState()
+		if state != "" {
+			t.Errorf("expected empty string outside git repo, got: %s", state)
 		}
 	})
 }

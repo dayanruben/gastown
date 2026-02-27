@@ -15,7 +15,6 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
-	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
@@ -215,14 +214,15 @@ Examples:
 var polecatCheckRecoveryCmd = &cobra.Command{
 	Use:   "check-recovery <rig>/<polecat>",
 	Short: "Check if polecat needs recovery vs safe to nuke",
-	Long: `Check recovery status of a polecat based on cleanup_status in agent bead.
+	Long: `Check recovery status of a polecat based on cleanup_status and merge queue state.
 
 Used by the Witness to determine appropriate cleanup action:
-  - SAFE_TO_NUKE: cleanup_status is 'clean' - no work at risk
+  - SAFE_TO_NUKE: cleanup_status is 'clean' AND work submitted to merge queue
+  - NEEDS_MQ_SUBMIT: git is clean but work was never submitted to the merge queue
   - NEEDS_RECOVERY: cleanup_status indicates unpushed/uncommitted work
 
 This prevents accidental data loss when cleaning up dormant polecats.
-The Witness should escalate NEEDS_RECOVERY cases to the Mayor.
+The Witness should escalate NEEDS_RECOVERY and NEEDS_MQ_SUBMIT cases to the Mayor.
 
 Examples:
   gt polecat check-recovery greenplace/Toast
@@ -465,7 +465,7 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 		displayState := p.State
 		if p.SessionRunning && displayState == polecat.StateDone {
 			displayState = polecat.StateWorking
-		} else if !p.SessionRunning && !p.Zombie && displayState.IsActive() {
+		} else if !p.SessionRunning && !p.Zombie && displayState == polecat.StateWorking {
 			displayState = polecat.StateDone
 		}
 
@@ -901,9 +901,10 @@ type RecoveryStatus struct {
 	Polecat       string                `json:"polecat"`
 	CleanupStatus polecat.CleanupStatus `json:"cleanup_status"`
 	NeedsRecovery bool                  `json:"needs_recovery"`
-	Verdict       string                `json:"verdict"` // SAFE_TO_NUKE or NEEDS_RECOVERY
+	Verdict       string                `json:"verdict"` // SAFE_TO_NUKE, NEEDS_RECOVERY, or NEEDS_MQ_SUBMIT
 	Branch        string                `json:"branch,omitempty"`
 	Issue         string                `json:"issue,omitempty"`
+	MQStatus      string                `json:"mq_status,omitempty"` // "submitted", "not_submitted", "unknown"
 }
 
 func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
@@ -965,7 +966,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	} else {
 		// Use cleanup_status from agent bead
 		status.CleanupStatus = polecat.CleanupStatus(fields.CleanupStatus)
-		if status.CleanupStatus.IsSafe() {
+		if status.CleanupStatus.IsSafe() && fields.ActiveMR == "" {
 			status.NeedsRecovery = false
 			status.Verdict = "SAFE_TO_NUKE"
 		} else {
@@ -973,6 +974,26 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			// Unknown/empty also treated conservatively
 			status.NeedsRecovery = true
 			status.Verdict = "NEEDS_RECOVERY"
+		}
+	}
+
+	// MQ check: if verdict is SAFE_TO_NUKE and polecat has a branch,
+	// verify the work was actually submitted to the merge queue.
+	// Without this check, polecats that crashed between push and MQ submission
+	// would be nuked with orphaned branches on the remote. See #1035.
+	if status.Verdict == "SAFE_TO_NUKE" && status.Branch != "" {
+		mqBd := beads.New(r.Path)
+		mr, mrErr := mqBd.FindMRForBranchAny(status.Branch)
+		if mrErr != nil {
+			// Can't verify MQ — be conservative
+			status.MQStatus = "unknown"
+		} else if mr != nil {
+			status.MQStatus = "submitted"
+		} else {
+			// Work was pushed but never entered the merge queue
+			status.MQStatus = "not_submitted"
+			status.NeedsRecovery = true
+			status.Verdict = "NEEDS_MQ_SUBMIT"
 		}
 	}
 
@@ -994,13 +1015,23 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println()
 
-	if status.NeedsRecovery {
+	switch status.Verdict {
+	case "NEEDS_MQ_SUBMIT":
+		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("NEEDS_MQ_SUBMIT"))
+		fmt.Printf("  MQ Status:       %s\n", status.MQStatus)
+		fmt.Println()
+		fmt.Printf("  %s Work is pushed but was never submitted to the merge queue.\n", style.Warning.Render("⚠"))
+		fmt.Println("  Submit to MQ before cleanup, or the branch will be orphaned.")
+	case "NEEDS_RECOVERY":
 		fmt.Printf("  Verdict:         %s\n", style.Error.Render("NEEDS_RECOVERY"))
 		fmt.Println()
 		fmt.Printf("  %s This polecat has unpushed/uncommitted work.\n", style.Warning.Render("⚠"))
 		fmt.Println("  Escalate to Mayor for recovery before cleanup.")
-	} else {
+	default:
 		fmt.Printf("  Verdict:         %s\n", style.Success.Render("SAFE_TO_NUKE"))
+		if status.MQStatus != "" {
+			fmt.Printf("  MQ Status:       %s\n", status.MQStatus)
+		}
 		fmt.Println()
 		fmt.Printf("  %s Safe to nuke - no work at risk.\n", style.Success.Render("✓"))
 	}
@@ -1193,11 +1224,47 @@ func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.R
 		fmt.Printf("  %s killed session\n", style.Success.Render("✓"))
 	}
 
-	// Step 2: Get polecat info before deletion (for branch name)
+	// Step 2: Get polecat info before deletion (for branch name + hooked work bead)
 	polecatInfo, getErr := mgr.Get(polecatName)
 	var branchToDelete string
 	if getErr == nil && polecatInfo != nil {
 		branchToDelete = polecatInfo.Branch
+	}
+
+	// Step 2.5: Burn any molecule attached to the polecat's hooked work bead.
+	// Without this, nuked polecats leave orphan molecule refs that block re-sling.
+	// The stale attached_molecule in the work bead's description causes sling to
+	// fail with "bead already has N attached molecule(s)" on re-dispatch (gt-npzy).
+	if getErr == nil && polecatInfo != nil && polecatInfo.Issue != "" {
+		nukeCleanupMolecules(polecatInfo.Issue, r)
+	}
+
+	// Step 2.75: Best-effort push before nuke (gt-4vr guardrail).
+	// Try to preserve any unpushed commits on the branch. If push fails,
+	// proceed — --force already means "I accept data loss".
+	if branchToDelete != "" {
+		var pushGit *git.Git
+		// Try worktree first (may still exist), then bare repo fallback
+		if polecatInfo != nil {
+			wtPath := filepath.Join(r.Path, "polecats", polecatName)
+			if _, statErr := os.Stat(wtPath); statErr == nil {
+				pushGit = git.NewGit(wtPath)
+			}
+		}
+		if pushGit == nil {
+			bareRepoPath := filepath.Join(r.Path, ".repo.git")
+			if info, statErr := os.Stat(bareRepoPath); statErr == nil && info.IsDir() {
+				pushGit = git.NewGitWithDir(bareRepoPath, "")
+			}
+		}
+		if pushGit != nil {
+			refspec := branchToDelete + ":" + branchToDelete
+			if err := pushGit.Push("origin", refspec, false); err != nil {
+				fmt.Printf("  %s best-effort push failed (proceeding): %v\n", style.Dim.Render("○"), err)
+			} else {
+				fmt.Printf("  %s pushed branch %s before nuke\n", style.Success.Render("✓"), branchToDelete)
+			}
+		}
 	}
 
 	// Step 3: Delete worktree (nuclear=true to bypass safety checks for stale polecats)
@@ -1211,23 +1278,27 @@ func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.R
 		fmt.Printf("  %s deleted worktree\n", style.Success.Render("✓"))
 	}
 
-	// Step 3.5: Reject any open MRs for this branch before deleting it.
-	// Prevents MQ/git sync inconsistency where MR exists but branch is gone.
+	// Step 3.5: Check for pending MR before touching the branch.
+	// If an open MR exists for this branch, the refinery still needs the remote
+	// branch to complete the merge. Preserve both the MR and remote branch;
+	// the refinery will delete the remote branch after a successful merge.
+	// Fixes: https://github.com/steveyegge/gastown/issues/2028
+	hasPendingMR := false
 	if branchToDelete != "" {
 		bd := beads.New(r.Path)
 		mr, findErr := bd.FindMRForBranch(branchToDelete)
 		if findErr != nil {
 			fmt.Printf("  %s MR lookup failed: %v\n", style.Dim.Render("○"), findErr)
 		} else if mr != nil {
-			if err := bd.CloseWithReason("rejected: polecat nuked", mr.ID); err != nil {
-				fmt.Printf("  %s MR close failed for %s: %v\n", style.Warning.Render("⚠"), mr.ID, err)
-			} else {
-				fmt.Printf("  %s rejected MR %s (polecat nuked)\n", style.Warning.Render("⚠"), mr.ID)
-			}
+			hasPendingMR = true
+			fmt.Printf("  %s preserving MR %s and remote branch for refinery merge\n", style.Success.Render("✓"), mr.ID)
 		}
 	}
 
-	// Step 4: Delete branch (if we know it) — local and remote
+	// Step 4: Delete branch (if we know it)
+	// Local branch can always be deleted (worktree is already gone).
+	// Remote branch is only deleted when there is NO pending MR — otherwise
+	// the refinery would find the source branch missing and fail to merge.
 	if branchToDelete != "" {
 		var repoGit *git.Git
 		bareRepoPath := filepath.Join(r.Path, ".repo.git")
@@ -1241,29 +1312,86 @@ func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.R
 		} else {
 			fmt.Printf("  %s deleted local branch %s\n", style.Success.Render("✓"), branchToDelete)
 		}
-		// Also delete remote branch if it exists
-		if err := repoGit.DeleteRemoteBranch("origin", branchToDelete); err != nil {
-			fmt.Printf("  %s remote branch delete: %v\n", style.Dim.Render("○"), err)
+		if hasPendingMR {
+			fmt.Printf("  %s skipped remote branch delete (MR pending in merge queue)\n", style.Dim.Render("○"))
 		} else {
-			fmt.Printf("  %s deleted remote branch %s\n", style.Success.Render("✓"), branchToDelete)
+			// No pending MR — safe to delete remote branch
+			if err := repoGit.DeleteRemoteBranch("origin", branchToDelete); err != nil {
+				fmt.Printf("  %s remote branch delete: %v\n", style.Dim.Render("○"), err)
+			} else {
+				fmt.Printf("  %s deleted remote branch %s\n", style.Success.Render("✓"), branchToDelete)
+			}
 		}
 	}
 
-	// Step 5: Close agent bead (if exists)
+	// Step 5: Reset agent bead for reuse (if exists)
+	// Uses ResetAgentBeadForReuse instead of bd close because agent beads are
+	// ephemeral (wisps table). Shelling out to `bd close` operates on the issues
+	// table and silently fails to affect wisps, leaving stale rows that block
+	// re-sling with "duplicate primary key" errors. (gt--irj)
+	// ResetAgentBeadForReuse keeps the bead open with agent_state="nuked" so
+	// CreateOrReopenAgentBead can simply update it on re-spawn without needing
+	// a close/reopen cycle.
 	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
-	closeArgs := []string{"close", agentBeadID, "--reason=nuked"}
-	if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {
-		closeArgs = append(closeArgs, "--session="+sessionID)
-	}
-	closeCmd := exec.Command("bd", closeArgs...)
-	closeCmd.Dir = filepath.Join(r.Path, "mayor", "rig")
-	if err := closeCmd.Run(); err != nil {
-		fmt.Printf("  %s agent bead not found or already closed\n", style.Dim.Render("○"))
+	bd := beads.New(r.Path)
+	if err := bd.ResetAgentBeadForReuse(agentBeadID, "nuked"); err != nil {
+		// Bead may not exist (first spawn failed, or test environment)
+		fmt.Printf("  %s agent bead not found or already cleaned\n", style.Dim.Render("○"))
 	} else {
 		fmt.Printf("  %s closed agent bead %s\n", style.Success.Render("✓"), agentBeadID)
 	}
 
 	return nil
+}
+
+// nukeCleanupMolecules burns any molecule attached to a work bead during polecat nuke.
+// This prevents stale attached_molecule references from blocking re-dispatch (gt-npzy).
+// Best-effort: failures are logged but don't abort the nuke.
+func nukeCleanupMolecules(workBeadID string, r *rig.Rig) {
+	// Use mayor/rig as workDir so ResolveBeadsDir finds the Dolt-backed
+	// .beads/ directory, not the gitignored rig-root .beads/. Without this,
+	// detach/close operations route to the wrong database and the stale
+	// molecule attachment persists on the work bead. (gt--1up)
+	bd := beads.New(filepath.Join(r.Path, "mayor", "rig"))
+
+	// Fetch the work bead to check for attached molecules
+	issue, err := bd.Show(workBeadID)
+	if err != nil {
+		fmt.Printf("  %s molecule cleanup: could not fetch work bead %s: %v\n",
+			style.Dim.Render("○"), workBeadID, err)
+		return
+	}
+
+	attachment := beads.ParseAttachmentFields(issue)
+	if attachment == nil || attachment.AttachedMolecule == "" {
+		return // No molecule attached — nothing to clean up
+	}
+
+	moleculeID := attachment.AttachedMolecule
+
+	// Force-close descendant steps before detaching (prevents orphaned step beads).
+	// Uses force variant since nuke is destructive — must succeed even for beads in
+	// invalid states.
+	forceCloseDescendants(bd, moleculeID)
+
+	// Detach the molecule with audit trail
+	if _, detachErr := bd.DetachMoleculeWithAudit(workBeadID, beads.DetachOptions{
+		Operation: "burn",
+		Reason:    "polecat nuked: cleaning stale molecule",
+	}); detachErr != nil {
+		fmt.Printf("  %s molecule detach failed for %s: %v\n",
+			style.Warning.Render("⚠"), moleculeID, detachErr)
+		return
+	}
+
+	// Force-close the orphaned wisp root so it doesn't linger
+	if closeErr := bd.ForceCloseWithReason("burned: polecat nuked", moleculeID); closeErr != nil {
+		fmt.Printf("  %s molecule root close failed for %s: %v\n",
+			style.Warning.Render("⚠"), moleculeID, closeErr)
+	} else {
+		fmt.Printf("  %s burned stale molecule %s from work bead %s\n",
+			style.Success.Render("✓"), moleculeID, workBeadID)
+	}
 }
 
 // cleanupOrphanedProcesses kills Claude processes that survived session termination.

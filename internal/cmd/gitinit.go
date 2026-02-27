@@ -13,8 +13,8 @@ import (
 )
 
 var (
-	gitInitGitHub  string
-	gitInitPublic  bool
+	gitInitGitHub string
+	gitInitPublic bool
 )
 
 var gitInitCmd = &cobra.Command{
@@ -61,18 +61,44 @@ const HQGitignore = `# Gas Town HQ .gitignore
 # =============================================================================
 **/state.json
 **/*.lock
+**/*.flock
+**/locks/
 **/registry.json
 **/*.pid
 **/heartbeat.json
 **/activity.json
 .events.jsonl
 .feed.jsonl
+**/audit.log
+**/last-touched
+**/.local_version
+**/.gt-types-configured
+**/feed-*.json
 
 # =============================================================================
 # Runtime state directories
 # =============================================================================
 daemon/
 logs/
+
+# =============================================================================
+# Centralized Dolt SQL server data directory
+# =============================================================================
+.dolt-data/
+
+# Dolt internal directories at any level (rig databases, nested .beads dolt)
+**/.dolt/
+**/.doltcfg/
+
+# =============================================================================
+# Event stream storage
+# =============================================================================
+events/
+
+# =============================================================================
+# HQ beads directory
+# =============================================================================
+beads_hq/
 
 # =============================================================================
 # Rig git worktrees (recreate with 'gt sling' or 'gt rig add')
@@ -118,7 +144,7 @@ logs/
 # Explicitly track (override above patterns)
 # =============================================================================
 # Note: .beads/ has its own .gitignore that handles database files
-# and keeps issues.jsonl, metadata.json, config file as source of truth
+# and keeps metadata.json, config file as source of truth
 `
 
 func runGitInit(cmd *cobra.Command, args []string) error {

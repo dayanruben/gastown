@@ -151,14 +151,16 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 
 	roleConfig, err := m.roleConfig()
 	if err != nil {
-		return err
+		// Non-fatal: role config is optional. Log and continue with defaults.
+		log.Printf("warning: could not load witness role config for %s: %v", m.rig.Name, err)
+		roleConfig = nil
 	}
 
 	// Build startup command first
 	// NOTE: No gt prime injection needed - SessionStart hook handles it automatically
 	// Export GT_ROLE and BD_ACTOR in the command since tmux SetEnvironment only affects new panes
 	// Pass m.rig.Path so rig agent settings are honored (not town-level defaults)
-	command, err := buildWitnessStartCommand(m.rig.Path, m.rig.Name, townRoot, agentOverride, roleConfig)
+	command, err := buildWitnessStartCommand(m.rig.Path, m.rig.Name, townRoot, sessionID, agentOverride, roleConfig)
 	if err != nil {
 		return err
 	}
@@ -175,7 +177,9 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		Role:     "witness",
 		Rig:      m.rig.Name,
 		TownRoot: townRoot,
+		Agent:    agentOverride,
 	})
+	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 	for k, v := range envVars {
 		_ = t.SetEnvironment(sessionID, k, v)
 	}
@@ -201,9 +205,9 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		return fmt.Errorf("waiting for witness to start: %w", err)
 	}
 
-	// Accept bypass permissions warning dialog if it appears.
-	if err := t.AcceptBypassPermissionsWarning(sessionID); err != nil {
-		log.Printf("warning: accepting bypass permissions for %s: %v", sessionID, err)
+	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
+	if err := t.AcceptStartupDialogs(sessionID); err != nil {
+		log.Printf("warning: accepting startup dialogs for %s: %v", sessionID, err)
 	}
 
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
@@ -241,24 +245,31 @@ func roleConfigEnvVars(roleConfig *beads.RoleConfig, townRoot, rigName string) m
 	}
 	expanded := make(map[string]string, len(roleConfig.EnvVars))
 	for key, value := range roleConfig.EnvVars {
-		expanded[key] = beads.ExpandRolePattern(value, townRoot, rigName, "", "witness")
+		expanded[key] = beads.ExpandRolePattern(value, townRoot, rigName, "", "witness", session.PrefixFor(rigName))
 	}
 	return expanded
 }
 
-func buildWitnessStartCommand(rigPath, rigName, townRoot, agentOverride string, roleConfig *beads.RoleConfig) (string, error) {
+func buildWitnessStartCommand(rigPath, rigName, townRoot, sessionName, agentOverride string, roleConfig *beads.RoleConfig) (string, error) {
 	if agentOverride != "" {
 		roleConfig = nil
 	}
 	if roleConfig != nil && roleConfig.StartCommand != "" {
-		return beads.ExpandRolePattern(roleConfig.StartCommand, townRoot, rigName, "", "witness"), nil
+		return beads.ExpandRolePattern(roleConfig.StartCommand, townRoot, rigName, "", "witness", session.PrefixFor(rigName)), nil
 	}
 	initialPrompt := session.BuildStartupPrompt(session.BeaconConfig{
 		Recipient: session.BeaconRecipient("witness", "", rigName),
 		Sender:    "deacon",
 		Topic:     "patrol",
 	}, "Run `gt prime --hook` and begin patrol.")
-	command, err := config.BuildAgentStartupCommandWithAgentOverride("witness", rigName, townRoot, rigPath, initialPrompt, agentOverride)
+	command, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
+		Role:        "witness",
+		Rig:         rigName,
+		TownRoot:    townRoot,
+		Prompt:      initialPrompt,
+		Topic:       "patrol",
+		SessionName: sessionName,
+	}, rigPath, initialPrompt, agentOverride)
 	if err != nil {
 		return "", fmt.Errorf("building startup command: %w", err)
 	}

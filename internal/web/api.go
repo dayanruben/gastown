@@ -18,7 +18,6 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 )
 
-
 // CommandRequest is the JSON request body for /api/run.
 type CommandRequest struct {
 	// Command is the gt command to run (without the "gt" prefix).
@@ -26,6 +25,8 @@ type CommandRequest struct {
 	Command string `json:"command"`
 	// Timeout in seconds (optional; see WebTimeoutsConfig for defaults)
 	Timeout int `json:"timeout,omitempty"`
+	// Confirmed must be true for commands that require confirmation.
+	Confirmed bool `json:"confirmed,omitempty"`
 }
 
 // CommandResponse is the JSON response from /api/run.
@@ -57,6 +58,8 @@ type APIHandler struct {
 	optionsCacheMu   sync.RWMutex
 	// cmdSem limits concurrent command executions to prevent resource exhaustion.
 	cmdSem chan struct{}
+	// csrfToken is validated on POST requests to prevent cross-site request forgery.
+	csrfToken string
 }
 
 const optionsCacheTTL = 30 * time.Second
@@ -65,8 +68,11 @@ const optionsCacheTTL = 30 * time.Second
 // handleOptions alone spawns 7; allow headroom for other concurrent handlers.
 const maxConcurrentCommands = 12
 
-// NewAPIHandler creates a new API handler with the given run timeouts.
-func NewAPIHandler(defaultRunTimeout, maxRunTimeout time.Duration) *APIHandler {
+// NewAPIHandler creates a new API handler with the given run timeouts and CSRF token.
+func NewAPIHandler(defaultRunTimeout, maxRunTimeout time.Duration, csrfToken string) *APIHandler {
+	if csrfToken == "" {
+		log.Printf("WARNING: APIHandler created with empty CSRF token — POST requests will not be protected")
+	}
 	// Use PATH lookup for gt binary. Do NOT use os.Executable() here - during
 	// tests it returns the test binary, causing fork bombs when executed.
 	workDir, _ := os.Getwd()
@@ -76,19 +82,26 @@ func NewAPIHandler(defaultRunTimeout, maxRunTimeout time.Duration) *APIHandler {
 		defaultRunTimeout: defaultRunTimeout,
 		maxRunTimeout:     maxRunTimeout,
 		cmdSem:            make(chan struct{}, maxConcurrentCommands),
+		csrfToken:         csrfToken,
 	}
 }
 
 // ServeHTTP routes API requests to the appropriate handler.
 func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers for dashboard
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	// No CORS headers — the dashboard is served from the same origin.
+	// Omitting Access-Control-Allow-Origin prevents cross-origin requests.
 
 	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+
+	// Validate CSRF token on all POST requests.
+	if r.Method == http.MethodPost && h.csrfToken != "" {
+		if r.Header.Get("X-Dashboard-Token") != h.csrfToken {
+			h.sendError(w, "Invalid or missing dashboard token", http.StatusForbidden)
+			return
+		}
 	}
 
 	path := strings.TrimPrefix(r.URL.Path, "/api")
@@ -142,6 +155,12 @@ func (h *APIHandler) handleRun(w http.ResponseWriter, r *http.Request) {
 	meta, err := ValidateCommand(req.Command)
 	if err != nil {
 		h.sendError(w, fmt.Sprintf("Command blocked: %v", err), http.StatusForbidden)
+		return
+	}
+
+	// Enforce server-side confirmation for dangerous commands
+	if meta.Confirm && !req.Confirmed {
+		h.sendError(w, "This command requires confirmation (set confirmed: true)", http.StatusForbidden)
 		return
 	}
 
@@ -1574,10 +1593,10 @@ func parsePRShowOutput(jsonStr string) PRShowResponse {
 	}
 
 	var data struct {
-		Number       int    `json:"number"`
-		Title        string `json:"title"`
-		State        string `json:"state"`
-		Author       struct {
+		Number int    `json:"number"`
+		Title  string `json:"title"`
+		State  string `json:"state"`
+		Author struct {
 			Login string `json:"login"`
 		} `json:"author"`
 		URL          string `json:"url"`
@@ -1643,18 +1662,18 @@ func parsePRShowOutput(jsonStr string) PRShowResponse {
 type CrewMember struct {
 	Name       string `json:"name"`
 	Rig        string `json:"rig"`
-	State      string `json:"state"`       // spinning, finished, ready, questions
+	State      string `json:"state"` // spinning, finished, ready, questions
 	Hook       string `json:"hook,omitempty"`
 	HookTitle  string `json:"hook_title,omitempty"`
-	Session    string `json:"session"`     // attached, detached, none
+	Session    string `json:"session"` // attached, detached, none
 	LastActive string `json:"last_active"`
 }
 
 // CrewResponse is the response for /api/crew.
 type CrewResponse struct {
-	Crew    []CrewMember `json:"crew"`
-	ByRig   map[string][]CrewMember `json:"by_rig"`
-	Total   int          `json:"total"`
+	Crew  []CrewMember            `json:"crew"`
+	ByRig map[string][]CrewMember `json:"by_rig"`
+	Total int                     `json:"total"`
 }
 
 // ReadyItem represents a ready work item.
@@ -1668,9 +1687,9 @@ type ReadyItem struct {
 
 // ReadyResponse is the response for /api/ready.
 type ReadyResponse struct {
-	Items   []ReadyItem         `json:"items"`
+	Items    []ReadyItem            `json:"items"`
 	BySource map[string][]ReadyItem `json:"by_source"`
-	Summary struct {
+	Summary  struct {
 		Total   int `json:"total"`
 		P1Count int `json:"p1_count"`
 		P2Count int `json:"p2_count"`
@@ -1685,7 +1704,7 @@ func (h *APIHandler) handleCrew(w http.ResponseWriter, r *http.Request) {
 
 	// Run gt crew list --all --json to get crew across all rigs
 	output, err := h.runGtCommand(ctx, 10*time.Second, []string{"crew", "list", "--all", "--json"})
-	
+
 	resp := CrewResponse{
 		Crew:  make([]CrewMember, 0),
 		ByRig: make(map[string][]CrewMember),
@@ -1705,7 +1724,7 @@ func (h *APIHandler) handleCrew(w http.ResponseWriter, r *http.Request) {
 		Session string `json:"session,omitempty"`
 		Hook    string `json:"hook,omitempty"`
 	}
-	
+
 	if err := json.Unmarshal([]byte(output), &crewData); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -1807,9 +1826,9 @@ func (h *APIHandler) isClaudeRunningInSession(ctx context.Context, sessionName s
 	}
 	// Check for common agent commands
 	return strings.Contains(output, "claude") ||
-	       strings.Contains(output, "node") ||
-	       strings.Contains(output, "codex") ||
-	       strings.Contains(output, "opencode")
+		strings.Contains(output, "node") ||
+		strings.Contains(output, "codex") ||
+		strings.Contains(output, "opencode")
 }
 
 // hasQuestionInPane checks the last output for question indicators.
@@ -1880,7 +1899,7 @@ func (h *APIHandler) handleReady(w http.ResponseWriter, r *http.Request) {
 
 	// Run gt ready --json to get ready work
 	output, err := h.runGtCommand(ctx, 12*time.Second, []string{"ready", "--json"})
-	
+
 	resp := ReadyResponse{
 		Items:    make([]ReadyItem, 0),
 		BySource: make(map[string][]ReadyItem),
@@ -1962,9 +1981,10 @@ func (h *APIHandler) handleSessionPreview(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Validate session name: must start with "gt-" and contain only safe characters
-	if !strings.HasPrefix(sessionName, "gt-") {
-		h.sendError(w, "Invalid session name: must start with gt-", http.StatusBadRequest)
+	// Validate session name: must start with a known prefix and contain only safe characters
+	hasValidPrefix := session.HasKnownPrefix(sessionName)
+	if !hasValidPrefix {
+		h.sendError(w, "Invalid session name: must start with a known rig prefix", http.StatusBadRequest)
 		return
 	}
 	for _, c := range sessionName {
@@ -2051,7 +2071,6 @@ func (h *APIHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	ctx := r.Context()

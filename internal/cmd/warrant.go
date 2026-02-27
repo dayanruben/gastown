@@ -26,12 +26,12 @@ var (
 
 // Warrant represents a death warrant for an agent
 type Warrant struct {
-	ID        string    `json:"id"`
-	Target    string    `json:"target"`    // e.g., "gastown/polecats/alpha", "deacon/dogs/bravo"
-	Reason    string    `json:"reason"`
-	FiledBy   string    `json:"filed_by"`
-	FiledAt   time.Time `json:"filed_at"`
-	Executed  bool      `json:"executed,omitempty"`
+	ID         string     `json:"id"`
+	Target     string     `json:"target"` // e.g., "gastown/polecats/alpha", "deacon/dogs/bravo"
+	Reason     string     `json:"reason"`
+	FiledBy    string     `json:"filed_by"`
+	FiledAt    time.Time  `json:"filed_at"`
+	Executed   bool       `json:"executed,omitempty"`
 	ExecutedAt *time.Time `json:"executed_at,omitempty"`
 }
 
@@ -373,19 +373,29 @@ func executeOneWarrant(w *Warrant, warrantPath string, tm *tmux.Tmux) error {
 func targetToSessionName(target string) (string, error) {
 	parts := strings.Split(target, "/")
 
-	// Handle different target formats
 	switch {
 	case len(parts) == 3 && parts[1] == "polecats":
 		// gastown/polecats/alpha -> {prefix}-alpha
 		return session.PolecatSessionName(session.PrefixFor(parts[0]), parts[2]), nil
+	case len(parts) == 3 && parts[1] == "crew":
+		// gastown/crew/bob -> {prefix}-crew-bob
+		return session.CrewSessionName(session.PrefixFor(parts[0]), parts[2]), nil
+	case len(parts) == 2 && parts[1] == "witness":
+		// gastown/witness -> {prefix}-witness
+		return session.WitnessSessionName(session.PrefixFor(parts[0])), nil
+	case len(parts) == 2 && parts[1] == "refinery":
+		// gastown/refinery -> {prefix}-refinery
+		return session.RefinerySessionName(session.PrefixFor(parts[0])), nil
 	case len(parts) == 2 && parts[0] == "deacon" && parts[1] == "dogs":
-		// This shouldn't happen - need dog name
 		return "", fmt.Errorf("invalid target: need dog name (e.g., deacon/dogs/alpha)")
 	case len(parts) == 3 && parts[0] == "deacon" && parts[1] == "dogs":
 		// deacon/dogs/alpha -> hq-dog-alpha
 		return fmt.Sprintf("hq-dog-%s", parts[2]), nil
 	default:
-		// Fallback: just use the target with dashes
-		return "gt-" + strings.ReplaceAll(target, "/", "-"), nil
+		prefix := session.DefaultPrefix
+		if len(parts) > 0 {
+			prefix = session.PrefixFor(parts[0])
+		}
+		return prefix + "-" + strings.ReplaceAll(target, "/", "-"), nil
 	}
 }

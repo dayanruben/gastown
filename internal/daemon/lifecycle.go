@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -307,19 +308,13 @@ func (d *Daemon) getRoleConfigForIdentity(identity string) (*beads.RoleConfig, *
 }
 
 // identityToSession converts a beads identity to a tmux session name.
-// Uses role config if available, falls back to hardcoded patterns.
+// Always uses session.*SessionName() functions for consistency with gt up and daemon heartbeat.
 func (d *Daemon) identityToSession(identity string) string {
-	config, parsed, err := d.getRoleConfigForIdentity(identity)
+	parsed, err := parseIdentity(identity)
 	if err != nil {
 		return ""
 	}
 
-	// If role config has session_pattern, use it
-	if config != nil && config.SessionPattern != "" {
-		return beads.ExpandRolePattern(config.SessionPattern, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType)
-	}
-
-	// Fallback: use default patterns based on role type
 	switch parsed.RoleType {
 	case "mayor":
 		return session.MayorSessionName()
@@ -371,30 +366,33 @@ func (d *Daemon) restartSession(sessionName, identity string) error {
 		d.syncWorkspace(workDir)
 	}
 
-	// Create session
-	// Use EnsureSessionFresh to handle zombie sessions that exist but have dead Claude
-	if err := d.tmux.EnsureSessionFresh(sessionName, workDir); err != nil {
+	// Build startup command BEFORE creating the session so we can use
+	// NewSessionWithCommand (command as initial pane process). This eliminates
+	// the race condition in the old EnsureSessionFresh + SendKeys pattern where
+	// the shell might not be ready to receive keystrokes, producing empty windows.
+	startCmd := d.getStartCommand(config, parsed)
+
+	// Create session with command as initial process (replaces EnsureSessionFresh + SendKeys).
+	// EnsureSessionFreshWithCommand kills zombie sessions and creates a new one atomically.
+	if err := d.tmux.EnsureSessionFreshWithCommand(sessionName, workDir, startCmd); err != nil {
+		if errors.Is(err, tmux.ErrSessionRunning) {
+			d.logger.Printf("Session %s already running with healthy agent, skipping restart", sessionName)
+			return nil
+		}
 		return fmt.Errorf("creating session: %w", err)
 	}
 
-	// Set environment variables
+	// Set environment variables in tmux session table (for debugging/monitoring tools).
 	d.setSessionEnvironment(sessionName, config, parsed)
 
 	// Apply theme (non-fatal: theming failure doesn't affect operation)
 	d.applySessionTheme(sessionName, parsed)
 
-	// Get and send startup command
-	startCmd := d.getStartCommand(config, parsed)
-	if err := d.tmux.SendKeys(sessionName, startCmd); err != nil {
-		return fmt.Errorf("sending startup command: %w", err)
-	}
-
-	// Wait for Claude to start, then accept bypass permissions warning if it appears.
-	// This ensures automated role starts aren't blocked by the warning dialog.
+	// Wait for Claude to start, then accept startup dialogs if they appear.
 	if err := d.tmux.WaitForCommand(sessionName, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
 		// Non-fatal - Claude might still start
 	}
-	_ = d.tmux.AcceptBypassPermissionsWarning(sessionName)
+	_ = d.tmux.AcceptStartupDialogs(sessionName)
 	time.Sleep(constants.ShutdownNotifyDelay)
 
 	return nil
@@ -405,7 +403,7 @@ func (d *Daemon) restartSession(sessionName, identity string) error {
 func (d *Daemon) getWorkDir(config *beads.RoleConfig, parsed *ParsedIdentity) string {
 	// If role config has work_dir_pattern, use it
 	if config != nil && config.WorkDirPattern != "" {
-		return beads.ExpandRolePattern(config.WorkDirPattern, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType)
+		return beads.ExpandRolePattern(config.WorkDirPattern, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType, session.PrefixFor(parsed.RigName))
 	}
 
 	// Fallback: use default patterns based on role type
@@ -443,7 +441,7 @@ func (d *Daemon) getNeedsPreSync(config *beads.RoleConfig, parsed *ParsedIdentit
 
 	// Fallback: roles with persistent git clones need pre-sync
 	switch parsed.RoleType {
-	case "refinery", "crew", "polecat":
+	case "refinery", "crew":
 		return true
 	default:
 		return false
@@ -457,7 +455,7 @@ func (d *Daemon) getStartCommand(roleConfig *beads.RoleConfig, parsed *ParsedIde
 	// If role config is available, use it
 	if roleConfig != nil && roleConfig.StartCommand != "" {
 		// Expand any patterns in the command
-		return beads.ExpandRolePattern(roleConfig.StartCommand, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType)
+		return beads.ExpandRolePattern(roleConfig.StartCommand, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType, session.PrefixFor(parsed.RigName))
 	}
 
 	rigPath := ""
@@ -541,7 +539,7 @@ func (d *Daemon) setSessionEnvironment(sessionName string, roleConfig *beads.Rol
 	// Set any custom env vars from role config
 	if roleConfig != nil {
 		for k, v := range roleConfig.EnvVars {
-			expanded := beads.ExpandRolePattern(v, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType)
+			expanded := beads.ExpandRolePattern(v, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType, session.PrefixFor(parsed.RigName))
 			_ = d.tmux.SetEnvironment(sessionName, k, expanded)
 		}
 	}
@@ -723,8 +721,8 @@ func (d *Daemon) closeMessage(id string) error {
 type AgentBeadInfo struct {
 	ID         string `json:"id"`
 	Type       string `json:"issue_type"`
-	State      string // Parsed from description: agent_state
-	HookBead   string // Parsed from description: hook_bead
+	State      string // From DB column (agent_state), fallback to description
+	HookBead   string // From DB column (hook_bead)
 	RoleType   string // Parsed from description: role_type
 	Rig        string // Parsed from description: rig
 	LastUpdate string `json:"updated_at"`
@@ -787,7 +785,7 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 	}
 
 	// Parse agent fields from description for role/state info
-	fields := beads.ParseAgentFieldsFromDescription(issue.Description)
+	fields := beads.ParseAgentFields(issue.Description)
 
 	info := &AgentBeadInfo{
 		ID:         issue.ID,
@@ -796,9 +794,18 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 	}
 
 	if fields != nil {
-		info.State = fields.AgentState
 		info.RoleType = fields.RoleType
 		info.Rig = fields.Rig
+	}
+
+	// Use AgentState from database column directly (not from description).
+	// UpdateAgentState updates the DB column but not the description text,
+	// so the description can contain stale state (e.g., "spawning" after
+	// the polecat has transitioned to "working"). Fall back to description
+	// only if the DB column is empty (legacy beads).
+	info.State = issue.AgentState
+	if info.State == "" && fields != nil {
+		info.State = fields.AgentState
 	}
 
 	// Use HookBead from database column directly (not from description)
@@ -899,6 +906,85 @@ func identityToBDActor(identity string) string {
 // Principle) violation. GUPP states: if you have work on your hook, you run it.
 const GUPPViolationTimeout = 30 * time.Minute
 
+// listAgentBeadsJSON queries both the issues and wisps tables for agent beads
+// and unmarshals the combined results into the provided slice pointer.
+// The wisps query is best-effort (gracefully ignored if table doesn't exist).
+func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
+	// Query issues table (backward compat during migration)
+	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--json") //nolint:gosec // G204: bd is a trusted internal tool
+	cmd.Dir = d.config.TownRoot
+	cmd.Env = os.Environ()
+
+	issuesOutput, issuesErr := cmd.Output()
+
+	// Query wisps table (primary source after agent bead migration)
+	wispCmd := exec.Command(d.bdPath, "mol", "wisp", "list", "--json") //nolint:gosec // G204: bd is a trusted internal tool
+	wispCmd.Dir = d.config.TownRoot
+	wispCmd.Env = os.Environ()
+
+	wispOutput, _ := wispCmd.Output() // Best-effort: wisps table may not exist
+
+	// Merge results: parse wisps first, then issues (wisps take precedence)
+	combined := mergeAgentBeadJSON(wispOutput, issuesOutput)
+	if combined == nil {
+		if issuesErr != nil {
+			return fmt.Errorf("bd list failed: %w", issuesErr)
+		}
+		return fmt.Errorf("no agent beads found")
+	}
+
+	return json.Unmarshal(combined, dest)
+}
+
+// mergeAgentBeadJSON merges JSON arrays from wisps and issues queries.
+// Returns a combined JSON array with wisps taking precedence for duplicate IDs.
+// Filters wisps to only include agent beads (type=agent or label gt:agent).
+func mergeAgentBeadJSON(wispJSON, issuesJSON []byte) []byte {
+	type agentEntry struct {
+		ID     string   `json:"id"`
+		Type   string   `json:"issue_type"`
+		Labels []string `json:"labels"`
+	}
+
+	// Track IDs from wisps to avoid duplicates
+	seenIDs := make(map[string]bool)
+	var result []json.RawMessage
+
+	// Parse wisps first (primary source)
+	if len(wispJSON) > 0 {
+		var wispEntries []json.RawMessage
+		if json.Unmarshal(wispJSON, &wispEntries) == nil {
+			for _, raw := range wispEntries {
+				var entry agentEntry
+				if json.Unmarshal(raw, &entry) == nil && beads.IsAgentBead(&beads.Issue{Type: entry.Type, Labels: entry.Labels}) {
+					seenIDs[entry.ID] = true
+					result = append(result, raw)
+				}
+			}
+		}
+	}
+
+	// Then issues (backward compat, skip duplicates)
+	if len(issuesJSON) > 0 {
+		var issueEntries []json.RawMessage
+		if json.Unmarshal(issuesJSON, &issueEntries) == nil {
+			for _, raw := range issueEntries {
+				var entry agentEntry
+				if json.Unmarshal(raw, &entry) == nil && !seenIDs[entry.ID] {
+					result = append(result, raw)
+				}
+			}
+		}
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+
+	combined, _ := json.Marshal(result)
+	return combined
+}
+
 // checkGUPPViolations looks for agents that have work-on-hook but aren't
 // progressing. This is a GUPP violation: agents with hooked work must execute.
 // The daemon detects these and notifies the relevant Witness for remediation.
@@ -912,27 +998,20 @@ func (d *Daemon) checkGUPPViolations() {
 
 // checkRigGUPPViolations checks polecats in a specific rig for GUPP violations.
 func (d *Daemon) checkRigGUPPViolations(rigName string) {
-	// List polecat agent beads for this rig
+	// List polecat agent beads for this rig (issues + wisps tables)
 	// Pattern: <prefix>-<rig>-polecat-<name> (e.g., gt-gastown-polecat-Toast)
-	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--json")
-	cmd.Dir = d.config.TownRoot
-	cmd.Env = os.Environ() // Inherit PATH to find bd executable
-
-	output, err := cmd.Output()
-	if err != nil {
-		d.logger.Printf("Warning: bd list failed for GUPP check: %v", err)
-		return
-	}
-
 	var agents []struct {
-		ID          string `json:"id"`
-		Description string `json:"description"`
-		UpdatedAt   string `json:"updated_at"`
-		HookBead    string `json:"hook_bead"` // Read from database column, not description
-		AgentState  string `json:"agent_state"`
+		ID          string   `json:"id"`
+		Description string   `json:"description"`
+		UpdatedAt   string   `json:"updated_at"`
+		HookBead    string   `json:"hook_bead"` // Read from database column, not description
+		AgentState  string   `json:"agent_state"`
+		Labels      []string `json:"labels"`
+		Type        string   `json:"issue_type"`
 	}
 
-	if err := json.Unmarshal(output, &agents); err != nil {
+	if err := d.listAgentBeadsJSON(&agents); err != nil {
+		d.logger.Printf("Warning: listing agent beads failed for GUPP check: %v", err)
 		return
 	}
 
@@ -1013,22 +1092,16 @@ func (d *Daemon) checkOrphanedWork() {
 
 // checkRigOrphanedWork checks polecats in a specific rig for orphaned work.
 func (d *Daemon) checkRigOrphanedWork(rigName string) {
-	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--json")
-	cmd.Dir = d.config.TownRoot
-	cmd.Env = os.Environ() // Inherit PATH to find bd executable
-
-	output, err := cmd.Output()
-	if err != nil {
-		d.logger.Printf("Warning: bd list failed for orphaned work check: %v", err)
-		return
-	}
-
+	// List polecat agent beads (issues + wisps tables)
 	var agents []struct {
-		ID       string `json:"id"`
-		HookBead string `json:"hook_bead"`
+		ID       string   `json:"id"`
+		HookBead string   `json:"hook_bead"`
+		Labels   []string `json:"labels"`
+		Type     string   `json:"issue_type"`
 	}
 
-	if err := json.Unmarshal(output, &agents); err != nil {
+	if err := d.listAgentBeadsJSON(&agents); err != nil {
+		d.logger.Printf("Warning: listing agent beads failed for orphaned work check: %v", err)
 		return
 	}
 

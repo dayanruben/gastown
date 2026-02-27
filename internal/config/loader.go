@@ -583,6 +583,103 @@ func AddRigToDaemonPatrols(townRoot string, rigName string) error {
 	return nil
 }
 
+// RemoveRigFromDaemonPatrols removes a rig from the witness and refinery patrol rigs arrays
+// in daemon.json. Uses raw JSON manipulation to preserve fields not in PatrolConfig
+// (e.g., dolt_server config). If daemon.json doesn't exist, this is a no-op.
+func RemoveRigFromDaemonPatrols(townRoot string, rigName string) error {
+	path := DaemonPatrolConfigPath(townRoot)
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path is constructed internally
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No daemon.json yet, nothing to update
+		}
+		return fmt.Errorf("reading daemon config: %w", err)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("parsing daemon config: %w", err)
+	}
+
+	patrolsRaw, ok := raw["patrols"]
+	if !ok {
+		return nil // No patrols section
+	}
+
+	var patrols map[string]json.RawMessage
+	if err := json.Unmarshal(patrolsRaw, &patrols); err != nil {
+		return fmt.Errorf("parsing patrols: %w", err)
+	}
+
+	modified := false
+	for _, patrolName := range []string{"witness", "refinery"} {
+		pRaw, ok := patrols[patrolName]
+		if !ok {
+			continue
+		}
+
+		var patrol map[string]json.RawMessage
+		if err := json.Unmarshal(pRaw, &patrol); err != nil {
+			continue
+		}
+
+		// Parse existing rigs array
+		var rigs []string
+		if rigsRaw, ok := patrol["rigs"]; ok {
+			if err := json.Unmarshal(rigsRaw, &rigs); err != nil {
+				rigs = nil
+			}
+		}
+
+		// Filter out the rig
+		var filtered []string
+		for _, r := range rigs {
+			if r != rigName {
+				filtered = append(filtered, r)
+			}
+		}
+
+		if len(filtered) == len(rigs) {
+			continue // Rig wasn't present
+		}
+
+		// Update with filtered list
+		rigsJSON, err := json.Marshal(filtered)
+		if err != nil {
+			return fmt.Errorf("encoding rigs: %w", err)
+		}
+		patrol["rigs"] = rigsJSON
+
+		patrolJSON, err := json.Marshal(patrol)
+		if err != nil {
+			return fmt.Errorf("encoding patrol %s: %w", patrolName, err)
+		}
+		patrols[patrolName] = patrolJSON
+		modified = true
+	}
+
+	if !modified {
+		return nil
+	}
+
+	patrolsJSON, err := json.Marshal(patrols)
+	if err != nil {
+		return fmt.Errorf("encoding patrols: %w", err)
+	}
+	raw["patrols"] = patrolsJSON
+
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encoding daemon config: %w", err)
+	}
+
+	if err := os.WriteFile(path, append(out, '\n'), 0644); err != nil { //nolint:gosec // G306: config file
+		return fmt.Errorf("writing daemon config: %w", err)
+	}
+
+	return nil
+}
+
 // LoadAccountsConfig loads and validates an accounts configuration file.
 func LoadAccountsConfig(path string) (*AccountsConfig, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // G304: path is constructed internally, not from user input
@@ -1268,6 +1365,16 @@ func resolveRoleAgentConfigCore(role, townRoot, rigPath string) *RuntimeConfig {
 		_ = LoadRigAgentRegistry(RigAgentRegistryPath(rigPath))
 	}
 
+	// Dogs default to Haiku (cheap infrastructure workers), but respect
+	// explicit non-Claude overrides (e.g., RoleAgents["dog"] = "opencode").
+	if role == "dog" {
+		if hasExplicitNonClaudeOverride(role, townSettings, rigSettings) {
+			// Fall through to normal resolution below
+		} else {
+			return claudeHaikuPreset()
+		}
+	}
+
 	// Check ephemeral cost tier (GT_COST_TIER env var)
 	tierRC, tierHandled := tryResolveFromEphemeralTier(role)
 	if tierHandled {
@@ -1771,6 +1878,11 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 	if rc.ResolvedAgent != "" {
 		resolvedEnv["GT_AGENT"] = rc.ResolvedAgent
 	}
+	// Set GT_PROCESS_NAMES for accurate liveness detection. Custom agents may
+	// shadow built-in preset names (e.g., custom "codex" running "opencode"),
+	// so we resolve process names from both agent name and actual command.
+	processNames := ResolveProcessNames(rc.ResolvedAgent, rc.Command)
+	resolvedEnv["GT_PROCESS_NAMES"] = strings.Join(processNames, ",")
 	// Merge agent-specific env vars (e.g., OPENCODE_PERMISSION for yolo mode)
 	for k, v := range rc.Env {
 		resolvedEnv[k] = v
@@ -1937,11 +2049,16 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	}
 	// Record agent name so IsAgentAlive can detect the running process.
 	// Explicit override takes priority; fall back to resolved agent name.
+	agentForProcess := rc.ResolvedAgent
 	if agentOverride != "" {
 		resolvedEnv["GT_AGENT"] = agentOverride
+		agentForProcess = agentOverride
 	} else if rc.ResolvedAgent != "" {
 		resolvedEnv["GT_AGENT"] = rc.ResolvedAgent
 	}
+	// Set GT_PROCESS_NAMES for accurate liveness detection of custom agents.
+	processNamesOverride := ResolveProcessNames(agentForProcess, rc.Command)
+	resolvedEnv["GT_PROCESS_NAMES"] = strings.Join(processNamesOverride, ",")
 	// Merge agent-specific env vars (e.g., OPENCODE_PERMISSION for yolo mode)
 	for k, v := range rc.Env {
 		resolvedEnv[k] = v
@@ -1974,6 +2091,15 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	return cmd, nil
 }
 
+// BuildStartupCommandFromConfig builds a startup command from a complete AgentEnvConfig.
+// Use this (instead of Build*StartupCommand helpers) when you need full OTEL context:
+// Issue (gt.issue), Topic (gt.topic), SessionName (gt.session), etc.
+// The rigPath, prompt, and agentOverride are passed through directly.
+func BuildStartupCommandFromConfig(cfg AgentEnvConfig, rigPath, prompt, agentOverride string) (string, error) {
+	envVars := AgentEnv(cfg)
+	return BuildStartupCommandWithAgentOverride(envVars, rigPath, prompt, agentOverride)
+}
+
 // BuildAgentStartupCommand is a convenience function for starting agent sessions.
 // It uses AgentEnv to set all standard environment variables.
 // For rig-level roles (witness, refinery), pass the rig name and rigPath.
@@ -1983,6 +2109,7 @@ func BuildAgentStartupCommand(role, rig, townRoot, rigPath, prompt string) strin
 		Role:     role,
 		Rig:      rig,
 		TownRoot: townRoot,
+		Prompt:   prompt,
 	})
 	return BuildStartupCommand(envVars, rigPath, prompt)
 }
@@ -1993,6 +2120,7 @@ func BuildAgentStartupCommandWithAgentOverride(role, rig, townRoot, rigPath, pro
 		Role:     role,
 		Rig:      rig,
 		TownRoot: townRoot,
+		Prompt:   prompt,
 	})
 	return BuildStartupCommandWithAgentOverride(envVars, rigPath, prompt, agentOverride)
 }
@@ -2009,6 +2137,7 @@ func BuildPolecatStartupCommand(rigName, polecatName, rigPath, prompt string) st
 		Rig:       rigName,
 		AgentName: polecatName,
 		TownRoot:  townRoot,
+		Prompt:    prompt,
 	})
 	return BuildStartupCommand(envVars, rigPath, prompt)
 }
@@ -2024,6 +2153,7 @@ func BuildPolecatStartupCommandWithAgentOverride(rigName, polecatName, rigPath, 
 		Rig:       rigName,
 		AgentName: polecatName,
 		TownRoot:  townRoot,
+		Prompt:    prompt,
 	})
 	return BuildStartupCommandWithAgentOverride(envVars, rigPath, prompt, agentOverride)
 }
@@ -2040,6 +2170,7 @@ func BuildCrewStartupCommand(rigName, crewName, rigPath, prompt string) string {
 		Rig:       rigName,
 		AgentName: crewName,
 		TownRoot:  townRoot,
+		Prompt:    prompt,
 	})
 	return BuildStartupCommand(envVars, rigPath, prompt)
 }
@@ -2055,6 +2186,7 @@ func BuildCrewStartupCommandWithAgentOverride(rigName, crewName, rigPath, prompt
 		Rig:       rigName,
 		AgentName: crewName,
 		TownRoot:  townRoot,
+		Prompt:    prompt,
 	})
 	return BuildStartupCommandWithAgentOverride(envVars, rigPath, prompt, agentOverride)
 }

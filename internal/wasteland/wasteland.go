@@ -11,6 +11,7 @@ package wasteland
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -19,6 +20,9 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrNotJoined indicates the rig has not joined a wasteland.
+var ErrNotJoined = errors.New("rig has not joined a wasteland")
 
 // Config holds the wasteland configuration for a rig.
 type Config struct {
@@ -51,7 +55,7 @@ func LoadConfig(townRoot string) (*Config, error) {
 	data, err := os.ReadFile(ConfigPath(townRoot))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("rig has not joined a wasteland (run 'gt wl join <upstream>')")
+			return nil, fmt.Errorf("%w (run 'gt wl join <upstream>')", ErrNotJoined)
 		}
 		return nil, fmt.Errorf("reading wasteland config: %w", err)
 	}
@@ -252,7 +256,141 @@ func LocalCloneDir(townRoot, upstreamOrg, upstreamDB string) string {
 	return filepath.Join(WastelandDir(townRoot), upstreamOrg, upstreamDB)
 }
 
-// escapeSQLString escapes single quotes in SQL strings.
+// escapeSQLString escapes backslashes and single quotes for SQL string literals.
 func escapeSQLString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
 	return strings.ReplaceAll(s, "'", "''")
+}
+
+// DoltHubAPI abstracts DoltHub REST API operations.
+type DoltHubAPI interface {
+	ForkRepo(fromOrg, fromDB, toOrg, token string) error
+}
+
+// DoltCLI abstracts dolt CLI subprocess operations.
+type DoltCLI interface {
+	Clone(org, db, targetDir string) error
+	RegisterRig(localDir, handle, dolthubOrg, displayName, ownerEmail, gtVersion string) error
+	Push(localDir string) error
+	AddUpstreamRemote(localDir, upstreamOrg, upstreamDB string) error
+}
+
+// ConfigStore abstracts wasteland config persistence.
+type ConfigStore interface {
+	Load(townRoot string) (*Config, error)
+	Save(townRoot string, cfg *Config) error
+}
+
+// Service coordinates wasteland operations with injectable dependencies.
+type Service struct {
+	API        DoltHubAPI
+	CLI        DoltCLI
+	Config     ConfigStore
+	OnProgress func(step string) // optional callback for progress reporting
+}
+
+// Join orchestrates the wasteland join workflow: fork -> clone -> add upstream -> register -> push -> save config.
+// Returns the saved Config on success, or the existing Config if already joined.
+func (s *Service) Join(upstream, forkOrg, token, handle, displayName, ownerEmail, gtVersion, townRoot string) (*Config, error) {
+	upstreamOrg, upstreamDB, err := ParseUpstream(upstream)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if already joined
+	if existing, err := s.Config.Load(townRoot); err == nil {
+		if existing.Upstream != upstream {
+			return nil, fmt.Errorf("already joined to %s; run gt wl leave first", existing.Upstream)
+		}
+		return existing, nil
+	} else if !errors.Is(err, ErrNotJoined) {
+		return nil, fmt.Errorf("loading wasteland config: %w", err)
+	}
+
+	localDir := LocalCloneDir(townRoot, upstreamOrg, upstreamDB)
+	progress := s.OnProgress
+	if progress == nil {
+		progress = func(string) {}
+	}
+
+	progress("Forking commons...")
+	if err := s.API.ForkRepo(upstreamOrg, upstreamDB, forkOrg, token); err != nil {
+		return nil, fmt.Errorf("forking commons: %w", err)
+	}
+
+	progress("Cloning fork locally...")
+	if err := s.CLI.Clone(forkOrg, upstreamDB, localDir); err != nil {
+		return nil, fmt.Errorf("cloning fork: %w", err)
+	}
+
+	progress("Adding upstream remote...")
+	if err := s.CLI.AddUpstreamRemote(localDir, upstreamOrg, upstreamDB); err != nil {
+		return nil, fmt.Errorf("adding upstream remote: %w", err)
+	}
+
+	progress("Registering rig...")
+	if err := s.CLI.RegisterRig(localDir, handle, forkOrg, displayName, ownerEmail, gtVersion); err != nil {
+		return nil, fmt.Errorf("registering rig: %w", err)
+	}
+
+	progress("Pushing to fork...")
+	if err := s.CLI.Push(localDir); err != nil {
+		return nil, fmt.Errorf("pushing to fork: %w", err)
+	}
+
+	cfg := &Config{
+		Upstream:  upstream,
+		ForkOrg:   forkOrg,
+		ForkDB:    upstreamDB,
+		LocalDir:  localDir,
+		RigHandle: handle,
+		JoinedAt:  time.Now(),
+	}
+	if err := s.Config.Save(townRoot, cfg); err != nil {
+		return nil, fmt.Errorf("saving wasteland config: %w", err)
+	}
+
+	return cfg, nil
+}
+
+// httpDoltHubAPI implements DoltHubAPI using the real DoltHub REST API.
+type httpDoltHubAPI struct{}
+
+func (h *httpDoltHubAPI) ForkRepo(fromOrg, fromDB, toOrg, token string) error {
+	return ForkDoltHubRepo(fromOrg, fromDB, toOrg, token)
+}
+
+// execDoltCLI implements DoltCLI using real dolt subprocess calls.
+type execDoltCLI struct{}
+
+func (e *execDoltCLI) Clone(org, db, targetDir string) error {
+	return CloneLocally(org, db, targetDir)
+}
+func (e *execDoltCLI) RegisterRig(localDir, handle, dolthubOrg, displayName, ownerEmail, gtVersion string) error {
+	return RegisterRig(localDir, handle, dolthubOrg, displayName, ownerEmail, gtVersion)
+}
+func (e *execDoltCLI) Push(localDir string) error {
+	return PushToOrigin(localDir)
+}
+func (e *execDoltCLI) AddUpstreamRemote(localDir, upstreamOrg, upstreamDB string) error {
+	return AddUpstreamRemote(localDir, upstreamOrg, upstreamDB)
+}
+
+// fileConfigStore implements ConfigStore using filesystem persistence.
+type fileConfigStore struct{}
+
+func (f *fileConfigStore) Load(townRoot string) (*Config, error) {
+	return LoadConfig(townRoot)
+}
+func (f *fileConfigStore) Save(townRoot string, cfg *Config) error {
+	return SaveConfig(townRoot, cfg)
+}
+
+// NewService creates a Service with real (production) dependencies.
+func NewService() *Service {
+	return &Service{
+		API:    &httpDoltHubAPI{},
+		CLI:    &execDoltCLI{},
+		Config: &fileConfigStore{},
+	}
 }

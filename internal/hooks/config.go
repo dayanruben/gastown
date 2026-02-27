@@ -6,6 +6,7 @@ package hooks
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,7 +21,7 @@ type HookEntry struct {
 
 // Hook represents an individual hook command.
 type Hook struct {
-	Type    string `json:"type"`    // "command"
+	Type    string `json:"type"` // "command"
 	Command string `json:"command"`
 }
 
@@ -32,6 +33,8 @@ type HooksConfig struct {
 	Stop             []HookEntry `json:"Stop,omitempty"`
 	PreCompact       []HookEntry `json:"PreCompact,omitempty"`
 	UserPromptSubmit []HookEntry `json:"UserPromptSubmit,omitempty"`
+	WorktreeCreate   []HookEntry `json:"WorktreeCreate,omitempty"`
+	WorktreeRemove   []HookEntry `json:"WorktreeRemove,omitempty"`
 }
 
 // SettingsJSON represents the full Claude Code settings.json structure.
@@ -42,6 +45,28 @@ type SettingsJSON struct {
 	Hooks          HooksConfig     `json:"-"`
 	// Extra holds all raw fields for roundtrip preservation.
 	Extra map[string]json.RawMessage `json:"-"`
+}
+
+// SettingsIntegrityError indicates a malformed settings.json that should be
+// treated as a fail-closed integrity violation by callers.
+type SettingsIntegrityError struct {
+	Path string
+	Err  error
+}
+
+func (e *SettingsIntegrityError) Error() string {
+	return fmt.Sprintf("settings integrity violation at %s: %v", e.Path, e.Err)
+}
+
+func (e *SettingsIntegrityError) Unwrap() error {
+	return e.Err
+}
+
+// IsSettingsIntegrityError reports whether an error chain contains a
+// SettingsIntegrityError.
+func IsSettingsIntegrityError(err error) bool {
+	var integrityErr *SettingsIntegrityError
+	return errors.As(err, &integrityErr)
 }
 
 // UnmarshalSettings parses a settings.json file, preserving all fields.
@@ -118,7 +143,14 @@ func LoadSettings(path string) (*SettingsJSON, error) {
 		}
 		return nil, err
 	}
-	return UnmarshalSettings(data)
+	settings, err := UnmarshalSettings(data)
+	if err != nil {
+		return nil, &SettingsIntegrityError{
+			Path: path,
+			Err:  err,
+		}
+	}
+	return settings, nil
 }
 
 // HooksEqual returns true if two HooksConfigs are structurally equal.
@@ -191,12 +223,121 @@ func DefaultOverrides() map[string]*HooksConfig {
 				},
 			},
 		},
+		// Witness roles: patrol-formula-guard (gt-e47hxn).
+		// Blocks patrol formulas from using persistent molecules — must use wisps.
+		// Without this, witnesses could accidentally create permanent patrol molecules
+		// that survive session restarts and accumulate unbounded.
+		"witness": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "Bash(*bd mol pour*patrol*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-witness*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-deacon*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-refinery*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+			},
+		},
+		// Deacon roles: patrol-formula-guard (same as witness).
+		// Deacons also run patrols and must use wisps, not persistent molecules.
+		"deacon": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "Bash(*bd mol pour*patrol*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-witness*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-deacon*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-refinery*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+			},
+		},
+		// Refinery roles: patrol-formula-guard (same as witness).
+		// Refineries also run patrols and must use wisps, not persistent molecules.
+		"refinery": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "Bash(*bd mol pour*patrol*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-witness*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-deacon*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-refinery*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+			},
+		},
 	}
 }
 
 // ComputeExpected computes the expected HooksConfig for a target by loading
 // the base config and applying all applicable overrides in order of specificity.
 // If no base config exists, uses DefaultBase().
+//
+// When an on-disk base exists, DefaultBase() is merged underneath it so that
+// new hook types (e.g., SessionStart added after the base was created) are
+// automatically backfilled. User customizations in the on-disk base take
+// precedence. Hook types absent from the on-disk base inherit from DefaultBase.
 //
 // For each override key, built-in defaults (from DefaultOverrides)
 // are merged first, then on-disk overrides layer on top. On-disk overrides can
@@ -209,6 +350,11 @@ func ComputeExpected(target string) (*HooksConfig, error) {
 		} else {
 			return nil, fmt.Errorf("loading base config: %w", err)
 		}
+	} else {
+		// Backfill: merge DefaultBase as floor, then on-disk base on top.
+		// This ensures new hook types added to DefaultBase are always present,
+		// while preserving user customizations from the on-disk base.
+		base = Merge(DefaultBase(), base)
 	}
 
 	defaults := DefaultOverrides()
@@ -334,7 +480,7 @@ func isRig(path string) bool {
 }
 
 // EventTypes returns the known hook event type names in display order.
-var EventTypes = []string{"PreToolUse", "PostToolUse", "SessionStart", "Stop", "PreCompact", "UserPromptSubmit"}
+var EventTypes = []string{"PreToolUse", "PostToolUse", "SessionStart", "Stop", "PreCompact", "UserPromptSubmit", "WorktreeCreate", "WorktreeRemove"}
 
 // GetEntries returns the hook entries for a given event type.
 func (c *HooksConfig) GetEntries(eventType string) []HookEntry {
@@ -351,6 +497,10 @@ func (c *HooksConfig) GetEntries(eventType string) []HookEntry {
 		return c.PreCompact
 	case "UserPromptSubmit":
 		return c.UserPromptSubmit
+	case "WorktreeCreate":
+		return c.WorktreeCreate
+	case "WorktreeRemove":
+		return c.WorktreeRemove
 	default:
 		return nil
 	}
@@ -371,6 +521,10 @@ func (c *HooksConfig) SetEntries(eventType string, entries []HookEntry) {
 		c.PreCompact = entries
 	case "UserPromptSubmit":
 		c.UserPromptSubmit = entries
+	case "WorktreeCreate":
+		c.WorktreeCreate = entries
+	case "WorktreeRemove":
+		c.WorktreeRemove = entries
 	}
 }
 
@@ -525,6 +679,27 @@ func DefaultBase() *HooksConfig {
 					Command: fmt.Sprintf("%s && gt tap guard pr-workflow", pathSetup),
 				}},
 			},
+			{
+				Matcher: "Bash(rm -rf /*)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: fmt.Sprintf("%s && gt tap guard dangerous-command", pathSetup),
+				}},
+			},
+			{
+				Matcher: "Bash(git push --force*)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: fmt.Sprintf("%s && gt tap guard dangerous-command", pathSetup),
+				}},
+			},
+			{
+				Matcher: "Bash(git push -f*)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: fmt.Sprintf("%s && gt tap guard dangerous-command", pathSetup),
+				}},
+			},
 		},
 		SessionStart: []HookEntry{
 			{
@@ -602,8 +777,24 @@ func loadConfig(path string) (*HooksConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
+	if err := validateUniqueMatchers(&cfg); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
 
 	return &cfg, nil
+}
+
+func validateUniqueMatchers(cfg *HooksConfig) error {
+	for _, eventType := range EventTypes {
+		seen := make(map[string]struct{})
+		for _, entry := range cfg.GetEntries(eventType) {
+			if _, exists := seen[entry.Matcher]; exists {
+				return fmt.Errorf("duplicate matcher %q in %s", entry.Matcher, eventType)
+			}
+			seen[entry.Matcher] = struct{}{}
+		}
+	}
+	return nil
 }
 
 // saveConfig writes a HooksConfig to a JSON file, creating directories as needed.

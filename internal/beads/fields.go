@@ -9,16 +9,11 @@ import (
 
 // Note: AgentFields, ParseAgentFields, FormatAgentDescription, and CreateAgentBead are in beads.go
 
-// ParseAgentFieldsFromDescription is an alias for ParseAgentFields.
-// Used by daemon for compatibility.
-func ParseAgentFieldsFromDescription(description string) *AgentFields {
-	return ParseAgentFields(description)
-}
-
 // AttachmentFields holds the attachment info for pinned beads.
 // These fields track which molecule is attached to a handoff/pinned bead.
 type AttachmentFields struct {
 	AttachedMolecule string // Root issue ID of the attached molecule
+	AttachedFormula  string // Formula name (e.g., "mol-polecat-work") for inline step display
 	AttachedAt       string // ISO 8601 timestamp when attached
 	AttachedArgs     string // Natural language args passed via gt sling --args (no-tmux mode)
 	DispatchedBy     string // Agent ID that dispatched this work (for completion notification)
@@ -26,6 +21,7 @@ type AttachmentFields struct {
 	Mode             string // Execution mode: "" (normal) or "ralph" (Ralph Wiggum loop)
 	ConvoyID         string // Convoy bead ID tracking this issue (e.g., "hq-cv-abc")
 	MergeStrategy    string // Convoy merge strategy: "direct", "mr", "local", or "" (default = mr)
+	ConvoyOwned      bool   // If true, convoy has gt:owned label (caller-managed lifecycle)
 }
 
 // ParseAttachmentFields extracts attachment fields from an issue's description.
@@ -61,6 +57,9 @@ func ParseAttachmentFields(issue *Issue) *AttachmentFields {
 		case "attached_molecule", "attached-molecule", "attachedmolecule":
 			fields.AttachedMolecule = value
 			hasFields = true
+		case "attached_formula", "attached-formula", "attachedformula":
+			fields.AttachedFormula = value
+			hasFields = true
 		case "attached_at", "attached-at", "attachedat":
 			fields.AttachedAt = value
 			hasFields = true
@@ -81,6 +80,9 @@ func ParseAttachmentFields(issue *Issue) *AttachmentFields {
 			hasFields = true
 		case "merge_strategy", "merge-strategy", "mergestrategy":
 			fields.MergeStrategy = value
+			hasFields = true
+		case "convoy_owned", "convoy-owned", "convoyowned":
+			fields.ConvoyOwned = strings.ToLower(value) == "true"
 			hasFields = true
 		}
 	}
@@ -103,6 +105,9 @@ func FormatAttachmentFields(fields *AttachmentFields) string {
 	if fields.AttachedMolecule != "" {
 		lines = append(lines, "attached_molecule: "+fields.AttachedMolecule)
 	}
+	if fields.AttachedFormula != "" {
+		lines = append(lines, "attached_formula: "+fields.AttachedFormula)
+	}
 	if fields.AttachedAt != "" {
 		lines = append(lines, "attached_at: "+fields.AttachedAt)
 	}
@@ -124,6 +129,9 @@ func FormatAttachmentFields(fields *AttachmentFields) string {
 	if fields.MergeStrategy != "" {
 		lines = append(lines, "merge_strategy: "+fields.MergeStrategy)
 	}
+	if fields.ConvoyOwned {
+		lines = append(lines, "convoy_owned: true")
+	}
 
 	return strings.Join(lines, "\n")
 }
@@ -137,6 +145,9 @@ func SetAttachmentFields(issue *Issue, fields *AttachmentFields) string {
 		"attached_molecule": true,
 		"attached-molecule": true,
 		"attachedmolecule":  true,
+		"attached_formula":  true,
+		"attached-formula":  true,
+		"attachedformula":   true,
 		"attached_at":       true,
 		"attached-at":       true,
 		"attachedat":        true,
@@ -157,6 +168,9 @@ func SetAttachmentFields(issue *Issue, fields *AttachmentFields) string {
 		"merge_strategy":    true,
 		"merge-strategy":    true,
 		"mergestrategy":     true,
+		"convoy_owned":      true,
+		"convoy-owned":      true,
+		"convoyowned":       true,
 	}
 
 	// Collect non-attachment lines from existing description
@@ -645,12 +659,13 @@ func FormatRoleConfig(config *RoleConfig) string {
 }
 
 // ExpandRolePattern expands placeholders in a pattern string.
-// Supported placeholders: {town}, {rig}, {name}, {role}
-func ExpandRolePattern(pattern, townRoot, rig, name, role string) string {
+// Supported placeholders: {town}, {rig}, {name}, {role}, {prefix}
+func ExpandRolePattern(pattern, townRoot, rig, name, role, prefix string) string {
 	result := pattern
 	result = strings.ReplaceAll(result, "{town}", townRoot)
 	result = strings.ReplaceAll(result, "{rig}", rig)
 	result = strings.ReplaceAll(result, "{name}", name)
 	result = strings.ReplaceAll(result, "{role}", role)
+	result = strings.ReplaceAll(result, "{prefix}", prefix)
 	return result
 }

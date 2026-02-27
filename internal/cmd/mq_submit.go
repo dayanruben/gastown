@@ -215,8 +215,10 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	existingMR, err := bd.FindMRForBranch(branch)
 	if err != nil {
 		style.PrintWarning("could not check for existing MR: %v", err)
-		// Continue with creation attempt - Create will fail if duplicate
-	} else if existingMR != nil {
+		// FindMRForBranch failed — fall through to create a new MR
+	}
+
+	if existingMR != nil {
 		mrIssue = existingMR
 		fmt.Printf("%s MR already exists (idempotent)\n", style.Bold.Render("✓"))
 	} else {
@@ -233,7 +235,7 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		}
 
 		// Nudge refinery to pick up the new MR
-		nudgeRefinery(rigName, fmt.Sprintf("MR submitted: %s branch=%s", mrIssue.ID, branch))
+		nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work")
 	}
 
 	// Success output

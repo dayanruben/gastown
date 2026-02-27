@@ -440,7 +440,7 @@ exit /b 0
 			RigName:     rigName,
 			PolecatName: "Toast",
 			ClonePath:   filepath.Join(townRoot, "fake-polecat"),
-			DoltBranch:  "",
+
 		}, nil
 	}
 
@@ -464,6 +464,93 @@ exit /b 0
 	}
 	if !rollbackCalled {
 		t.Fatalf("expected rollbackSlingArtifacts to be called")
+	}
+}
+
+func TestRollbackSlingArtifactsBurnsAttachedMolecules(t *testing.T) {
+	townRoot, _ := filepath.EvalSymlinks(t.TempDir())
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	bdScript := `#!/bin/sh
+set -e
+cmd="$1"
+shift || true
+case "$cmd" in
+  update)
+    exit 0
+    ;;
+esac
+exit 0
+`
+	bdScriptWindows := `@echo off
+set "cmd=%1"
+if "%cmd%"=="update" exit /b 0
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(EnvGTRole, "mayor")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	prevGetBead := getBeadInfoForRollback
+	prevCollect := collectExistingMoleculesForRollback
+	prevBurn := burnExistingMoleculesForRollback
+	t.Cleanup(func() {
+		getBeadInfoForRollback = prevGetBead
+		collectExistingMoleculesForRollback = prevCollect
+		burnExistingMoleculesForRollback = prevBurn
+	})
+
+	getBeadInfoForRollback = func(beadID string) (*beadInfo, error) {
+		if beadID != "gt-abc123" {
+			t.Fatalf("unexpected bead id: %q", beadID)
+		}
+		return &beadInfo{
+			Description: "attached_molecule: gt-wisp-stale",
+			Dependencies: []beads.IssueDep{
+				{ID: "gt-wisp-stale"},
+			},
+		}, nil
+	}
+	collectExistingMoleculesForRollback = collectExistingMolecules
+
+	burnCalled := false
+	burnExistingMoleculesForRollback = func(molecules []string, beadID, gotTownRoot string) error {
+		burnCalled = true
+		if beadID != "gt-abc123" {
+			t.Fatalf("unexpected burn bead id: %q", beadID)
+		}
+		if gotTownRoot != townRoot {
+			t.Fatalf("unexpected town root: got %q want %q", gotTownRoot, townRoot)
+		}
+		if len(molecules) != 1 || molecules[0] != "gt-wisp-stale" {
+			t.Fatalf("unexpected molecules to burn: %#v", molecules)
+		}
+		return nil
+	}
+
+	rollbackSlingArtifacts(&SpawnedPolecatInfo{
+		RigName:     "gastown",
+		PolecatName: "Toast",
+	}, "gt-abc123", "")
+
+	if !burnCalled {
+		t.Fatalf("expected rollbackSlingArtifacts to burn attached molecules")
 	}
 }
 
@@ -582,7 +669,7 @@ exit /b 0
 			RigName:     rigName,
 			PolecatName: "Toast",
 			ClonePath:   fakeWorkDir,
-			DoltBranch:  "",
+
 		}, nil
 	}
 
@@ -778,8 +865,8 @@ exit /b 0
 }
 
 // TestVerifyBeadExistsAllowStale reproduces the bug in gtl-ncq where beads
-// visible via regular bd show fail due to database sync issues.
-// The fix uses --allow-stale to skip the sync check for existence verification.
+// visible via regular bd show fail due to database staleness.
+// The fix uses --allow-stale to skip the staleness check for existence verification.
 func TestVerifyBeadExistsAllowStale(t *testing.T) {
 	townRoot := t.TempDir()
 
@@ -788,9 +875,9 @@ func TestVerifyBeadExistsAllowStale(t *testing.T) {
 		t.Fatalf("mkdir mayor/rig: %v", err)
 	}
 
-	// Create a stub bd that simulates the sync issue:
-	// - without --allow-stale fails (database out of sync)
-	// - with --allow-stale succeeds (skips sync check)
+	// Create a stub bd that simulates a staleness issue:
+	// - without --allow-stale fails (database stale)
+	// - with --allow-stale succeeds (skips staleness check)
 	binDir := filepath.Join(townRoot, "bin")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatalf("mkdir binDir: %v", err)
@@ -810,7 +897,7 @@ if [ "$allow_stale" = "true" ]; then
   exit 0
 else
   # Without --allow-stale, fails with sync error
-  echo '{"error":"Database out of sync with JSONL."}'
+  echo '{"error":"Database is stale."}'
   exit 1
 fi
 `
@@ -824,7 +911,7 @@ if "%allow%"=="true" (
   echo [{"title":"Test bead","status":"open","assignee":""}]
   exit /b 0
 )
-echo {"error":"Database out of sync with JSONL."}
+echo {"error":"Database is stale."}
 exit /b 1
 `
 	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
@@ -2261,6 +2348,106 @@ exit /b 0
 			// Verify correct agent was resolved
 			if !strings.Contains(stdout, tt.wantAgent) {
 				t.Errorf("expected agent %q in output, got:\n%s", tt.wantAgent, stdout)
+			}
+		})
+	}
+}
+// TestSlingRejectsDeferredBead verifies that gt sling refuses to sling beads
+// with deferred status or deferral keywords in their description (gt-1326mw).
+// This prevents wasting polecat slots on low-priority deferred work.
+func TestSlingRejectsDeferredBead(t *testing.T) {
+	tests := []struct {
+		name      string
+		bdOutput  string // JSON response from bd show --json
+		force     bool
+		wantError string // expected error substring, empty = no error expected
+	}{
+		{
+			name:      "deferred status is rejected",
+			bdOutput:  `[{"title":"Epic cleanup","status":"deferred","assignee":"","description":"some task"}]`,
+			wantError: "refusing to sling deferred bead",
+		},
+		{
+			name:      "deferred to post-launch in description is rejected",
+			bdOutput:  `[{"title":"Nice to have feature","status":"open","assignee":"","description":"deferred to post-launch"}]`,
+			wantError: "refusing to sling deferred bead",
+		},
+		{
+			name:      "status: deferred in description is rejected",
+			bdOutput:  `[{"title":"Low-pri work","status":"open","assignee":"","description":"status: deferred, will revisit later"}]`,
+			wantError: "refusing to sling deferred bead",
+		},
+		{
+			name:     "deferred status with --force is allowed",
+			bdOutput: `[{"title":"Re-activated work","status":"deferred","assignee":"","description":"re-activated from deferred"}]`,
+			force:    true,
+		},
+		{
+			name:     "open bead is allowed",
+			bdOutput: `[{"title":"Normal work","status":"open","assignee":"","description":"just a regular task"}]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			townRoot := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+
+			binDir := filepath.Join(townRoot, "bin")
+			if err := os.MkdirAll(binDir, 0755); err != nil {
+				t.Fatalf("mkdir bin: %v", err)
+			}
+
+			// Create bd stub that returns the test bead info
+			bdScript := "#!/bin/sh\necho '" + tt.bdOutput + "'\n"
+			bdScriptWindows := "@echo off\r\necho " + tt.bdOutput + "\r\n"
+			writeBDStub(t, binDir, bdScript, bdScriptWindows)
+
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv(EnvGTRole, "crew")
+			t.Setenv("GT_CREW", "jv")
+			t.Setenv("GT_POLECAT", "")
+			t.Setenv("TMUX_PANE", "")
+			t.Setenv("GT_TEST_NO_NUDGE", "1")
+
+			cwd, err := os.Getwd()
+			if err != nil {
+				t.Fatalf("getwd: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Chdir(cwd) })
+			if err := os.Chdir(townRoot); err != nil {
+				t.Fatalf("chdir: %v", err)
+			}
+
+			prevDryRun := slingDryRun
+			prevNoConvoy := slingNoConvoy
+			prevForce := slingForce
+			t.Cleanup(func() {
+				slingDryRun = prevDryRun
+				slingNoConvoy = prevNoConvoy
+				slingForce = prevForce
+			})
+			slingDryRun = true
+			slingNoConvoy = true
+			slingForce = tt.force
+
+			err = runSling(nil, []string{"gt-test123"})
+
+			if tt.wantError != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q but got nil", tt.wantError)
+				}
+				if !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("expected error containing %q, got: %v", tt.wantError, err)
+				}
+			} else if err != nil {
+				// Some errors are OK in dry-run (e.g., "finding town root" when workspace not fully set up).
+				// We only fail if the error is about deferred rejection, which shouldn't happen.
+				if strings.Contains(err.Error(), "refusing to sling deferred") {
+					t.Fatalf("unexpected deferred rejection: %v", err)
+				}
 			}
 		})
 	}

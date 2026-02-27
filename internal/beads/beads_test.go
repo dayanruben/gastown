@@ -2,6 +2,7 @@ package beads
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -177,10 +178,8 @@ func TestIntegration(t *testing.T) {
 
 	b := New(dir)
 
-	// Sync database with JSONL before testing to avoid "Database out of sync" errors.
-	// This can happen when JSONL is updated (e.g., by git pull) but the database
-	// hasn't been imported yet. Running sync --import-only ensures we test against
-	// consistent data and prevents flaky test failures.
+	// Sync database before testing to ensure consistent data and prevent
+	// flaky test failures from stale state.
 	// We use --allow-stale to handle cases where the daemon is actively writing and
 	// the staleness check would otherwise fail spuriously.
 	syncCmd := exec.Command("bd", "--allow-stale", "sync", "--import-only")
@@ -1091,6 +1090,56 @@ func TestResolveBeadsDir(t *testing.T) {
 		}
 	})
 
+	t.Run("absolute path redirect", func(t *testing.T) {
+		// Redirect file contains an absolute path (e.g., /Users/emech/.../gastown/.beads)
+		// This was the path-doubling bug: filepath.Join(workDir, absPath) produces
+		// workDir/Users/emech/... instead of using absPath directly.
+		workDir := filepath.Join(tmpDir, "polecat", "chrome")
+		localBeadsDir := filepath.Join(workDir, ".beads")
+		targetBeadsDir := filepath.Join(tmpDir, "canonical", ".beads")
+
+		if err := os.MkdirAll(localBeadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(targetBeadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write absolute path redirect
+		redirectPath := filepath.Join(localBeadsDir, "redirect")
+		if err := os.WriteFile(redirectPath, []byte(targetBeadsDir+"\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		got := ResolveBeadsDir(workDir)
+		if got != targetBeadsDir {
+			t.Errorf("ResolveBeadsDir() = %q, want %q (absolute redirect should be used as-is)", got, targetBeadsDir)
+		}
+	})
+
+	t.Run("absolute path in redirect chain", func(t *testing.T) {
+		// Test absolute path handling in resolveBeadsDirWithDepth (chained redirects)
+		firstBeadsDir := filepath.Join(tmpDir, "chain-test", "first", ".beads")
+		finalBeadsDir := filepath.Join(tmpDir, "chain-test", "final", ".beads")
+
+		if err := os.MkdirAll(firstBeadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(finalBeadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// First beads redirects via absolute path to final
+		if err := os.WriteFile(filepath.Join(firstBeadsDir, "redirect"), []byte(finalBeadsDir+"\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		got := resolveBeadsDirWithDepth(firstBeadsDir, 3)
+		if got != finalBeadsDir {
+			t.Errorf("resolveBeadsDirWithDepth() = %q, want %q", got, finalBeadsDir)
+		}
+	})
+
 	t.Run("circular redirect", func(t *testing.T) {
 		// Redirect that points to itself (e.g., mayor/rig/.beads/redirect -> ../../mayor/rig/.beads)
 		// This is the bug scenario from gt-csbjj
@@ -1149,6 +1198,12 @@ func TestParseAgentBeadID(t *testing.T) {
 		{"gt-gastown-crew-polecat", "gastown", "crew", "polecat", true},
 		// Worker name collides with role keyword + hyphenated rig
 		{"gt-my-rig-polecat-witness", "my-rig", "polecat", "witness", true},
+		// Collapsed form: prefix == rig (e.g., rig "ff" with prefix "ff")
+		{"ff-witness", "ff", "witness", "", true},                // collapsed rig-level singleton
+		{"ff-refinery", "ff", "refinery", "", true},              // collapsed rig-level singleton
+		{"ff-polecat-nux", "ff", "polecat", "nux", true},         // collapsed named agent
+		{"ff-crew-dave", "ff", "crew", "dave", true},             // collapsed named agent
+		{"ff-polecat-war-boy", "ff", "polecat", "war-boy", true}, // collapsed named with hyphen
 		// Parseable but not valid agent roles (IsAgentSessionBead will reject)
 		{"gt-abc123", "", "abc123", "", true}, // Parses as town-level but not valid role
 		// Other prefixes (bd-, hq-)
@@ -1361,6 +1416,7 @@ func TestExpandRolePattern(t *testing.T) {
 		rig      string
 		name     string
 		role     string
+		prefix   string
 		want     string
 	}{
 		{
@@ -1369,18 +1425,20 @@ func TestExpandRolePattern(t *testing.T) {
 			want:     "gt-mayor",
 		},
 		{
-			pattern:  "gt-{rig}-{role}",
+			pattern:  "{prefix}-{role}",
 			townRoot: "/Users/stevey/gt",
 			rig:      "gastown",
 			role:     "witness",
-			want:     "gt-gastown-witness",
+			prefix:   "gt",
+			want:     "gt-witness",
 		},
 		{
-			pattern:  "gt-{rig}-{name}",
+			pattern:  "{prefix}-{name}",
 			townRoot: "/Users/stevey/gt",
 			rig:      "gastown",
 			name:     "toast",
-			want:     "gt-gastown-toast",
+			prefix:   "gt",
+			want:     "gt-toast",
 		},
 		{
 			pattern:  "{town}/{rig}/polecats/{name}",
@@ -1407,7 +1465,7 @@ func TestExpandRolePattern(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.pattern, func(t *testing.T) {
-			got := ExpandRolePattern(tt.pattern, tt.townRoot, tt.rig, tt.name, tt.role)
+			got := ExpandRolePattern(tt.pattern, tt.townRoot, tt.rig, tt.name, tt.role, tt.prefix)
 			if got != tt.want {
 				t.Errorf("ExpandRolePattern() = %q, want %q", got, tt.want)
 			}
@@ -1869,6 +1927,54 @@ func TestSetupRedirect(t *testing.T) {
 		}
 	})
 
+	t.Run("crew worktree with absolute rig redirect", func(t *testing.T) {
+		// Setup: rig/.beads/redirect contains an absolute path
+		townRoot := t.TempDir()
+		rigRoot := filepath.Join(townRoot, "testrig")
+		rigBeads := filepath.Join(rigRoot, ".beads")
+		crewPath := filepath.Join(rigRoot, "crew", "max")
+
+		// Create an absolute target beads directory (simulates a canonical .beads outside the town)
+		absTarget := filepath.Join(t.TempDir(), "canonical", ".beads")
+		if err := os.MkdirAll(absTarget, 0755); err != nil {
+			t.Fatalf("mkdir abs target: %v", err)
+		}
+
+		// Create rig structure with absolute redirect
+		if err := os.MkdirAll(rigBeads, 0755); err != nil {
+			t.Fatalf("mkdir rig beads: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(rigBeads, "redirect"), []byte(absTarget+"\n"), 0644); err != nil {
+			t.Fatalf("write rig redirect: %v", err)
+		}
+		if err := os.MkdirAll(crewPath, 0755); err != nil {
+			t.Fatalf("mkdir crew: %v", err)
+		}
+
+		// Run SetupRedirect
+		if err := SetupRedirect(townRoot, crewPath); err != nil {
+			t.Fatalf("SetupRedirect failed: %v", err)
+		}
+
+		// Verify redirect is the absolute path (not upPath + absolutePath)
+		redirectPath := filepath.Join(crewPath, ".beads", "redirect")
+		content, err := os.ReadFile(redirectPath)
+		if err != nil {
+			t.Fatalf("read redirect: %v", err)
+		}
+
+		want := absTarget + "\n"
+		if string(content) != want {
+			t.Errorf("redirect content = %q, want %q (absolute path should be passed through)", string(content), want)
+		}
+
+		// Verify redirect resolves correctly
+		resolved := ResolveBeadsDir(crewPath)
+		if resolved != absTarget {
+			t.Errorf("resolved = %q, want %q", resolved, absTarget)
+		}
+	})
+
 	t.Run("polecat worktree", func(t *testing.T) {
 		townRoot := t.TempDir()
 		rigRoot := filepath.Join(townRoot, "testrig")
@@ -2177,9 +2283,6 @@ func TestSetupRedirect(t *testing.T) {
 	})
 }
 
-
-
-
 // TestResetAgentBeadForReuse_NukeRespawnCycle tests the preferred nuke→respawn
 // lifecycle using ResetAgentBeadForReuse (gt-14b8o fix). This keeps the bead open
 // with agent_state="nuked", avoiding the close/reopen cycle
@@ -2276,29 +2379,24 @@ func TestResetAgentBeadForReuse_NukeRespawnCycle(t *testing.T) {
 	t.Log("LIFECYCLE TEST PASSED: spawn → reset → respawn works without close/reopen")
 }
 
-
-
-
-
-
 // TestIsAgentBead verifies the IsAgentBead function correctly identifies agent
 // beads by checking both the gt:agent label (preferred) and the legacy type field.
 func TestIsAgentBead(t *testing.T) {
 	tests := []struct {
-		name   string
-		issue  *Issue
-		want   bool
+		name  string
+		issue *Issue
+		want  bool
 	}{
 		{
-			name: "nil issue",
+			name:  "nil issue",
 			issue: nil,
-			want: false,
+			want:  false,
 		},
 		{
 			name: "agent with legacy type",
 			issue: &Issue{
-				ID:   "gt-gastown-polecat-toast",
-				Type: "agent",
+				ID:     "gt-gastown-polecat-toast",
+				Type:   "agent",
 				Labels: []string{},
 			},
 			want: true,
@@ -2306,8 +2404,8 @@ func TestIsAgentBead(t *testing.T) {
 		{
 			name: "agent with gt:agent label",
 			issue: &Issue{
-				ID:   "gt-gastown-polecat-toast",
-				Type: "task",
+				ID:     "gt-gastown-polecat-toast",
+				Type:   "task",
 				Labels: []string{"gt:agent"},
 			},
 			want: true,
@@ -2315,8 +2413,8 @@ func TestIsAgentBead(t *testing.T) {
 		{
 			name: "agent with both type and label",
 			issue: &Issue{
-				ID:   "gt-gastown-polecat-toast",
-				Type: "agent",
+				ID:     "gt-gastown-polecat-toast",
+				Type:   "agent",
 				Labels: []string{"gt:agent", "other-label"},
 			},
 			want: true,
@@ -2324,8 +2422,8 @@ func TestIsAgentBead(t *testing.T) {
 		{
 			name: "not an agent - task type without label",
 			issue: &Issue{
-				ID:   "gt-abc123",
-				Type: "task",
+				ID:     "gt-abc123",
+				Type:   "task",
 				Labels: []string{},
 			},
 			want: false,
@@ -2333,8 +2431,8 @@ func TestIsAgentBead(t *testing.T) {
 		{
 			name: "not an agent - bug type with other labels",
 			issue: &Issue{
-				ID:   "gt-xyz456",
-				Type: "bug",
+				ID:     "gt-xyz456",
+				Type:   "bug",
 				Labels: []string{"priority-high", "blocked"},
 			},
 			want: false,
@@ -2342,8 +2440,8 @@ func TestIsAgentBead(t *testing.T) {
 		{
 			name: "agent with gt:agent label and other labels",
 			issue: &Issue{
-				ID:   "gt-gastown-witness",
-				Type: "task",
+				ID:     "gt-gastown-witness",
+				Type:   "task",
 				Labels: []string{"priority-high", "gt:agent", "status-running"},
 			},
 			want: true,
@@ -2355,6 +2453,388 @@ func TestIsAgentBead(t *testing.T) {
 			got := IsAgentBead(tt.issue)
 			if got != tt.want {
 				t.Errorf("IsAgentBead() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestFilterBeadsEnv_NilInput verifies filterBeadsEnv does not panic on nil.
+func TestFilterBeadsEnv_NilInput(t *testing.T) {
+	got := filterBeadsEnv(nil)
+	if got == nil {
+		t.Fatal("filterBeadsEnv(nil) returned nil, want empty slice")
+	}
+	if len(got) != 0 {
+		t.Errorf("filterBeadsEnv(nil) returned %d items, want 0", len(got))
+	}
+}
+
+// TestFilterBeadsEnv_EmptyInput verifies filterBeadsEnv on empty slice.
+func TestFilterBeadsEnv_EmptyInput(t *testing.T) {
+	got := filterBeadsEnv([]string{})
+	if len(got) != 0 {
+		t.Errorf("filterBeadsEnv([]) returned %d items, want 0", len(got))
+	}
+}
+
+// TestFilterBeadsEnv_PreservesDoltPortVars verifies that GT_DOLT_PORT and
+// BEADS_DOLT_PORT are preserved by filterBeadsEnv even though BEADS_* vars
+// are otherwise stripped. Tests need these to reach test Dolt servers.
+func TestFilterBeadsEnv_PreservesDoltPortVars(t *testing.T) {
+	environ := []string{
+		"BD_ACTOR=test-actor",
+		"BEADS_DIR=/tmp/beads",
+		"BEADS_DB=/tmp/beads.db",
+		"BEADS_DOLT_PORT=13306",
+		"GT_DOLT_PORT=13307",
+		"GT_ROOT=/tmp/gt",
+		"HOME=/home/test",
+		"PATH=/usr/bin",
+	}
+	got := filterBeadsEnv(environ)
+	want := []string{
+		"BEADS_DOLT_PORT=13306",
+		"GT_DOLT_PORT=13307",
+		"PATH=/usr/bin",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("filterBeadsEnv returned %d items, want %d\n  got:  %v\n  want: %v",
+			len(got), len(want), got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestNewIsolatedWithPort verifies the constructor sets serverPort.
+func TestNewIsolatedWithPort(t *testing.T) {
+	b := NewIsolatedWithPort("/tmp/test", 13307)
+	if !b.isolated {
+		t.Error("expected isolated=true")
+	}
+	if b.serverPort != 13307 {
+		t.Errorf("serverPort = %d, want 13307", b.serverPort)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// stripEnvPrefixes tests (refactored from runWithRouting inline logic)
+// ---------------------------------------------------------------------------
+
+// TestStripEnvPrefixes verifies the generic prefix stripping used by runWithRouting.
+func TestStripEnvPrefixes(t *testing.T) {
+	tests := []struct {
+		name     string
+		environ  []string
+		prefixes []string
+		want     []string
+	}{
+		{
+			name:     "strips single prefix",
+			environ:  []string{"BEADS_DIR=/tmp", "PATH=/usr/bin", "HOME=/home"},
+			prefixes: []string{"BEADS_DIR="},
+			want:     []string{"PATH=/usr/bin", "HOME=/home"},
+		},
+		{
+			name:     "strips multiple prefixes",
+			environ:  []string{"BEADS_DIR=/tmp", "BD_ACTOR=test-actor", "PATH=/usr/bin"},
+			prefixes: []string{"BEADS_DIR=", "BD_ACTOR="},
+			want:     []string{"PATH=/usr/bin"},
+		},
+		{
+			name:     "no matches",
+			environ:  []string{"PATH=/usr/bin", "HOME=/home"},
+			prefixes: []string{"BEADS_DIR=", "BD_ACTOR="},
+			want:     []string{"PATH=/usr/bin", "HOME=/home"},
+		},
+		{
+			name:     "empty prefixes",
+			environ:  []string{"PATH=/usr/bin"},
+			prefixes: []string{},
+			want:     []string{"PATH=/usr/bin"},
+		},
+		{
+			name:     "nil environ",
+			environ:  nil,
+			prefixes: []string{"BEADS_DIR="},
+			want:     []string{},
+		},
+		{
+			name:     "empty environ",
+			environ:  []string{},
+			prefixes: []string{"BEADS_DIR="},
+			want:     []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stripEnvPrefixes(tt.environ, tt.prefixes...)
+			if len(got) != len(tt.want) {
+				t.Fatalf("stripEnvPrefixes() returned %d items, want %d\n  got:  %v\n  want: %v",
+					len(got), len(tt.want), got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestStripEnvPrefixes_PreservesOrder verifies output ordering is stable.
+func TestStripEnvPrefixes_PreservesOrder(t *testing.T) {
+	environ := []string{"A=1", "BEADS_DIR=/tmp", "B=2", "BD_ACTOR=x", "C=3"}
+	got := stripEnvPrefixes(environ, "BEADS_DIR=", "BD_ACTOR=")
+	want := []string{"A=1", "B=2", "C=3"}
+
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// translateDoltPort tests
+// ---------------------------------------------------------------------------
+
+// TestTranslateDoltPort verifies GT_DOLT_PORT → BEADS_DOLT_PORT translation.
+// This is the core fix for hq-27t: gastown sets GT_DOLT_PORT but bd only reads
+// BEADS_DOLT_PORT. Without translation, bd falls back to metadata.json port 3307.
+func TestTranslateDoltPort(t *testing.T) {
+	tests := []struct {
+		name string
+		env  []string
+		want []string
+	}{
+		{
+			name: "translates GT to BEADS",
+			env:  []string{"GT_DOLT_PORT=12345", "PATH=/usr/bin"},
+			want: []string{"GT_DOLT_PORT=12345", "PATH=/usr/bin", "BEADS_DOLT_PORT=12345"},
+		},
+		{
+			name: "skips if BEADS_DOLT_PORT already set",
+			env:  []string{"GT_DOLT_PORT=12345", "BEADS_DOLT_PORT=99999"},
+			want: []string{"GT_DOLT_PORT=12345", "BEADS_DOLT_PORT=99999"},
+		},
+		{
+			name: "no-op without GT_DOLT_PORT",
+			env:  []string{"PATH=/usr/bin"},
+			want: []string{"PATH=/usr/bin"},
+		},
+		{
+			name: "empty env",
+			env:  []string{},
+			want: []string{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := translateDoltPort(tt.env)
+			if len(got) != len(tt.want) {
+				t.Fatalf("translateDoltPort() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests — verify env behavior with real os.Environ()
+// ---------------------------------------------------------------------------
+
+// TestFilterBeadsEnv_Integration verifies filterBeadsEnv strips all expected
+// vars from a real os.Environ() with multiple beads vars set.
+func TestFilterBeadsEnv_Integration(t *testing.T) {
+	t.Setenv("BD_ACTOR", "gastown/polecats/TestPolecat")
+	t.Setenv("BEADS_DIR", "/tmp/test-beads")
+	t.Setenv("GT_ROOT", "/tmp/test-gt-root")
+
+	env := filterBeadsEnv(os.Environ())
+
+	// BEADS_DOLT_PORT and GT_DOLT_PORT are explicitly preserved (test server access).
+	// Check that other BEADS_* vars are still stripped.
+	forbidden := []string{"BD_ACTOR=", "BEADS_DIR=", "BEADS_DB=", "GT_ROOT=", "HOME="}
+	for _, e := range env {
+		for _, prefix := range forbidden {
+			if strings.HasPrefix(e, prefix) {
+				t.Errorf("filterBeadsEnv did not strip %s (found: %s)", prefix, e)
+			}
+		}
+	}
+}
+
+// TestBdBranch_SystemScenario_FilterBeadsEnvIsolation verifies filterBeadsEnv
+// strips all beads-related vars from subprocess environment.
+func TestBdBranch_SystemScenario_FilterBeadsEnvIsolation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping system test in short mode")
+	}
+
+	t.Setenv("BD_ACTOR", "gastown/polecats/FilterTest")
+	t.Setenv("BEADS_DIR", "/tmp/filter-test-beads")
+	t.Setenv("GT_ROOT", "/tmp/filter-test-gt")
+
+	cmd := exec.Command("env")
+	cmd.Env = filterBeadsEnv(os.Environ())
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("env command failed: %v", err)
+	}
+
+	output := string(out)
+	// Note: HOME= is stripped by filterBeadsEnv, but on macOS the kernel may
+	// re-inject HOME into subprocesses. Only check beads-specific vars here.
+	forbidden := []string{"BD_ACTOR=", "BEADS_DIR=", "GT_ROOT="}
+	for _, prefix := range forbidden {
+		if strings.Contains(output, prefix) {
+			t.Errorf("filterBeadsEnv subprocess still contains %s", prefix)
+		}
+	}
+}
+
+// TestBuildRunEnv verifies buildRunEnv() returns the correct environment
+// for each mode: default (passthrough) and isolated (strip all beads vars).
+func TestBuildRunEnv(t *testing.T) {
+	tests := []struct {
+		name     string
+		isolated bool
+		// envVars to inject via t.Setenv
+		envVars map[string]string
+		// mustContain: prefixes that MUST be present in the result
+		mustContain []string
+		// mustNotContain: prefixes that MUST NOT be present in the result
+		mustNotContain []string
+	}{
+		{
+			name:           "default preserves all vars",
+			envVars:        map[string]string{"PATH": "/usr/bin"},
+			mustContain:    []string{"PATH="},
+			mustNotContain: nil,
+		},
+		{
+			name:           "isolated strips all beads vars",
+			isolated:       true,
+			envVars:        map[string]string{"BD_ACTOR": "test-actor", "BEADS_DIR": "/tmp/beads"},
+			mustNotContain: []string{"BD_ACTOR=", "BEADS_DIR="},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.envVars {
+				t.Setenv(k, v)
+			}
+			b := &Beads{workDir: "/tmp", isolated: tt.isolated}
+			env := b.buildRunEnv()
+
+			for _, prefix := range tt.mustContain {
+				found := false
+				for _, e := range env {
+					if strings.HasPrefix(e, prefix) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("expected %s to be present", prefix)
+				}
+			}
+			for _, prefix := range tt.mustNotContain {
+				for _, e := range env {
+					if strings.HasPrefix(e, prefix) {
+						t.Errorf("expected %s to be absent, got %s", prefix, e)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestBuildRoutingEnv verifies buildRoutingEnv() returns the correct environment
+// for each mode: default (strip BEADS_DIR only) and isolated (strip all beads vars).
+func TestBuildRoutingEnv(t *testing.T) {
+	tests := []struct {
+		name           string
+		isolated       bool
+		envVars        map[string]string
+		mustContain    []string
+		mustNotContain []string
+	}{
+		{
+			name:           "default strips BEADS_DIR only",
+			envVars:        map[string]string{"BEADS_DIR": "/tmp/beads", "PATH": "/usr/bin"},
+			mustContain:    []string{"PATH="},
+			mustNotContain: []string{"BEADS_DIR="},
+		},
+		{
+			name:           "isolated strips all beads vars",
+			isolated:       true,
+			envVars:        map[string]string{"BD_ACTOR": "test-actor", "BEADS_DIR": "/tmp/beads"},
+			mustNotContain: []string{"BD_ACTOR=", "BEADS_DIR="},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.envVars {
+				t.Setenv(k, v)
+			}
+			b := &Beads{workDir: "/tmp", isolated: tt.isolated}
+			env := b.buildRoutingEnv()
+
+			for _, prefix := range tt.mustContain {
+				found := false
+				for _, e := range env {
+					if strings.HasPrefix(e, prefix) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("expected %s to be present", prefix)
+				}
+			}
+			for _, prefix := range tt.mustNotContain {
+				for _, e := range env {
+					if strings.HasPrefix(e, prefix) {
+						t.Errorf("expected %s to be absent, got %s", prefix, e)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestIsSubprocessCrash(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"normal error", fmt.Errorf("bd create: exit status 1"), false},
+		{"not found", fmt.Errorf("bd show: not found"), false},
+		{"signal segfault", fmt.Errorf("bd create: signal: segmentation fault"), true},
+		{"signal killed", fmt.Errorf("bd create: signal: killed"), true},
+		{"nil pointer in stderr", fmt.Errorf("bd create: nil pointer dereference"), true},
+		{"panic in stderr", fmt.Errorf("bd create: panic: runtime error"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isSubprocessCrash(tt.err); got != tt.want {
+				t.Errorf("isSubprocessCrash(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}

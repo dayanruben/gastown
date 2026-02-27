@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -301,11 +302,13 @@ func parseGroupAddress(address string) *ParsedGroup {
 
 // agentBead represents an agent bead as returned by bd list --label=gt:agent.
 type agentBead struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Status      string `json:"status"`
-	CreatedBy   string `json:"created_by"`
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Status      string   `json:"status"`
+	CreatedBy   string   `json:"created_by"`
+	Type        string   `json:"issue_type"`
+	Labels      []string `json:"labels"`
 }
 
 // agentBeadToAddress converts an agent bead to a mail address.
@@ -699,6 +702,7 @@ func (r *Router) queryAgents(descContains string) []*agentBead {
 }
 
 // queryAgentsInDir queries agent beads in a specific beads directory with optional description filtering.
+// Queries both the issues and wisps tables, merging results.
 func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, error) {
 	args := []string{"list", "--label=gt:agent", "--json", "--limit=0"}
 
@@ -708,25 +712,68 @@ func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, 
 
 	ctx, cancel := bdReadCtx()
 	defer cancel()
-	stdout, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
-	if err != nil {
-		return nil, fmt.Errorf("querying agents in %s: %w", beadsDir, err)
-	}
 
+	// Query issues table (backward compat during migration)
+	stdout, issuesErr := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+
+	// Also query wisps table for migrated agent beads (best-effort)
+	wispCtx, wispCancel := bdReadCtx()
+	defer wispCancel()
+	wispOut, _ := runBdCommand(wispCtx, []string{"mol", "wisp", "list", "--json"}, filepath.Dir(beadsDir), beadsDir)
+
+	// Merge results: collect agent beads from both sources
+	seenIDs := make(map[string]bool)
 	var agents []*agentBead
-	if err := json.Unmarshal(stdout, &agents); err != nil {
-		return nil, fmt.Errorf("parsing agent query result: %w", err)
+
+	// Parse wisps first (primary source after migration)
+	if len(wispOut) > 0 {
+		var wispAgents []*agentBead
+		if json.Unmarshal(wispOut, &wispAgents) == nil {
+			for _, agent := range wispAgents {
+				if isAgentBeadEntry(agent) {
+					seenIDs[agent.ID] = true
+					agents = append(agents, agent)
+				}
+			}
+		}
 	}
 
-	// Filter for open agents only (closed agents are inactive)
+	// Then issues (backward compat, skip duplicates)
+	if len(stdout) > 0 {
+		var issueAgents []*agentBead
+		if json.Unmarshal(stdout, &issueAgents) == nil {
+			for _, agent := range issueAgents {
+				if !seenIDs[agent.ID] {
+					agents = append(agents, agent)
+				}
+			}
+		}
+	} else if issuesErr != nil && len(agents) == 0 {
+		return nil, fmt.Errorf("querying agents in %s: %w", beadsDir, issuesErr)
+	}
+
+	// Filter for active agents (closed/deleted agents are inactive)
 	var active []*agentBead
 	for _, agent := range agents {
-		if agent.Status == "open" || agent.Status == "in_progress" {
+		if agent.Status == "open" || agent.Status == "in_progress" || agent.Status == "hooked" || agent.Status == "pinned" {
 			active = append(active, agent)
 		}
 	}
 
 	return active, nil
+}
+
+// isAgentBeadEntry checks if an agentBead entry is an actual agent bead.
+func isAgentBeadEntry(a *agentBead) bool {
+	if a.Type == "agent" {
+		return true
+	}
+	for _, l := range a.Labels {
+		if l == "gt:agent" {
+			return true
+		}
+	}
+	return false
 }
 
 // queryAgentsFromDir queries agent beads from a specific beads directory.
@@ -855,6 +902,7 @@ func (r *Router) validateRecipient(identity string) error {
 		townBeadsDir := filepath.Join(r.townRoot, ".beads")
 		routes, err := beads.LoadRoutes(townBeadsDir)
 		if err == nil {
+			var queryErrors []string
 			for _, route := range routes {
 				// Skip hq- routes (town-level, already queried)
 				if strings.HasPrefix(route.Prefix, "hq-") {
@@ -863,7 +911,8 @@ func (r *Router) validateRecipient(identity string) error {
 				rigBeadsDir := filepath.Join(r.townRoot, route.Path, ".beads")
 				rigAgents, err := r.queryAgentsFromDir(rigBeadsDir)
 				if err != nil {
-					continue // Skip rigs with errors
+					queryErrors = append(queryErrors, fmt.Sprintf("%s: %v", route.Path, err))
+					continue
 				}
 				for _, agent := range rigAgents {
 					if agentBeadToAddress(agent) == identity {
@@ -871,10 +920,52 @@ func (r *Router) validateRecipient(identity string) error {
 					}
 				}
 			}
+			if len(queryErrors) > 0 {
+				return fmt.Errorf("no agent found (query errors: %s)", strings.Join(queryErrors, "; "))
+			}
 		}
 	}
 
+	// Fall back to workspace directory validation. Agent beads may be missing
+	// (e.g., Dolt DB reset) even though the agent's workspace directory exists.
+	if r.townRoot != "" && r.validateAgentWorkspace(identity) {
+		return nil
+	}
+
 	return fmt.Errorf("no agent found")
+}
+
+// validateAgentWorkspace checks if an agent's workspace directory exists on disk.
+// Used as a fallback when the agent isn't found in the bead registry.
+func (r *Router) validateAgentWorkspace(identity string) bool {
+	parts := strings.Split(identity, "/")
+
+	switch len(parts) {
+	case 1:
+		// Town-level singleton: "mayor", "deacon"
+		name := strings.TrimSuffix(parts[0], "/")
+		return dirExists(filepath.Join(r.townRoot, name))
+	case 2:
+		rig, name := parts[0], parts[1]
+		// Singleton role: gastown/witness, gastown/refinery
+		if dirExists(filepath.Join(r.townRoot, rig, name)) {
+			return true
+		}
+		// Named role (identity normalized away crew/polecats): check both
+		for _, role := range []string{"crew", "polecats"} {
+			if dirExists(filepath.Join(r.townRoot, rig, role, name)) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// dirExists returns true if the path exists and is a directory.
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 // sendToSingle sends a message to a single recipient.
@@ -934,7 +1025,7 @@ func (r *Router) sendToSingle(msg *Message) error {
 	// Add actor for attribution (sender identity)
 	args = append(args, "--actor", msg.From)
 
-	// Add --ephemeral flag for ephemeral messages (stored in single DB, filtered from JSONL export)
+	// Add --ephemeral flag for ephemeral messages (wisps, not synced to git)
 	if r.shouldBeWisp(msg) {
 		args = append(args, "--ephemeral")
 	}
@@ -1397,36 +1488,36 @@ func (r *Router) notifyRecipient(msg *Message) error {
 
 		notification := fmt.Sprintf("📬 You have new mail from %s. Subject: %s. Run 'gt mail inbox' to read.", msg.From, msg.Subject)
 
-		// Idle-aware notification: try immediate nudge first, fall back to queue.
-		waitErr := r.tmux.WaitForIdle(sessionID, timeout)
-		if waitErr == nil {
-			// Session is idle → send immediate nudge
-			if err := r.tmux.NudgeSession(sessionID, notification); err == nil {
-				return nil
-			} else if errors.Is(err, tmux.ErrSessionNotFound) {
-				// Session disappeared between idle check and nudge — try next candidate
-				continue
-			} else if errors.Is(err, tmux.ErrNoServer) {
-				return nil
-			}
-			// NudgeSession failed for non-terminal reason — fall through to queue
-		} else if errors.Is(waitErr, tmux.ErrNoServer) {
-			// No tmux server — no point trying other candidates
-			return nil
-		} else if errors.Is(waitErr, tmux.ErrSessionNotFound) {
-			// Session disappeared — try next candidate
-			continue
-		}
-
-		// Busy or nudge failed → enqueue for cooperative delivery at the
-		// agent's next turn boundary.
+		// Always enqueue mail notifications for cooperative delivery.
+		// Mail is not urgent enough to justify immediate NudgeSession,
+		// which risks a TOCTOU race: WaitForIdle may detect a brief
+		// inter-tool-call idle flash, then NudgeSession's Escape key
+		// disrupts the session that has resumed Cerebrating, leaving
+		// the notification text stuck in the input buffer with Enter
+		// never firing. See: https://github.com/steveyegge/gastown/issues/2032
 		if r.townRoot != "" {
 			return nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
 				Sender:  msg.From,
 				Message: notification,
 			})
 		}
-		// Fallback to direct nudge if town root unavailable
+		// Fallback to idle-aware nudge if town root unavailable.
+		// This preserves the original behavior for edge cases where
+		// cooperative delivery isn't possible.
+		waitErr := r.tmux.WaitForIdle(sessionID, timeout)
+		if waitErr == nil {
+			if err := r.tmux.NudgeSession(sessionID, notification); err == nil {
+				return nil
+			} else if errors.Is(err, tmux.ErrSessionNotFound) {
+				continue
+			} else if errors.Is(err, tmux.ErrNoServer) {
+				return nil
+			}
+		} else if errors.Is(waitErr, tmux.ErrNoServer) {
+			return nil
+		} else if errors.Is(waitErr, tmux.ErrSessionNotFound) {
+			continue
+		}
 		return r.tmux.NudgeSession(sessionID, notification)
 	}
 
@@ -1491,6 +1582,9 @@ func addressToAgentBeadID(address string) string {
 	case strings.HasPrefix(target, "crew/"):
 		crewName := strings.TrimPrefix(target, "crew/")
 		return session.CrewSessionName(rigPrefix, crewName)
+	case strings.HasPrefix(target, "polecats/"):
+		pcName := strings.TrimPrefix(target, "polecats/")
+		return session.PolecatSessionName(rigPrefix, pcName)
 	default:
 		return session.PolecatSessionName(rigPrefix, target)
 	}

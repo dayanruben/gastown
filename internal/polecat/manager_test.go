@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/testutil"
 )
 
 // installMockBd places a fake bd binary in PATH that handles the commands
@@ -100,23 +102,6 @@ esac
 		}
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-}
-
-func TestStateIsActive(t *testing.T) {
-	tests := []struct {
-		state  State
-		active bool
-	}{
-		{StateWorking, true},
-		{StateDone, false},
-		{StateStuck, false},
-	}
-
-	for _, tt := range tests {
-		if got := tt.state.IsActive(); got != tt.active {
-			t.Errorf("%s.IsActive() = %v, want %v", tt.state, got, tt.active)
-		}
-	}
 }
 
 func TestStateIsWorking(t *testing.T) {
@@ -855,7 +840,9 @@ func TestAddWithOptions_NoPrimeMDCreatedLocally(t *testing.T) {
 	// Use real bd if available; fall back to a mock for environments (like
 	// Windows CI) where bd is not installed.
 	if _, err := exec.LookPath("bd"); err == nil {
-		bd := beads.NewWithBeadsDir(mayorRig, mayorBeads)
+		testutil.RequireDoltServer(t)
+		port, _ := strconv.Atoi(testutil.DoltTestPort())
+		bd := beads.NewIsolatedWithPort(mayorRig, port)
 		if err := bd.Init("gt"); err != nil {
 			t.Fatalf("bd init: %v", err)
 		}
@@ -967,7 +954,9 @@ func TestAddWithOptions_NoFilesAddedToRepo(t *testing.T) {
 	// Use real bd if available; fall back to a mock for environments (like
 	// Windows CI) where bd is not installed.
 	if _, err := exec.LookPath("bd"); err == nil {
-		bd := beads.NewWithBeadsDir(mayorRig, mayorBeads)
+		testutil.RequireDoltServer(t)
+		port, _ := strconv.Atoi(testutil.DoltTestPort())
+		bd := beads.NewIsolatedWithPort(mayorRig, port)
 		if err := bd.Init("gt"); err != nil {
 			t.Fatalf("bd init: %v", err)
 		}
@@ -1111,7 +1100,9 @@ func TestAddWithOptions_SettingsInstalledInPolecatsDir(t *testing.T) {
 	// Use real bd if available; fall back to a mock for environments (like
 	// Windows CI) where bd is not installed.
 	if _, err := exec.LookPath("bd"); err == nil {
-		bd := beads.NewWithBeadsDir(mayorRig, mayorBeads)
+		testutil.RequireDoltServer(t)
+		port, _ := strconv.Atoi(testutil.DoltTestPort())
+		bd := beads.NewIsolatedWithPort(mayorRig, port)
 		if err := bd.Init("gt"); err != nil {
 			t.Fatalf("bd init: %v", err)
 		}
@@ -1361,9 +1352,10 @@ func TestAddWithOptions_RollbackReleasesName(t *testing.T) {
 		t.Fatalf("git commit: %v", err)
 	}
 
-	// Add origin remote but deliberately DON'T create origin/main ref.
-	// This will cause AddWithOptions to fail at ref validation, testing rollback.
-	cmd = exec.Command("git", "remote", "add", "origin", mayorRig)
+	// Add origin remote pointing to a nonexistent path so that fetch fails
+	// and origin/main is never created. This causes AddWithOptions to fail at
+	// ref validation, testing rollback.
+	cmd = exec.Command("git", "remote", "add", "origin", "/nonexistent/repo")
 	cmd.Dir = mayorRig
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git remote add: %v\n%s", err, out)

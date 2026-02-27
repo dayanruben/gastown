@@ -1418,6 +1418,41 @@ func TestBuildAgentStartupCommand_UsesRoleAgents(t *testing.T) {
 	}
 }
 
+func TestBuildAgentStartupCommand_DogUsesRoleAgents(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+
+	townSettings := NewTownSettings()
+	townSettings.DefaultAgent = "claude-opus"
+	townSettings.Agents = map[string]*RuntimeConfig{
+		"claude-opus": {
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions", "--model", "opus"},
+		},
+		"claude-haiku": {
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions", "--model", "haiku"},
+		},
+	}
+	townSettings.RoleAgents = map[string]string{
+		"dog": "claude-haiku",
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	cmd := BuildAgentStartupCommand("dog", "", townRoot, "", "")
+	if !strings.Contains(cmd, "GT_ROLE=dog") {
+		t.Fatalf("expected GT_ROLE=dog in command, got: %q", cmd)
+	}
+	if !strings.Contains(cmd, "--model haiku") {
+		t.Fatalf("expected --model haiku from role_agents[dog], got: %q", cmd)
+	}
+	if strings.Contains(cmd, "--model opus") {
+		t.Fatalf("did not expect --model opus (default_agent) for dog role, got: %q", cmd)
+	}
+}
+
 func TestValidateAgentConfig(t *testing.T) {
 	t.Parallel()
 
@@ -1651,6 +1686,29 @@ func TestWithRoleSettingsFlag_InjectsForClaude(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("default Claude agent should get --settings flag for polecat role, but Args = %v", rc.Args)
+	}
+}
+
+func TestRoleSettingsDir(t *testing.T) {
+	t.Parallel()
+	rigPath := "/fake/rig"
+	tests := []struct {
+		role string
+		want string
+	}{
+		{"crew", filepath.Join(rigPath, "crew")},
+		{"witness", filepath.Join(rigPath, "witness")},
+		{"refinery", filepath.Join(rigPath, "refinery")},
+		{"polecat", filepath.Join(rigPath, "polecats")},
+		{"mayor", ""},
+		{"deacon", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		got := RoleSettingsDir(tt.role, rigPath)
+		if got != tt.want {
+			t.Errorf("RoleSettingsDir(%q, %q) = %q, want %q", tt.role, rigPath, got, tt.want)
+		}
 	}
 }
 
@@ -2042,6 +2100,210 @@ func TestAddRigToDaemonPatrols(t *testing.T) {
 
 		if err := AddRigToDaemonPatrols(townRoot, "newrig"); err != nil {
 			t.Fatalf("AddRigToDaemonPatrols: %v", err)
+		}
+	})
+}
+
+func TestRemoveRigFromDaemonPatrols(t *testing.T) {
+	t.Parallel()
+
+	t.Run("removes rig from witness and refinery", func(t *testing.T) {
+		t.Parallel()
+		townRoot := t.TempDir()
+		mayorDir := filepath.Join(townRoot, "mayor")
+		if err := os.MkdirAll(mayorDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		daemonJSON := `{
+  "type": "daemon-patrol-config",
+  "version": 1,
+  "patrols": {
+    "witness": {"enabled": true, "rigs": ["gastown", "beads", "myrig"]},
+    "refinery": {"enabled": true, "rigs": ["gastown", "beads", "myrig"]},
+    "deacon": {"enabled": true}
+  }
+}`
+		if err := os.WriteFile(filepath.Join(mayorDir, "daemon.json"), []byte(daemonJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := RemoveRigFromDaemonPatrols(townRoot, "beads"); err != nil {
+			t.Fatalf("RemoveRigFromDaemonPatrols: %v", err)
+		}
+
+		cfg, err := LoadDaemonPatrolConfig(DaemonPatrolConfigPath(townRoot))
+		if err != nil {
+			t.Fatalf("LoadDaemonPatrolConfig: %v", err)
+		}
+
+		witness := cfg.Patrols["witness"]
+		if len(witness.Rigs) != 2 || witness.Rigs[0] != "gastown" || witness.Rigs[1] != "myrig" {
+			t.Errorf("witness rigs = %v, want [gastown myrig]", witness.Rigs)
+		}
+
+		refinery := cfg.Patrols["refinery"]
+		if len(refinery.Rigs) != 2 || refinery.Rigs[0] != "gastown" || refinery.Rigs[1] != "myrig" {
+			t.Errorf("refinery rigs = %v, want [gastown myrig]", refinery.Rigs)
+		}
+	})
+
+	t.Run("no-op when rig not present", func(t *testing.T) {
+		t.Parallel()
+		townRoot := t.TempDir()
+		mayorDir := filepath.Join(townRoot, "mayor")
+		if err := os.MkdirAll(mayorDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		daemonJSON := `{
+  "type": "daemon-patrol-config",
+  "version": 1,
+  "patrols": {
+    "witness": {"enabled": true, "rigs": ["gastown"]},
+    "refinery": {"enabled": true, "rigs": ["gastown"]}
+  }
+}`
+		if err := os.WriteFile(filepath.Join(mayorDir, "daemon.json"), []byte(daemonJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := RemoveRigFromDaemonPatrols(townRoot, "nonexistent"); err != nil {
+			t.Fatalf("RemoveRigFromDaemonPatrols: %v", err)
+		}
+
+		cfg, err := LoadDaemonPatrolConfig(DaemonPatrolConfigPath(townRoot))
+		if err != nil {
+			t.Fatalf("LoadDaemonPatrolConfig: %v", err)
+		}
+
+		witness := cfg.Patrols["witness"]
+		if len(witness.Rigs) != 1 || witness.Rigs[0] != "gastown" {
+			t.Errorf("witness rigs = %v, want [gastown]", witness.Rigs)
+		}
+	})
+
+	t.Run("preserves dolt_server fields", func(t *testing.T) {
+		t.Parallel()
+		townRoot := t.TempDir()
+		mayorDir := filepath.Join(townRoot, "mayor")
+		if err := os.MkdirAll(mayorDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		daemonJSON := `{
+  "type": "daemon-patrol-config",
+  "version": 1,
+  "patrols": {
+    "dolt_server": {"enabled": true, "port": 3307, "host": "127.0.0.1"},
+    "witness": {"enabled": true, "rigs": ["gastown", "beads"]},
+    "refinery": {"enabled": true, "rigs": ["gastown", "beads"]}
+  }
+}`
+		path := filepath.Join(mayorDir, "daemon.json")
+		if err := os.WriteFile(path, []byte(daemonJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := RemoveRigFromDaemonPatrols(townRoot, "beads"); err != nil {
+			t.Fatalf("RemoveRigFromDaemonPatrols: %v", err)
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatal(err)
+		}
+
+		var patrols map[string]json.RawMessage
+		if err := json.Unmarshal(raw["patrols"], &patrols); err != nil {
+			t.Fatal(err)
+		}
+
+		var doltServer map[string]interface{}
+		if err := json.Unmarshal(patrols["dolt_server"], &doltServer); err != nil {
+			t.Fatal(err)
+		}
+
+		if doltServer["port"].(float64) != 3307 {
+			t.Errorf("dolt_server port = %v, want 3307", doltServer["port"])
+		}
+	})
+
+	t.Run("no-op when daemon.json missing", func(t *testing.T) {
+		t.Parallel()
+		townRoot := t.TempDir()
+
+		if err := RemoveRigFromDaemonPatrols(townRoot, "beads"); err != nil {
+			t.Fatalf("RemoveRigFromDaemonPatrols: %v", err)
+		}
+	})
+
+	t.Run("no-op when no patrols section", func(t *testing.T) {
+		t.Parallel()
+		townRoot := t.TempDir()
+		mayorDir := filepath.Join(townRoot, "mayor")
+		if err := os.MkdirAll(mayorDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		daemonJSON := `{"type": "daemon-patrol-config", "version": 1}`
+		if err := os.WriteFile(filepath.Join(mayorDir, "daemon.json"), []byte(daemonJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := RemoveRigFromDaemonPatrols(townRoot, "beads"); err != nil {
+			t.Fatalf("RemoveRigFromDaemonPatrols: %v", err)
+		}
+	})
+
+	t.Run("roundtrip add then remove", func(t *testing.T) {
+		t.Parallel()
+		townRoot := t.TempDir()
+		mayorDir := filepath.Join(townRoot, "mayor")
+		if err := os.MkdirAll(mayorDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		daemonJSON := `{
+  "type": "daemon-patrol-config",
+  "version": 1,
+  "patrols": {
+    "witness": {"enabled": true, "rigs": ["gastown"]},
+    "refinery": {"enabled": true, "rigs": ["gastown"]}
+  }
+}`
+		if err := os.WriteFile(filepath.Join(mayorDir, "daemon.json"), []byte(daemonJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Add a rig
+		if err := AddRigToDaemonPatrols(townRoot, "newrig"); err != nil {
+			t.Fatalf("AddRigToDaemonPatrols: %v", err)
+		}
+
+		// Remove it
+		if err := RemoveRigFromDaemonPatrols(townRoot, "newrig"); err != nil {
+			t.Fatalf("RemoveRigFromDaemonPatrols: %v", err)
+		}
+
+		cfg, err := LoadDaemonPatrolConfig(DaemonPatrolConfigPath(townRoot))
+		if err != nil {
+			t.Fatalf("LoadDaemonPatrolConfig: %v", err)
+		}
+
+		witness := cfg.Patrols["witness"]
+		if len(witness.Rigs) != 1 || witness.Rigs[0] != "gastown" {
+			t.Errorf("witness rigs = %v, want [gastown]", witness.Rigs)
+		}
+
+		refinery := cfg.Patrols["refinery"]
+		if len(refinery.Rigs) != 1 || refinery.Rigs[0] != "gastown" {
+			t.Errorf("refinery rigs = %v, want [gastown]", refinery.Rigs)
 		}
 	})
 }
@@ -3881,6 +4143,61 @@ func TestBuildStartupCommandWithAgentOverride_SetsGTAgent(t *testing.T) {
 	}
 }
 
+func TestBuildStartupCommandWithAgentOverride_SetsGTProcessNames(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	// Create necessary config files
+	townSettings := NewTownSettings()
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd, err := BuildStartupCommandWithAgentOverride(
+		map[string]string{"GT_ROLE": constants.RoleWitness},
+		rigPath,
+		"",
+		"gemini",
+	)
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
+	}
+
+	// Should include GT_PROCESS_NAMES with gemini's process names
+	if !strings.Contains(cmd, "GT_PROCESS_NAMES=gemini") {
+		t.Errorf("expected GT_PROCESS_NAMES=gemini in command, got: %q", cmd)
+	}
+}
+
+func TestBuildStartupCommand_SetsGTProcessNames(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	townSettings := NewTownSettings()
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd := BuildStartupCommand(
+		map[string]string{"GT_ROLE": constants.RoleWitness},
+		rigPath,
+		"",
+	)
+
+	// Default agent is claude — GT_PROCESS_NAMES should include node,claude
+	if !strings.Contains(cmd, "GT_PROCESS_NAMES=") {
+		t.Errorf("expected GT_PROCESS_NAMES in command, got: %q", cmd)
+	}
+}
+
 // TestBuildStartupCommandWithAgentOverride_UsesOverrideWhenNoTownRoot tests that
 // agentOverride is respected even when findTownRootFromCwd fails.
 // This is a regression test for the bug where `gt deacon start --agent codex`
@@ -3955,10 +4272,10 @@ func TestBuildStartupCommandWithAgentOverride_GTAgentFromResolvedAgent(t *testin
 		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
 	}
 
-	// GT_AGENT should be set from the resolved agent name (default: "claude")
-	// so that IsAgentAlive can detect the running process correctly.
+	// GT_AGENT should be set from the resolved agent for liveness detection,
+	// even when no explicit override is used.
 	if !strings.Contains(cmd, "GT_AGENT=") {
-		t.Errorf("expected GT_AGENT in command from resolved agent, got: %q", cmd)
+		t.Errorf("expected GT_AGENT in command for liveness detection, got: %q", cmd)
 	}
 }
 

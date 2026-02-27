@@ -70,9 +70,10 @@ type SessionStartOptions struct {
 	// If set, this is injected as an environment variable.
 	RuntimeConfigDir string
 
-	// DoltBranch is the polecat-specific Dolt branch for write isolation.
-	// If set, BD_BRANCH env var is injected into the polecat session.
-	DoltBranch string
+	// Agent is the agent override for this polecat session (e.g., "codex", "gemini").
+	// If set, GT_AGENT is written to the tmux session environment table so that
+	// IsAgentAlive and waitForPolecatReady read the correct process names.
+	Agent string
 }
 
 // SessionInfo contains information about a running polecat session.
@@ -220,11 +221,25 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		}
 	}
 
-	// Use ResolveRoleAgentConfig instead of deprecated LoadRuntimeConfig to properly
-	// resolve role_agents from town settings. This ensures EnsureSettingsForRole
-	// creates the correct settings/plugin for the configured agent (e.g., opencode).
+	// Resolve runtime config for the agent that will actually run in this session.
+	// When an explicit --agent override is provided (e.g., "codex"), use it to resolve
+	// the correct agent config. Without this, ResolveRoleAgentConfig returns the default
+	// role agent (usually Claude), causing WaitForRuntimeReady to poll for the wrong
+	// prompt prefix and all fallback/nudge logic to use incorrect agent capabilities.
+	// This was the root cause of gt-1j3m: Codex polecats sat idle because the startup
+	// sequence used Claude's ReadyPromptPrefix ("❯ ") to detect readiness in a Codex
+	// session, timing out instead of using Codex's delay-based readiness.
 	townRoot := filepath.Dir(m.rig.Path)
-	runtimeConfig := config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
+	var runtimeConfig *config.RuntimeConfig
+	if opts.Agent != "" {
+		rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, opts.Agent)
+		if err != nil {
+			return fmt.Errorf("resolving agent config for %s: %w", opts.Agent, err)
+		}
+		runtimeConfig = rc
+	} else {
+		runtimeConfig = config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
+	}
 
 	// Ensure runtime settings exist in the shared polecats parent directory.
 	// Settings are passed to Claude Code via --settings flag.
@@ -252,16 +267,24 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 	command := opts.Command
 	if command == "" {
-		command = config.BuildPolecatStartupCommand(m.rig.Name, polecat, m.rig.Path, beacon)
+		var err error
+		command, err = config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
+			Role:        "polecat",
+			Rig:         m.rig.Name,
+			AgentName:   polecat,
+			TownRoot:    townRoot,
+			Prompt:      beacon,
+			Issue:       opts.Issue,
+			Topic:       "assigned",
+			SessionName: sessionID,
+		}, m.rig.Path, beacon, "")
+		if err != nil {
+			return fmt.Errorf("building startup command: %w", err)
+		}
 	}
 	// Prepend runtime config dir env if needed
 	if runtimeConfig.Session != nil && runtimeConfig.Session.ConfigDirEnv != "" && opts.RuntimeConfigDir != "" {
 		command = config.PrependEnv(command, map[string]string{runtimeConfig.Session.ConfigDirEnv: opts.RuntimeConfigDir})
-	}
-
-	// Branch-per-polecat: inject BD_BRANCH into startup command
-	if opts.DoltBranch != "" {
-		command = config.PrependEnv(command, map[string]string{"BD_BRANCH": opts.DoltBranch})
 	}
 
 	// Disable Dolt auto-commit for polecats to prevent manifest contention
@@ -308,9 +331,21 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		AgentName:        polecat,
 		TownRoot:         townRoot,
 		RuntimeConfigDir: opts.RuntimeConfigDir,
+		Agent:            opts.Agent,
 	})
 	for k, v := range envVars {
 		debugSession("SetEnvironment "+k, m.tmux.SetEnvironment(sessionID, k, v))
+	}
+
+	// Fallback: set GT_AGENT from resolved config when no explicit --agent override.
+	// AgentEnv only emits GT_AGENT when opts.Agent is non-empty (explicit override).
+	// Without this fallback, the default path (no --agent flag) leaves GT_AGENT
+	// unset in the tmux session table, causing the validation below to fail and
+	// kill the session. BuildStartupCommand sets GT_AGENT in process env via
+	// exec env, but tmux show-environment reads the session table, not process env.
+	// This mirrors the daemon's compensating logic (daemon.go ~line 1593-1595).
+	if _, hasGTAgent := envVars["GT_AGENT"]; !hasGTAgent && runtimeConfig.ResolvedAgent != "" {
+		debugSession("SetEnvironment GT_AGENT (resolved)", m.tmux.SetEnvironment(sessionID, "GT_AGENT", runtimeConfig.ResolvedAgent))
 	}
 
 	// Set GT_BRANCH and GT_POLECAT_PATH in tmux session environment.
@@ -321,23 +356,15 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	debugSession("SetEnvironment GT_POLECAT_PATH", m.tmux.SetEnvironment(sessionID, "GT_POLECAT_PATH", workDir))
 	debugSession("SetEnvironment GT_TOWN_ROOT", m.tmux.SetEnvironment(sessionID, "GT_TOWN_ROOT", townRoot))
 
-	// Branch-per-polecat: set BD_BRANCH in tmux session environment
-	// This ensures respawned processes also inherit the branch setting.
-	if opts.DoltBranch != "" {
-		debugSession("SetEnvironment BD_BRANCH", m.tmux.SetEnvironment(sessionID, "BD_BRANCH", opts.DoltBranch))
-	}
-
 	// Disable Dolt auto-commit in tmux session environment (gt-5cc2p).
 	// This ensures respawned processes also inherit the setting.
 	debugSession("SetEnvironment BD_DOLT_AUTO_COMMIT", m.tmux.SetEnvironment(sessionID, "BD_DOLT_AUTO_COMMIT", "off"))
 
-	// Set GT_AGENT in tmux session environment so IsAgentAlive can detect
-	// the running process. BuildStartupCommand sets it via exec env (process env),
-	// but IsAgentAlive reads from tmux show-environment (session env).
-	if runtimeConfig.ResolvedAgent != "" {
-		debugSession("SetEnvironment GT_AGENT", m.tmux.SetEnvironment(sessionID, "GT_AGENT", runtimeConfig.ResolvedAgent))
-	}
-
+	// Set GT_PROCESS_NAMES for accurate liveness detection. Custom agents may
+	// shadow built-in preset names (e.g., custom "codex" running "opencode"),
+	// so we resolve process names from both agent name and actual command.
+	processNames := config.ResolveProcessNames(runtimeConfig.ResolvedAgent, runtimeConfig.Command)
+	debugSession("SetEnvironment GT_PROCESS_NAMES", m.tmux.SetEnvironment(sessionID, "GT_PROCESS_NAMES", strings.Join(processNames, ",")))
 	// Hook the issue to the polecat if provided via --issue flag
 	if opts.Issue != "" {
 		agentID := fmt.Sprintf("%s/polecats/%s", m.rig.Name, polecat)
@@ -357,11 +384,13 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// Wait for Claude to start (non-fatal)
 	debugSession("WaitForCommand", m.tmux.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout))
 
-	// Accept bypass permissions warning dialog if it appears
-	debugSession("AcceptBypassPermissionsWarning", m.tmux.AcceptBypassPermissionsWarning(sessionID))
+	// Accept startup dialogs (workspace trust + bypass permissions) if they appear
+	debugSession("AcceptStartupDialogs", m.tmux.AcceptStartupDialogs(sessionID))
 
-	// Wait for runtime to be fully ready at the prompt (not just started)
-	runtime.SleepForReadyDelay(runtimeConfig)
+	// Wait for runtime to be fully ready at the prompt (not just started).
+	// Uses prompt-based polling for agents with ReadyPromptPrefix (e.g., Claude "❯ "),
+	// falling back to ReadyDelayMs sleep for agents without prompt detection.
+	debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout))
 
 	// Handle fallback nudges for non-hook agents.
 	// See StartupFallbackInfo in runtime package for the fallback matrix.
@@ -376,14 +405,23 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		}
 
 		if fallbackInfo.StartupNudgeDelayMs > 0 {
-			// Wait for agent to run gt prime before sending work instructions
-			time.Sleep(time.Duration(fallbackInfo.StartupNudgeDelayMs) * time.Millisecond)
+			// Wait for agent to finish processing beacon + gt prime before sending work instructions.
+			// Uses prompt-based detection where available; falls back to max(ReadyDelayMs, StartupNudgeDelayMs).
+			primeWaitRC := runtime.RuntimeConfigWithMinDelay(runtimeConfig, fallbackInfo.StartupNudgeDelayMs)
+			debugSession("WaitForPrimeReady", m.tmux.WaitForRuntimeReady(sessionID, primeWaitRC, constants.ClaudeStartTimeout))
 		}
 
 		if fallbackInfo.SendStartupNudge {
 			// Send work instructions via nudge
 			debugSession("SendStartupNudge", m.tmux.NudgeSession(sessionID, runtime.StartupNudgeContent()))
 		}
+	}
+
+	// Verify startup nudge was delivered: poll for idle prompt and retry if lost.
+	// This fixes the Mode B race where the nudge arrives before Claude Code is ready,
+	// causing the polecat to sit idle at an empty prompt. See GH#1379.
+	if fallbackInfo.SendStartupNudge {
+		m.verifyStartupNudgeDelivery(sessionID, runtimeConfig)
 	}
 
 	// Legacy fallback for other startup paths (non-fatal)
@@ -680,6 +718,58 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 		return fmt.Errorf("%w: %s is tombstoned", ErrIssueInvalid, issueID)
 	}
 	return nil
+}
+
+// verifyStartupNudgeDelivery checks if the polecat started working after the
+// startup nudge and retries the nudge if the agent is still idle at its prompt.
+// This fixes the Mode B race condition (GH#1379) where the startup nudge arrives
+// before Claude Code is ready, causing the polecat to sit idle.
+//
+// The approach models ensureAgentReady (sling_helpers.go): after the nudge, wait
+// a verification delay, then check if the agent is at its idle prompt. If idle,
+// re-send the nudge and check again, up to StartupNudgeMaxRetries times.
+//
+// Non-fatal: if verification fails or times out, the session is left running.
+// The witness zombie patrol will eventually detect and handle truly idle polecats.
+func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config.RuntimeConfig) {
+	// Only verify for agents with prompt detection. Without ReadyPromptPrefix,
+	// we can't distinguish "idle at prompt" from "busy processing".
+	if rc == nil || rc.Tmux == nil || rc.Tmux.ReadyPromptPrefix == "" {
+		return
+	}
+
+	nudgeContent := runtime.StartupNudgeContent()
+
+	for attempt := 1; attempt <= constants.StartupNudgeMaxRetries; attempt++ {
+		// Wait for the agent to process the nudge before checking.
+		time.Sleep(constants.StartupNudgeVerifyDelay)
+
+		// Check if session is still alive
+		running, err := m.tmux.HasSession(sessionID)
+		if err != nil || !running {
+			return // Session died, nothing to verify
+		}
+
+		// If the agent is NOT at the prompt, it's working — nudge was received.
+		if !m.tmux.IsAtPrompt(sessionID, rc) {
+			return
+		}
+
+		// Agent is at the idle prompt — nudge was likely lost. Retry.
+		fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d: agent %s idle at prompt, retrying nudge\n",
+			attempt, constants.StartupNudgeMaxRetries, sessionID)
+		if err := m.tmux.NudgeSession(sessionID, nudgeContent); err != nil {
+			fmt.Fprintf(os.Stderr, "[startup-nudge] retry nudge failed for %s: %v\n", sessionID, err)
+			return
+		}
+	}
+
+	// If we exhausted retries and the agent is still idle, log a warning.
+	// The witness zombie patrol will handle this case.
+	if m.tmux.IsAtPrompt(sessionID, rc) {
+		fmt.Fprintf(os.Stderr, "[startup-nudge] WARNING: agent %s still idle after %d nudge retries\n",
+			sessionID, constants.StartupNudgeMaxRetries)
+	}
 }
 
 // hookIssue pins an issue to a polecat's hook using bd update.

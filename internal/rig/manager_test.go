@@ -351,7 +351,7 @@ func TestInitBeads_TrackedBeads_CreatesRedirect(t *testing.T) {
 	}
 
 	manager := &Manager{}
-	if err := manager.InitBeads(rigPath, "gt"); err != nil {
+	if err := manager.InitBeads(rigPath, "gt", ""); err != nil {
 		t.Fatalf("initBeads: %v", err)
 	}
 
@@ -400,7 +400,7 @@ exit 0
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	manager := &Manager{}
-	if err := manager.InitBeads(rigPath, "gt"); err != nil {
+	if err := manager.InitBeads(rigPath, "gt", ""); err != nil {
 		t.Fatalf("initBeads: %v", err)
 	}
 
@@ -443,7 +443,7 @@ exit 1
 	t.Setenv("BEADS_DIR_LOG", beadsDirLog)
 
 	manager := &Manager{}
-	if err := manager.InitBeads(rigPath, "gt"); err != nil {
+	if err := manager.InitBeads(rigPath, "gt", ""); err != nil {
 		t.Fatalf("initBeads: %v", err)
 	}
 
@@ -452,7 +452,7 @@ exit 1
 	if err != nil {
 		t.Fatalf("reading config.yaml: %v", err)
 	}
-	want := "prefix: gt\nissue-prefix: gt\n"
+	want := "prefix: gt\nissue-prefix: gt\nsync.mode: dolt-native\n"
 	if string(config) != want {
 		t.Fatalf("config.yaml = %q, want %q", string(config), want)
 	}
@@ -484,7 +484,7 @@ exit 0
 	t.Setenv("BD_CMD_LOG", cmdLog)
 
 	manager := &Manager{}
-	if err := manager.InitBeads(rigPath, "myrig"); err != nil {
+	if err := manager.InitBeads(rigPath, "myrig", ""); err != nil {
 		t.Fatalf("initBeads: %v", err)
 	}
 
@@ -498,6 +498,10 @@ exit 0
 	// Verify bd config set issue_prefix was called with the correct prefix
 	if !strings.Contains(cmds, "config set issue_prefix myrig") {
 		t.Errorf("expected 'bd config set issue_prefix myrig' in commands log, got:\n%s", cmds)
+	}
+	// Verify sync mode is explicitly set to dolt-native for new rig beads.
+	if !strings.Contains(cmds, "config set sync.mode dolt-native") {
+		t.Errorf("expected 'bd config set sync.mode dolt-native' in commands log, got:\n%s", cmds)
 	}
 }
 
@@ -555,13 +559,16 @@ case "$cmd" in
   config)
     # Accept config commands (e.g., "bd config set types.custom ...")
     ;;
+  init)
+    # Accept init commands (e.g., "bd init --prefix gt --server")
+    ;;
   *)
     echo "unexpected command: $cmd" >&2
     exit 1
     ;;
 esac
 `
-	windowsScript := "@echo off\r\nsetlocal enabledelayedexpansion\r\nif defined BEADS_DIR_LOG (\r\n  if defined BEADS_DIR (\r\n    echo %BEADS_DIR%>>\"%BEADS_DIR_LOG%\"\r\n  ) else (\r\n    echo ^<unset^> >>\"%BEADS_DIR_LOG%\"\r\n  )\r\n)\r\nset \"cmd=%1\"\r\nset \"arg2=%2\"\r\nset \"arg3=%3\"\r\nif \"%cmd%\"==\"--allow-stale\" (\r\n  set \"cmd=%2\"\r\n  set \"arg2=%3\"\r\n  set \"arg3=%4\"\r\n)\r\nif \"%cmd%\"==\"show\" (\r\n  echo []\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"create\" (\r\n  set \"id=\"\r\n  set \"title=\"\r\n  for %%A in (%*) do (\r\n    set \"arg=%%~A\"\r\n    if /i \"!arg:~0,5!\"==\"--id=\" set \"id=!arg:~5!\"\r\n    if /i \"!arg:~0,8!\"==\"--title=\" set \"title=!arg:~8!\"\r\n  )\r\n  if defined AGENT_LOG (\r\n    echo !id!>>\"%AGENT_LOG%\"\r\n  )\r\n  echo {\"id\":\"!id!\",\"title\":\"!title!\",\"description\":\"\",\"issue_type\":\"agent\"}\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"slot\" exit /b 0\r\nif \"%cmd%\"==\"config\" exit /b 0\r\nexit /b 1\r\n"
+	windowsScript := "@echo off\r\nsetlocal enabledelayedexpansion\r\nif defined BEADS_DIR_LOG (\r\n  if defined BEADS_DIR (\r\n    echo %BEADS_DIR%>>\"%BEADS_DIR_LOG%\"\r\n  ) else (\r\n    echo ^<unset^> >>\"%BEADS_DIR_LOG%\"\r\n  )\r\n)\r\nset \"cmd=%1\"\r\nset \"arg2=%2\"\r\nset \"arg3=%3\"\r\nif \"%cmd%\"==\"--allow-stale\" (\r\n  set \"cmd=%2\"\r\n  set \"arg2=%3\"\r\n  set \"arg3=%4\"\r\n)\r\nif \"%cmd%\"==\"show\" (\r\n  echo []\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"create\" (\r\n  set \"id=\"\r\n  set \"title=\"\r\n  for %%A in (%*) do (\r\n    set \"arg=%%~A\"\r\n    if /i \"!arg:~0,5!\"==\"--id=\" set \"id=!arg:~5!\"\r\n    if /i \"!arg:~0,8!\"==\"--title=\" set \"title=!arg:~8!\"\r\n  )\r\n  if defined AGENT_LOG (\r\n    echo !id!>>\"%AGENT_LOG%\"\r\n  )\r\n  echo {\"id\":\"!id!\",\"title\":\"!title!\",\"description\":\"\",\"issue_type\":\"agent\"}\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"slot\" exit /b 0\r\nif \"%cmd%\"==\"config\" exit /b 0\r\nif \"%cmd%\"==\"init\" exit /b 0\r\nexit /b 1\r\n"
 
 	binDir := writeFakeBD(t, script, windowsScript)
 	agentLog := filepath.Join(t.TempDir(), "agents.log")
@@ -659,7 +666,7 @@ func TestInitBeadsRejectsInvalidPrefix(t *testing.T) {
 
 	for _, prefix := range tests {
 		t.Run(prefix, func(t *testing.T) {
-			err := manager.InitBeads(rigPath, prefix)
+			err := manager.InitBeads(rigPath, prefix, "")
 			if err == nil {
 				t.Errorf("initBeads(%q) should have failed", prefix)
 			}
@@ -702,6 +709,11 @@ func TestDeriveBeadsPrefix(t *testing.T) {
 		{"myrig", "my"},
 		{"awesome", "aw"},
 		{"coolrig", "co"},
+
+		// camelCase names
+		{"myProject", "mp"},
+		{"gasStation", "gs"},
+		{"HTMLParser", "hp"},
 
 		// With language suffixes stripped
 		{"myproject-py", "my"},
@@ -755,6 +767,49 @@ func TestSplitCompoundWord(t *testing.T) {
 			for i := range got {
 				if got[i] != tt.want[i] {
 					t.Errorf("splitCompoundWord(%q)[%d] = %q, want %q", tt.word, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestSplitCamelCase(t *testing.T) {
+	tests := []struct {
+		word string
+		want []string
+	}{
+		// Basic camelCase
+		{"myProject", []string{"my", "Project"}},
+		{"gasStation", []string{"gas", "Station"}},
+
+		// PascalCase
+		{"MyProject", []string{"My", "Project"}},
+
+		// Uppercase runs
+		{"HTMLParser", []string{"HTML", "Parser"}},
+		{"parseJSON", []string{"parse", "JSON"}},
+
+		// No splits (single word, all lower)
+		{"gastown", []string{"gastown"}},
+		{"a", []string{"a"}},
+
+		// All uppercase (no lower transition)
+		{"AB", []string{"AB"}},
+
+		// Empty
+		{"", nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.word, func(t *testing.T) {
+			got := splitCamelCase(tt.word)
+			if len(got) != len(tt.want) {
+				t.Errorf("splitCamelCase(%q) = %v, want %v", tt.word, got, tt.want)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("splitCamelCase(%q)[%d] = %q, want %q", tt.word, i, got[i], tt.want[i])
 				}
 			}
 		})
@@ -857,78 +912,26 @@ func TestDetectBeadsPrefixFromConfig_TrailingDash(t *testing.T) {
 	}
 }
 
-func TestDetectBeadsPrefixFromConfig_FallbackIssuesJSONL(t *testing.T) {
-	tests := []struct {
-		name       string
-		issuesJSON string
-		want       string
-	}{
-		{
-			name:       "regular issue ID extracts prefix",
-			issuesJSON: `{"id":"gt-mawit","title":"test"}`,
-			want:       "gt",
-		},
-		{
-			name: "skips agent bead with multi-hyphen ID",
-			issuesJSON: `{"id":"gt-demo-witness","title":"agent"}
-{"id":"gt-abc12","title":"regular"}`,
-			want: "gt",
-		},
-		{
-			name:       "skips agent bead when only entry",
-			issuesJSON: `{"id":"gt-demo-witness","title":"agent"}`,
-			want:       "",
-		},
-		{
-			name:       "multi-hyphen prefix with regular hash",
-			issuesJSON: `{"id":"baseball-v3-abc12","title":"test"}`,
-			want:       "baseball-v3",
-		},
-		{
-			name: "multiple regular issues agree on prefix",
-			issuesJSON: `{"id":"gt-mawit","title":"a"}
-{"id":"gt-1nfip","title":"b"}
-{"id":"gt-6vvz1","title":"c"}`,
-			want: "gt",
-		},
-		{
-			name: "filters out merge request IDs (10-char suffix)",
-			issuesJSON: `{"id":"gt-mr-abc1234567","title":"mr"}
-{"id":"gt-mawit","title":"regular"}`,
-			want: "gt",
-		},
-		{
-			name:       "empty issues file returns empty",
-			issuesJSON: "",
-			want:       "",
-		},
-		{
-			name: "mixed agent and regular IDs returns correct prefix",
-			issuesJSON: `{"id":"gt-gastown-polecat-cheedo","title":"agent"}
-{"id":"gt-gastown-witness","title":"agent"}
-{"id":"gt-abc12","title":"regular"}
-{"id":"gt-xyz99","title":"regular"}`,
-			want: "gt",
-		},
+func TestDetectBeadsPrefixFromConfig_NoFallbackToJSONL(t *testing.T) {
+	// Verify that detectBeadsPrefixFromConfig does NOT fall back to issues.jsonl.
+	// Gastown requires Dolt server — JSONL is not a supported data source.
+	dir := t.TempDir()
+
+	// Write config.yaml without a prefix key
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("# no prefix\n"), 0644); err != nil {
+		t.Fatalf("writing config.yaml: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			dir := t.TempDir()
-			// Write config.yaml without a prefix key to trigger fallback
-			configPath := filepath.Join(dir, "config.yaml")
-			if err := os.WriteFile(configPath, []byte("# no prefix\n"), 0644); err != nil {
-				t.Fatalf("writing config.yaml: %v", err)
-			}
-			issuesPath := filepath.Join(dir, "issues.jsonl")
-			if err := os.WriteFile(issuesPath, []byte(tt.issuesJSON), 0644); err != nil {
-				t.Fatalf("writing issues.jsonl: %v", err)
-			}
-			got := detectBeadsPrefixFromConfig(configPath)
-			if got != tt.want {
-				t.Errorf("detectBeadsPrefixFromConfig() = %q, want %q", got, tt.want)
-			}
-		})
+	// Write issues.jsonl with valid data — should be ignored
+	issuesPath := filepath.Join(dir, "issues.jsonl")
+	if err := os.WriteFile(issuesPath, []byte(`{"id":"gt-mawit","title":"test"}`), 0644); err != nil {
+		t.Fatalf("writing issues.jsonl: %v", err)
+	}
+
+	got := detectBeadsPrefixFromConfig(configPath)
+	if got != "" {
+		t.Errorf("detectBeadsPrefixFromConfig() = %q, want empty (should not read issues.jsonl)", got)
 	}
 }
 

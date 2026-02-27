@@ -10,11 +10,11 @@ import (
 // setupDoltDB creates a fake Dolt database directory under .dolt-data/.
 func setupDoltDB(t *testing.T, townRoot, dbName string) {
 	t.Helper()
-	doltDir := filepath.Join(townRoot, ".dolt-data", dbName, ".dolt")
-	if err := os.MkdirAll(doltDir, 0755); err != nil {
-		t.Fatalf("creating dolt dir for %s: %v", dbName, err)
+	nomsDir := filepath.Join(townRoot, ".dolt-data", dbName, ".dolt", "noms")
+	if err := os.MkdirAll(nomsDir, 0755); err != nil {
+		t.Fatalf("creating noms dir for %s: %v", dbName, err)
 	}
-	if err := os.WriteFile(filepath.Join(doltDir, "manifest"), []byte("test"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(nomsDir, "manifest"), []byte("test"), 0644); err != nil {
 		t.Fatalf("writing manifest for %s: %v", dbName, err)
 	}
 }
@@ -35,7 +35,6 @@ func setupRigMetadata(t *testing.T, townRoot, rigName, doltDatabase string) {
 		"backend":       "dolt",
 		"dolt_mode":     "server",
 		"dolt_database": doltDatabase,
-		"jsonl_export":  "issues.jsonl",
 	}
 	data, err := json.Marshal(meta)
 	if err != nil {
@@ -56,7 +55,6 @@ func setupServerMetadata(t *testing.T, beadsDir, host string, port int) {
 		"backend":       "dolt",
 		"dolt_mode":     "server",
 		"dolt_database": "test",
-		"jsonl_export":  "issues.jsonl",
 	}
 	if host != "" {
 		meta["dolt_server_host"] = host
@@ -297,3 +295,4 @@ func TestDoltOrphanedDatabaseCheck_Name(t *testing.T) {
 		t.Errorf("expected name 'dolt-orphaned-databases', got %q", check.Name())
 	}
 }
+

@@ -13,6 +13,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
@@ -694,10 +695,9 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		AgentName:        name,
 		TownRoot:         townRoot,
 		RuntimeConfigDir: opts.ClaudeConfigDir,
+		Agent:            opts.AgentOverride,
 	})
-	if opts.AgentOverride != "" {
-		envVars["GT_AGENT"] = opts.AgentOverride
-	}
+	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 
 	// Build startup command (also includes env vars via 'exec env' for
 	// WaitForCommand detection — belt and suspenders with -e flags)
@@ -750,7 +750,15 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 			Sender:    "human",
 			Topic:     topic,
 		})
-		claudeCmd, err = config.BuildCrewStartupCommandWithAgentOverride(m.rig.Name, name, m.rig.Path, beacon, opts.AgentOverride)
+		claudeCmd, err = config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
+			Role:        "crew",
+			Rig:         m.rig.Name,
+			AgentName:   name,
+			TownRoot:    townRoot,
+			Prompt:      beacon,
+			Topic:       topic,
+			SessionName: m.SessionName(name),
+		}, m.rig.Path, beacon, opts.AgentOverride)
 		if err != nil {
 			return fmt.Errorf("building startup command: %w", err)
 		}
@@ -809,10 +817,27 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
 	_ = session.TrackSessionPID(townRoot, sessionID, t)
 
-	// Note: We intentionally don't wait for the agent to start here.
-	// The session is created in detached mode, and blocking for 60 seconds
-	// serves no purpose. If the caller needs to know when the agent is ready,
-	// they can check with IsAgentAlive().
+	// Wait for the agent to start, then accept the bypass permissions warning
+	// dialog if it appears. Without this, crew sessions get stuck on the
+	// "Bypass Permissions mode" confirmation dialog.
+	if !opts.Interactive {
+		agentName := opts.AgentOverride
+		if agentName == "" {
+			if rc := config.ResolveRoleAgentConfig("crew", townRoot, m.rig.Path); rc != nil && rc.Provider != "" {
+				agentName = rc.Provider
+			} else {
+				agentName = "claude"
+			}
+		}
+		preset := config.GetAgentPresetByName(agentName)
+		if preset != nil && preset.EmitsPermissionWarning {
+			if err := t.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
+				// Non-fatal — agent might still start
+				style.PrintWarning("timeout waiting for agent to start: %v", err)
+			}
+			_ = t.AcceptStartupDialogs(sessionID)
+		}
+	}
 
 	return nil
 }

@@ -19,9 +19,9 @@ import (
 
 // Synthesis command flags
 var (
-	synthesisRig     string
-	synthesisDryRun  bool
-	synthesisForce   bool
+	synthesisRig      string
+	synthesisDryRun   bool
+	synthesisForce    bool
 	synthesisReviewID string
 )
 
@@ -121,7 +121,7 @@ type ConvoyMeta struct {
 	ID          string   `json:"id"`
 	Title       string   `json:"title"`
 	Status      string   `json:"status"`
-	Formula     string   `json:"formula,omitempty"`     // Formula name
+	Formula     string   `json:"formula,omitempty"`      // Formula name
 	FormulaPath string   `json:"formula_path,omitempty"` // Path to formula file
 	ReviewID    string   `json:"review_id,omitempty"`    // Review ID for output paths
 	LegIssues   []string `json:"leg_issues,omitempty"`   // Tracked leg issue IDs
@@ -590,9 +590,9 @@ func createSynthesisBead(convoyID string, meta *ConvoyMeta, f *formula.Formula,
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		// Try to extract ID from non-JSON output
+		// Try to extract ID from non-JSON output (bead IDs have format: prefix-id)
 		out := strings.TrimSpace(stdout.String())
-		if strings.HasPrefix(out, "hq-") || strings.HasPrefix(out, "gt-") {
+		if looksLikeIssueID(out) {
 			return out, nil
 		}
 		return "", fmt.Errorf("parsing created bead: %w", err)

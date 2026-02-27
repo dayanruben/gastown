@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -27,10 +28,10 @@ import (
 	"github.com/steveyegge/gastown/internal/feed"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mayor"
-	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/wisp"
@@ -51,8 +52,9 @@ type Daemon struct {
 	curator       *feed.Curator
 	convoyManager *ConvoyManager
 	beadsStores   map[string]beadsdk.Storage
-	doltServer    *DoltServerManager
-	krcPruner     *KRCPruner
+	doltServer     *DoltServerManager
+	doltTestServer *DoltServerManager
+	krcPruner      *KRCPruner
 
 	// Mass death detection: track recent session deaths
 	deathsMu     sync.Mutex
@@ -75,6 +77,20 @@ type Daemon struct {
 
 	// Restart tracking with exponential backoff to prevent crash loops
 	restartTracker *RestartTracker
+
+	// telemetry exports metrics and logs to VictoriaMetrics / VictoriaLogs.
+	// Nil when telemetry is disabled (GT_OTEL_METRICS_URL / GT_OTEL_LOGS_URL not set).
+	otelProvider *telemetry.Provider
+	metrics      *daemonMetrics
+
+	// jsonlPushFailures tracks consecutive git push failures for JSONL backup.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	jsonlPushFailures int
+
+	// lastDoctorMolTime tracks when the last mol-dog-doctor molecule was poured.
+	// Option B throttling: only pour when anomaly detected AND cooldown elapsed.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	lastDoctorMolTime time.Time
 }
 
 // sessionDeath records a detected session death for mass death analysis.
@@ -94,6 +110,12 @@ const (
 	// (process exists) but not making progress (infinite loop, stuck API
 	// call, etc.). Conservative: 30 minutes. See: gt-tr3d
 	hungSessionThreshold = 30 * time.Minute
+
+	// doctorMolCooldown is the minimum interval between mol-dog-doctor molecules.
+	// Option B throttling: health checks run every 30s, but we only pour a
+	// molecule when anomalies are detected, with this cooldown to avoid spamming.
+	// 5 minutes = max 288 wisps/day vs ~2880 without throttling.
+	doctorMolCooldown = 5 * time.Minute
 )
 
 // New creates a new daemon instance.
@@ -113,13 +135,20 @@ func New(config *Config) (*Daemon, error) {
 	logger := log.New(logFile, "", log.LstdFlags)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Initialize session prefix registry from rigs.json.
-	_ = session.InitRegistry(config.TownRoot)
+	// Initialize session prefix and agent registries from town root.
+	if err := session.InitRegistry(config.TownRoot); err != nil {
+		logger.Printf("Warning: failed to initialize town registry: %v", err)
+	}
 
 	// Load patrol config from mayor/daemon.json (optional - nil if missing)
 	patrolConfig := LoadPatrolConfig(config.TownRoot)
 	if patrolConfig != nil {
 		logger.Printf("Loaded patrol config from %s", PatrolConfigFile(config.TownRoot))
+		// Propagate env vars from daemon.json to this process and all spawned sessions.
+		for k, v := range patrolConfig.Env {
+			os.Setenv(k, v)
+			logger.Printf("Set env %s=%s from daemon.json", k, v)
+		}
 	}
 
 	// Initialize Dolt server manager if configured
@@ -128,6 +157,15 @@ func New(config *Config) (*Daemon, error) {
 		doltServer = NewDoltServerManager(config.TownRoot, patrolConfig.Patrols.DoltServer, logger.Printf)
 		if doltServer.IsEnabled() {
 			logger.Printf("Dolt server management enabled (port %d)", patrolConfig.Patrols.DoltServer.Port)
+		}
+	}
+
+	// Initialize Dolt TEST server manager if configured (dedicated test server, e.g., port 3308)
+	var doltTestServer *DoltServerManager
+	if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.DoltTestServer != nil {
+		doltTestServer = NewDoltServerManager(config.TownRoot, patrolConfig.Patrols.DoltTestServer, logger.Printf)
+		if doltTestServer.IsEnabled() {
+			logger.Printf("Dolt TEST server management enabled (port %d)", patrolConfig.Patrols.DoltTestServer.Port)
 		}
 	}
 
@@ -149,6 +187,32 @@ func New(config *Config) (*Daemon, error) {
 		logger.Printf("Warning: failed to load restart state: %v", err)
 	}
 
+	// Initialize OpenTelemetry (best-effort — telemetry failure never blocks startup).
+	// Activate by setting GT_OTEL_METRICS_URL and/or GT_OTEL_LOGS_URL.
+	otelProvider, otelErr := telemetry.Init(ctx, "gastown-daemon", "")
+	if otelErr != nil {
+		logger.Printf("Warning: telemetry init failed: %v", otelErr)
+	}
+	var dm *daemonMetrics
+	if otelProvider != nil {
+		dm, err = newDaemonMetrics()
+		if err != nil {
+			logger.Printf("Warning: failed to register daemon metrics: %v", err)
+			dm = nil
+		} else {
+			metricsURL := os.Getenv(telemetry.EnvMetricsURL)
+			if metricsURL == "" {
+				metricsURL = telemetry.DefaultMetricsURL
+			}
+			logsURL := os.Getenv(telemetry.EnvLogsURL)
+			if logsURL == "" {
+				logsURL = telemetry.DefaultLogsURL
+			}
+			logger.Printf("Telemetry active (metrics → %s, logs → %s)",
+				metricsURL, logsURL)
+		}
+	}
+
 	return &Daemon{
 		config:         config,
 		patrolConfig:   patrolConfig,
@@ -157,9 +221,12 @@ func New(config *Config) (*Daemon, error) {
 		ctx:            ctx,
 		cancel:         cancel,
 		doltServer:     doltServer,
+		doltTestServer: doltTestServer,
 		gtPath:         gtPath,
 		bdPath:         bdPath,
 		restartTracker: restartTracker,
+		otelProvider:   otelProvider,
+		metrics:        dm,
 	}, nil
 }
 
@@ -190,8 +257,7 @@ func (d *Daemon) Run() error {
 	}
 
 	// Repair metadata.json for all rigs on startup.
-	// This auto-fixes stale jsonl_export values (e.g., "beads.jsonl" → "issues.jsonl")
-	// left behind by historical migrations.
+	// This ensures all rigs have proper Dolt server configuration.
 	if _, errs := doltserver.EnsureAllMetadata(d.config.TownRoot); len(errs) > 0 {
 		for _, e := range errs {
 			d.logger.Printf("Warning: metadata repair: %v", e)
@@ -278,6 +344,19 @@ func (d *Daemon) Run() error {
 		d.logger.Printf("Dolt health check ticker started (interval %v)", interval)
 	}
 
+	// Start dedicated Dolt TEST server health check ticker if configured.
+	// Monitors the shared test server (e.g., port 3308) so all `go test`
+	// invocations share one server instead of spawning their own.
+	var doltTestHealthTicker *time.Ticker
+	var doltTestHealthChan <-chan time.Time
+	if d.doltTestServer != nil && d.doltTestServer.IsEnabled() {
+		interval := d.doltTestServer.HealthCheckInterval()
+		doltTestHealthTicker = time.NewTicker(interval)
+		doltTestHealthChan = doltTestHealthTicker.C
+		defer doltTestHealthTicker.Stop()
+		d.logger.Printf("Dolt TEST health check ticker started (interval %v)", interval)
+	}
+
 	// Start dedicated Dolt remotes push ticker if configured.
 	// This runs at a lower frequency (default 15 min) than the heartbeat (3 min)
 	// to periodically push databases to their git remotes.
@@ -289,6 +368,66 @@ func (d *Daemon) Run() error {
 		doltRemotesChan = doltRemotesTicker.C
 		defer doltRemotesTicker.Stop()
 		d.logger.Printf("Dolt remotes push ticker started (interval %v)", interval)
+	}
+
+	// Start dedicated Dolt backup ticker if configured.
+	// Runs filesystem backup sync (dolt backup sync) for production databases.
+	var doltBackupTicker *time.Ticker
+	var doltBackupChan <-chan time.Time
+	if IsPatrolEnabled(d.patrolConfig, "dolt_backup") {
+		interval := doltBackupInterval(d.patrolConfig)
+		doltBackupTicker = time.NewTicker(interval)
+		doltBackupChan = doltBackupTicker.C
+		defer doltBackupTicker.Stop()
+		d.logger.Printf("Dolt backup ticker started (interval %v)", interval)
+	}
+
+	// Start JSONL git backup ticker if configured.
+	// Exports issues to JSONL, scrubs ephemeral data, pushes to git repo.
+	var jsonlGitBackupTicker *time.Ticker
+	var jsonlGitBackupChan <-chan time.Time
+	if IsPatrolEnabled(d.patrolConfig, "jsonl_git_backup") {
+		interval := jsonlGitBackupInterval(d.patrolConfig)
+		jsonlGitBackupTicker = time.NewTicker(interval)
+		jsonlGitBackupChan = jsonlGitBackupTicker.C
+		defer jsonlGitBackupTicker.Stop()
+		d.logger.Printf("JSONL git backup ticker started (interval %v)", interval)
+	}
+
+	// Start wisp reaper ticker if configured.
+	// Closes stale wisps (abandoned molecule steps, old patrol data) across all databases.
+	var wispReaperTicker *time.Ticker
+	var wispReaperChan <-chan time.Time
+	if IsPatrolEnabled(d.patrolConfig, "wisp_reaper") {
+		interval := wispReaperInterval(d.patrolConfig)
+		wispReaperTicker = time.NewTicker(interval)
+		wispReaperChan = wispReaperTicker.C
+		defer wispReaperTicker.Stop()
+		d.logger.Printf("Wisp reaper ticker started (interval %v)", interval)
+	}
+
+	// Start doctor dog ticker if configured.
+	// Health monitor: TCP check, latency, DB count, gc, zombie detection, backup/disk checks.
+	var doctorDogTicker *time.Ticker
+	var doctorDogChan <-chan time.Time
+	if IsPatrolEnabled(d.patrolConfig, "doctor_dog") {
+		interval := doctorDogInterval(d.patrolConfig)
+		doctorDogTicker = time.NewTicker(interval)
+		doctorDogChan = doctorDogTicker.C
+		defer doctorDogTicker.Stop()
+		d.logger.Printf("Doctor dog ticker started (interval %v)", interval)
+	}
+
+	// Start janitor dog ticker if configured.
+	// Cleans up orphan test databases on the test server (port 3308).
+	var janitorDogTicker *time.Ticker
+	var janitorDogChan <-chan time.Time
+	if IsPatrolEnabled(d.patrolConfig, "janitor_dog") {
+		interval := janitorDogInterval(d.patrolConfig)
+		janitorDogTicker = time.NewTicker(interval)
+		janitorDogChan = janitorDogTicker.C
+		defer janitorDogTicker.Stop()
+		d.logger.Printf("Janitor dog ticker started (interval %v)", interval)
 	}
 
 	// Note: PATCH-010 uses per-session hooks in deacon/manager.go (SetAutoRespawnHook).
@@ -321,11 +460,52 @@ func (d *Daemon) Run() error {
 				d.ensureDoltServerRunning()
 			}
 
+		case <-doltTestHealthChan:
+			// Dedicated Dolt TEST server health check — keeps the shared
+			// test server alive so agents don't spawn per-test zombies.
+			if !d.isShutdownInProgress() {
+				d.ensureDoltTestServerRunning()
+			}
+
 		case <-doltRemotesChan:
 			// Periodic Dolt remote push — pushes databases to their configured
 			// git remotes on a 15-minute cadence (independent of heartbeat).
 			if !d.isShutdownInProgress() {
 				d.pushDoltRemotes()
+			}
+
+		case <-doltBackupChan:
+			// Periodic Dolt filesystem backup — syncs production databases to
+			// local backup directory on a 15-minute cadence.
+			if !d.isShutdownInProgress() {
+				d.syncDoltBackups()
+			}
+
+		case <-jsonlGitBackupChan:
+			// Periodic JSONL git backup — exports issues, scrubs ephemeral data,
+			// commits and pushes to git repo.
+			if !d.isShutdownInProgress() {
+				d.syncJsonlGitBackup()
+			}
+
+		case <-wispReaperChan:
+			// Periodic wisp reaper — closes stale wisps (abandoned molecule steps,
+			// old patrol data) to prevent unbounded table growth (Clown Show audit).
+			if !d.isShutdownInProgress() {
+				d.reapWisps()
+			}
+
+		case <-doctorDogChan:
+			// Doctor dog — comprehensive Dolt health monitor: connectivity, latency,
+			// gc, zombie detection, backup staleness, and disk usage checks.
+			if !d.isShutdownInProgress() {
+				d.runDoctorDog()
+			}
+
+		case <-janitorDogChan:
+			// Janitor dog — pours molecule for test server orphan cleanup.
+			if !d.isShutdownInProgress() {
+				d.runJanitorDog()
 			}
 
 		case <-timer.C:
@@ -359,11 +539,15 @@ func (d *Daemon) heartbeat(state *State) {
 		return
 	}
 
+	d.metrics.recordHeartbeat(d.ctx)
 	d.logger.Println("Heartbeat starting (recovery-focused)")
 
 	// 0. Ensure Dolt server is running (if configured)
 	// This must happen before beads operations that depend on Dolt.
 	d.ensureDoltServerRunning()
+
+	// 0b. Ensure Dolt TEST server is running (if configured)
+	d.ensureDoltTestServerRunning()
 
 	// 1. Ensure Deacon is running (restart if dead)
 	// Check patrol config - can be disabled in mayor/daemon.json
@@ -414,12 +598,14 @@ func (d *Daemon) heartbeat(state *State) {
 	// 6. Ensure Mayor is running (restart if dead)
 	d.ensureMayorRunning()
 
-	// 7. Trigger pending polecat spawns (bootstrap mode - ZFC violation acceptable)
-	// This ensures polecats get nudged even when Deacon isn't in a patrol cycle.
-	// Uses regex-based WaitForRuntimeReady, which is acceptable for daemon bootstrap.
-	d.triggerPendingSpawns()
+	// 6.5. Handle Dog lifecycle: cleanup stuck dogs and dispatch plugins
+	if IsPatrolEnabled(d.patrolConfig, "handler") {
+		d.handleDogs()
+	} else {
+		d.logger.Printf("Handler patrol disabled in config, skipping")
+	}
 
-	// 8. Process lifecycle requests
+	// 7. Process lifecycle requests
 	d.processLifecycleRequests()
 
 	// 9. (Removed) Stale agent check - violated "discover, don't track"
@@ -445,6 +631,10 @@ func (d *Daemon) heartbeat(state *State) {
 	// branches persist indefinitely. This cleans them up periodically.
 	d.pruneStaleBranches()
 
+	// 14. Dispatch scheduled work (capacity-controlled polecat dispatch).
+	// Shells out to `gt scheduler run` to avoid circular import between daemon and cmd.
+	d.dispatchQueuedWork()
+
 	// Update state
 	state.LastHeartbeat = time.Now()
 	state.HeartbeatCount++
@@ -457,6 +647,8 @@ func (d *Daemon) heartbeat(state *State) {
 
 // ensureDoltServerRunning ensures the Dolt SQL server is running if configured.
 // This provides the backend for beads database access in server mode.
+// Option B throttling: pours a mol-dog-doctor molecule only when health check
+// warnings are detected, with a 5-minute cooldown to avoid wisp spam.
 func (d *Daemon) ensureDoltServerRunning() {
 	if d.doltServer == nil || !d.doltServer.IsEnabled() {
 		return
@@ -464,6 +656,58 @@ func (d *Daemon) ensureDoltServerRunning() {
 
 	if err := d.doltServer.EnsureRunning(); err != nil {
 		d.logger.Printf("Error ensuring Dolt server is running: %v", err)
+	}
+
+	// Option B throttling: pour mol-dog-doctor only on anomaly with cooldown.
+	if warnings := d.doltServer.LastWarnings(); len(warnings) > 0 {
+		if time.Since(d.lastDoctorMolTime) >= doctorMolCooldown {
+			d.lastDoctorMolTime = time.Now()
+			go d.pourDoctorMolecule(warnings)
+		}
+	}
+
+	// Update OTel gauges with the latest Dolt health snapshot.
+	if d.metrics != nil {
+		h := doltserver.GetHealthMetrics(d.config.TownRoot)
+		d.metrics.updateDoltHealth(
+			int64(h.Connections),
+			int64(h.MaxConnections),
+			float64(h.QueryLatency.Milliseconds()),
+			h.DiskUsageBytes,
+			h.Healthy,
+		)
+	}
+}
+
+// pourDoctorMolecule creates a mol-dog-doctor molecule to track a health anomaly.
+// Runs asynchronously — molecule lifecycle is observability, not control flow.
+func (d *Daemon) pourDoctorMolecule(warnings []string) {
+	mol := d.pourDogMolecule("mol-dog-doctor", map[string]string{
+		"port": strconv.Itoa(d.doltServer.config.Port),
+	})
+	defer mol.close()
+
+	// Step 1: probe — connectivity was already checked (we got here because it passed).
+	mol.closeStep("probe")
+
+	// Step 2: inspect — resource checks produced the warnings.
+	mol.closeStep("inspect")
+
+	// Step 3: report — log the warning summary.
+	summary := strings.Join(warnings, "; ")
+	d.logger.Printf("Doctor molecule: %d warning(s): %s", len(warnings), summary)
+	mol.closeStep("report")
+}
+
+// ensureDoltTestServerRunning ensures the dedicated test Dolt server is running.
+// This provides a shared server for all `go test` invocations, eliminating
+// per-test zombie servers (Clown Show root cause).
+func (d *Daemon) ensureDoltTestServerRunning() {
+	if d.doltTestServer == nil || !d.doltTestServer.IsEnabled() {
+		return
+	}
+	if err := d.doltTestServer.EnsureRunning(); err != nil {
+		d.logger.Printf("Error ensuring test Dolt server: %v", err)
 	}
 }
 
@@ -562,7 +806,6 @@ func (d *Daemon) ensureBootRunning() {
 func (d *Daemon) runDegradedBootTriage(b *boot.Boot) {
 	startTime := time.Now()
 	status := &boot.Status{
-		Running:   true,
 		StartedAt: startTime,
 	}
 
@@ -581,7 +824,6 @@ func (d *Daemon) runDegradedBootTriage(b *boot.Boot) {
 		status.LastAction = "nothing"
 	}
 
-	status.Running = false
 	status.CompletedAt = time.Now()
 
 	if err := b.SaveStatus(status); err != nil {
@@ -632,6 +874,8 @@ func (d *Daemon) ensureDeaconRunning() {
 	// Track when we started the Deacon to prevent race condition in checkDeaconHeartbeat.
 	// The heartbeat file will still be stale until the Deacon runs a full patrol cycle.
 	d.deaconLastStarted = time.Now()
+	d.metrics.recordRestart(d.ctx, "deacon")
+	telemetry.RecordDaemonRestart(d.ctx, "deacon")
 	d.logger.Println("Deacon started successfully")
 }
 
@@ -796,6 +1040,8 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 		return
 	}
 
+	d.metrics.recordRestart(d.ctx, "witness")
+	telemetry.RecordDaemonRestart(d.ctx, "witness-"+rigName)
 	d.logger.Printf("Witness session for %s started successfully", rigName)
 }
 
@@ -846,6 +1092,8 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 		return
 	}
 
+	d.metrics.recordRestart(d.ctx, "refinery")
+	telemetry.RecordDaemonRestart(d.ctx, "refinery-"+rigName)
 	d.logger.Printf("Refinery session for %s started successfully", rigName)
 }
 
@@ -1042,55 +1290,6 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	return true, ""
 }
 
-// triggerPendingSpawns polls pending polecat spawns and triggers those that are ready.
-// This is bootstrap mode - uses regex-based WaitForRuntimeReady which is acceptable
-// for daemon operations when no AI agent is guaranteed to be running.
-// The timeout is short (2s) to avoid blocking the heartbeat.
-func (d *Daemon) triggerPendingSpawns() {
-	const triggerTimeout = 2 * time.Second
-
-	// Check for pending spawns (from POLECAT_STARTED messages in Deacon inbox)
-	pending, err := polecat.CheckInboxForSpawns(d.config.TownRoot)
-	if err != nil {
-		d.logger.Printf("Error checking pending spawns: %v", err)
-		return
-	}
-
-	if len(pending) == 0 {
-		return
-	}
-
-	d.logger.Printf("Found %d pending spawn(s), attempting to trigger...", len(pending))
-
-	// Trigger pending spawns (uses WaitForRuntimeReady with short timeout)
-	results, err := polecat.TriggerPendingSpawns(d.config.TownRoot, triggerTimeout)
-	if err != nil {
-		d.logger.Printf("Error triggering spawns: %v", err)
-		return
-	}
-
-	// Log results
-	triggered := 0
-	for _, r := range results {
-		if r.Triggered {
-			triggered++
-			d.logger.Printf("Triggered polecat: %s/%s", r.Spawn.Rig, r.Spawn.Polecat)
-		} else if r.Error != nil {
-			d.logger.Printf("Error triggering %s: %v", r.Spawn.Session, r.Error)
-		}
-	}
-
-	if triggered > 0 {
-		d.logger.Printf("Triggered %d/%d pending spawn(s)", triggered, len(pending))
-	}
-
-	// Prune stale pending spawns (older than 5 minutes - likely dead sessions)
-	pruned, _ := polecat.PruneStalePending(d.config.TownRoot, 5*time.Minute)
-	if pruned > 0 {
-		d.logger.Printf("Pruned %d stale pending spawn(s)", pruned)
-	}
-}
-
 // processLifecycleRequests checks for and processes lifecycle requests.
 func (d *Daemon) processLifecycleRequests() {
 	d.ProcessLifecycleRequests()
@@ -1119,12 +1318,33 @@ func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return
 		d.logger.Println("KRC pruner stopped")
 	}
 
+	// Push Dolt remotes before stopping the server (if patrol is enabled)
+	d.pushDoltRemotes()
+
+	// Stop Dolt test server if we're managing it
+	if d.doltTestServer != nil && d.doltTestServer.IsEnabled() && !d.doltTestServer.IsExternal() {
+		if err := d.doltTestServer.Stop(); err != nil {
+			d.logger.Printf("Warning: failed to stop Dolt test server: %v", err)
+		} else {
+			d.logger.Println("Dolt test server stopped")
+		}
+	}
+
 	// Stop Dolt server if we're managing it
 	if d.doltServer != nil && d.doltServer.IsEnabled() && !d.doltServer.IsExternal() {
 		if err := d.doltServer.Stop(); err != nil {
 			d.logger.Printf("Warning: failed to stop Dolt server: %v", err)
 		} else {
 			d.logger.Println("Dolt server stopped")
+		}
+	}
+
+	// Flush and stop OTel providers (5s deadline to avoid blocking shutdown).
+	if d.otelProvider != nil {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := d.otelProvider.Shutdown(shutCtx); err != nil {
+			d.logger.Printf("Warning: telemetry shutdown: %v", err)
 		}
 	}
 
@@ -1461,6 +1681,33 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 		return
 	}
 
+	// Spawning guard: skip polecats being actively started by gt sling.
+	// agent_state='spawning' means the polecat bead was created (with hook_bead
+	// set atomically) but the tmux session hasn't been launched yet. Restarting
+	// here would create a second Claude process alongside the one gt sling is
+	// about to start, causing the double-spawn bug (issue #1752).
+	//
+	// Time-bound: only skip if the bead was updated recently (within 5 minutes).
+	// If gt sling crashed during spawn, the polecat would be stuck in 'spawning'
+	// indefinitely. The Witness patrol also catches spawning-as-zombie, but a
+	// time-bound here makes the daemon self-sufficient for this edge case.
+	if info.State == "spawning" {
+		if updatedAt, err := time.Parse(time.RFC3339, info.LastUpdate); err == nil {
+			if time.Since(updatedAt) < 5*time.Minute {
+				d.logger.Printf("Skipping restart for %s/%s: agent_state=spawning (gt sling in progress, updated %s ago)",
+					rigName, polecatName, time.Since(updatedAt).Round(time.Second))
+				return
+			}
+			d.logger.Printf("Spawning guard expired for %s/%s: agent_state=spawning but last updated %s ago (>5m), proceeding with crash detection",
+				rigName, polecatName, time.Since(updatedAt).Round(time.Second))
+		} else {
+			// Can't parse timestamp — be safe, skip restart during spawning
+			d.logger.Printf("Skipping restart for %s/%s: agent_state=spawning (gt sling in progress, unparseable updated_at)",
+				rigName, polecatName)
+			return
+		}
+	}
+
 	// TOCTOU guard: re-verify session is still dead before restarting.
 	// Between the initial check and now, the session may have been restarted
 	// by another heartbeat cycle, witness, or the polecat itself.
@@ -1476,14 +1723,20 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 	// Track this death for mass death detection
 	d.recordSessionDeath(sessionName)
 
+	// Emit session_death event for audit trail / feed visibility
+	_ = events.LogFeed(events.TypeSessionDeath, sessionName,
+		events.SessionDeathPayload(sessionName, rigName+"/polecats/"+polecatName, "crash detected by daemon health check", "daemon"))
+
 	// Auto-restart the polecat
-	if err := d.restartPolecatSession(rigName, polecatName, sessionName); err != nil {
-		d.logger.Printf("Error restarting polecat %s/%s: %v", rigName, polecatName, err)
-		// Notify witness as fallback
-		d.notifyWitnessOfCrashedPolecat(rigName, polecatName, info.HookBead, err)
+	restartErr := d.restartPolecatSession(rigName, polecatName, sessionName)
+	if restartErr != nil {
+		d.logger.Printf("Error restarting polecat %s/%s: %v", rigName, polecatName, restartErr)
 	} else {
 		d.logger.Printf("Successfully restarted crashed polecat %s/%s", rigName, polecatName)
 	}
+
+	// Always notify witness of crash (with restart outcome)
+	d.notifyWitnessOfCrashedPolecat(rigName, polecatName, info.HookBead, restartErr)
 }
 
 // recordSessionDeath records a session death and checks for mass death pattern.
@@ -1563,21 +1816,31 @@ func (d *Daemon) restartPolecatSession(rigName, polecatName, sessionName string)
 	// Pre-sync workspace (ensure beads are current)
 	d.syncWorkspace(workDir)
 
-	// Create new tmux session
-	// Use EnsureSessionFresh to handle zombie sessions that exist but have dead Claude
-	if err := d.tmux.EnsureSessionFresh(sessionName, workDir); err != nil {
-		return fmt.Errorf("creating session: %w", err)
-	}
-
-	// Set environment variables using centralized AgentEnv
+	// Build startup command BEFORE creating the session so we can use
+	// NewSessionWithCommand (command as initial pane process). This eliminates
+	// the race condition in the old EnsureSessionFresh + SendKeys pattern where
+	// the shell might not be ready to receive keystrokes, producing empty windows.
 	envVars := config.AgentEnv(config.AgentEnvConfig{
 		Role:      "polecat",
 		Rig:       rigName,
 		AgentName: polecatName,
 		TownRoot:  d.config.TownRoot,
 	})
+	rc := config.ResolveRoleAgentConfig("polecat", d.config.TownRoot, rigPath)
+	startCmd := config.BuildStartupCommand(envVars, rigPath, "")
 
-	// Set all env vars in tmux session (for debugging) and they'll also be exported to Claude
+	// Create session with command as initial process (replaces EnsureSessionFresh + SendKeys).
+	// EnsureSessionFreshWithCommand kills zombie sessions and creates a new one atomically.
+	if err := d.tmux.EnsureSessionFreshWithCommand(sessionName, workDir, startCmd); err != nil {
+		if errors.Is(err, tmux.ErrSessionRunning) {
+			d.logger.Printf("Session %s already running with healthy agent, skipping restart", sessionName)
+			return nil
+		}
+		return fmt.Errorf("creating session: %w", err)
+	}
+
+	// Set environment variables in tmux session table (for debugging/monitoring tools).
+	// The process itself gets env vars via 'exec env ...' in the startup command.
 	for k, v := range envVars {
 		_ = d.tmux.SetEnvironment(sessionName, k, v)
 	}
@@ -1586,10 +1849,13 @@ func (d *Daemon) restartPolecatSession(rigName, polecatName, sessionName string)
 	// (e.g., witness patrol) can detect non-Claude agents.
 	// BuildStartupCommand sets GT_AGENT in process env via exec env, but that
 	// isn't visible to tmux show-environment.
-	rc := config.ResolveRoleAgentConfig("polecat", d.config.TownRoot, rigPath)
 	if rc.ResolvedAgent != "" {
 		_ = d.tmux.SetEnvironment(sessionName, "GT_AGENT", rc.ResolvedAgent)
 	}
+
+	// Set GT_PROCESS_NAMES for accurate liveness detection of custom agents.
+	processNames := config.ResolveProcessNames(rc.ResolvedAgent, rc.Command)
+	_ = d.tmux.SetEnvironment(sessionName, "GT_PROCESS_NAMES", strings.Join(processNames, ","))
 
 	// Apply theme
 	theme := tmux.AssignTheme(rigName)
@@ -1599,34 +1865,39 @@ func (d *Daemon) restartPolecatSession(rigName, polecatName, sessionName string)
 	agentID := fmt.Sprintf("%s/%s", rigName, polecatName)
 	_ = d.tmux.SetPaneDiedHook(sessionName, agentID)
 
-	// Launch Claude with environment exported inline
-	// Pass rigPath so rig agent settings are honored (not town-level defaults)
-	startCmd := config.BuildStartupCommand(envVars, rigPath, "")
-	if err := d.tmux.SendKeys(sessionName, startCmd); err != nil {
-		return fmt.Errorf("sending startup command: %w", err)
-	}
-
-	// Wait for Claude to start, then accept bypass permissions warning if it appears.
-	// This ensures automated restarts aren't blocked by the warning dialog.
+	// Wait for Claude to start, then accept startup dialogs if they appear.
 	if err := d.tmux.WaitForCommand(sessionName, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
 		// Non-fatal - Claude might still start
 	}
-	_ = d.tmux.AcceptBypassPermissionsWarning(sessionName)
+	_ = d.tmux.AcceptStartupDialogs(sessionName)
 
 	return nil
 }
 
-// notifyWitnessOfCrashedPolecat notifies the witness when a polecat restart fails.
+// notifyWitnessOfCrashedPolecat notifies the witness when a polecat crash is detected.
+// If restartErr is nil, the notification is informational (restart succeeded).
+// If restartErr is non-nil, the notification indicates manual intervention may be needed.
 func (d *Daemon) notifyWitnessOfCrashedPolecat(rigName, polecatName, hookBead string, restartErr error) {
 	witnessAddr := rigName + "/witness"
-	subject := fmt.Sprintf("CRASHED_POLECAT: %s/%s restart failed", rigName, polecatName)
-	body := fmt.Sprintf(`Polecat %s crashed and automatic restart failed.
+	var subject, body string
+	if restartErr == nil {
+		subject = fmt.Sprintf("CRASHED_POLECAT: %s/%s restarted", rigName, polecatName)
+		body = fmt.Sprintf(`Polecat %s crashed and was automatically restarted.
+
+hook_bead: %s
+
+No action required.`,
+			polecatName, hookBead)
+	} else {
+		subject = fmt.Sprintf("CRASHED_POLECAT: %s/%s restart failed", rigName, polecatName)
+		body = fmt.Sprintf(`Polecat %s crashed and automatic restart failed.
 
 hook_bead: %s
 restart_error: %v
 
 Manual intervention may be required.`,
-		polecatName, hookBead, restartErr)
+			polecatName, hookBead, restartErr)
+	}
 
 	cmd := exec.Command(d.gtPath, "mail", "send", witnessAddr, "-s", subject, "-m", body) //nolint:gosec // G204: args are constructed internally
 	cmd.Dir = d.config.TownRoot
@@ -1694,4 +1965,29 @@ func (d *Daemon) pruneStaleBranches() {
 
 	// Also prune in the town root itself (mayor clone)
 	pruneInDir(d.config.TownRoot, "town-root")
+}
+
+// dispatchQueuedWork shells out to `gt scheduler run` to dispatch scheduled beads.
+// This avoids circular import between the daemon and cmd packages.
+// Uses a 5m timeout to allow multi-bead dispatch with formula cooking and hook retries.
+//
+// Timeout safety: if the timeout fires mid-dispatch, a bead may be left with
+// metadata written but label not yet swapped (or vice versa). The dispatch flock
+// is released on process death, and dispatchSingleBead's label swap retry logic
+// prevents double-dispatch on the next cycle. The batch_size config (default: 1)
+// limits how many beads are in-flight per heartbeat, reducing the timeout window.
+func (d *Daemon) dispatchQueuedWork() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gt", "scheduler", "run")
+	cmd.Dir = d.config.TownRoot
+	cmd.Env = append(os.Environ(), "GT_DAEMON=1", "BD_DOLT_AUTO_COMMIT=off")
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		d.logger.Printf("Scheduler dispatch timed out after 5m")
+	} else if err != nil {
+		d.logger.Printf("Scheduler dispatch failed: %v (output: %s)", err, string(out))
+	} else if len(out) > 0 {
+		d.logger.Printf("Scheduler dispatch: %s", string(out))
+	}
 }

@@ -96,6 +96,14 @@ func runMoleculeBurn(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("detaching molecule: %w", err)
 	}
+	// Close the molecule root after detach so the audit sees original status.
+	// Without this, the wisp root stays in "hooked" status indefinitely,
+	// causing patrol molecule leaks (issue #1828).
+	rootClosed := true
+	if closeErr := b.ForceCloseWithReason("burned", moleculeID); closeErr != nil {
+		style.PrintWarning("could not close molecule root %s: %v", moleculeID, closeErr)
+		rootClosed = false
+	}
 
 	if moleculeJSON {
 		result := map[string]interface{}{
@@ -103,6 +111,7 @@ func runMoleculeBurn(cmd *cobra.Command, args []string) error {
 			"from":            target,
 			"handoff_id":      handoff.ID,
 			"children_closed": childrenClosed,
+			"root_closed":     rootClosed,
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -254,7 +263,7 @@ squashed_at: %s
 			}())
 		}
 
-		// Create the digest bead (ephemeral to avoid JSONL pollution)
+		// Create the digest bead (ephemeral to avoid git pollution)
 		// Per-cycle digests are aggregated daily by 'gt patrol digest'
 		digestIssue, err := b.Create(beads.CreateOptions{
 			Title:       digestTitle,
@@ -297,6 +306,15 @@ squashed_at: %s
 		return fmt.Errorf("detaching molecule: %w", err)
 	}
 
+	// Close the molecule root after detach so the audit sees original status.
+	// Without this, the wisp root stays in "hooked" status indefinitely,
+	// causing patrol molecule leaks (issue #1828).
+	rootClosed := true
+	if closeErr := b.ForceCloseWithReason("squashed", moleculeID); closeErr != nil {
+		style.PrintWarning("could not close molecule root %s: %v", moleculeID, closeErr)
+		rootClosed = false
+	}
+
 	if moleculeJSON {
 		result := map[string]interface{}{
 			"squashed":        moleculeID,
@@ -304,6 +322,7 @@ squashed_at: %s
 			"handoff_id":      handoff.ID,
 			"children_closed": childrenClosed,
 			"digest_skipped":  moleculeNoDigest,
+			"root_closed":     rootClosed,
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -327,6 +346,17 @@ squashed_at: %s
 // closeDescendants recursively closes all descendant issues of a parent.
 // Returns the count of issues closed. Logs warnings on errors but doesn't fail.
 func closeDescendants(b *beads.Beads, parentID string) int {
+	return closeDescendantsImpl(b, parentID, false)
+}
+
+// forceCloseDescendants is like closeDescendants but uses force-close,
+// which succeeds even for beads in invalid states. Use in destructive
+// paths (nuke, burn) where we must clean up regardless.
+func forceCloseDescendants(b *beads.Beads, parentID string) {
+	closeDescendantsImpl(b, parentID, true)
+}
+
+func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) int {
 	children, err := b.List(beads.ListOptions{
 		Parent: parentID,
 		Status: "all",
@@ -343,7 +373,7 @@ func closeDescendants(b *beads.Beads, parentID string) int {
 	// First, recursively close grandchildren
 	totalClosed := 0
 	for _, child := range children {
-		totalClosed += closeDescendants(b, child.ID)
+		totalClosed += closeDescendantsImpl(b, child.ID, force)
 	}
 
 	// Then close direct children
@@ -355,7 +385,13 @@ func closeDescendants(b *beads.Beads, parentID string) int {
 	}
 
 	if len(idsToClose) > 0 {
-		if closeErr := b.Close(idsToClose...); closeErr != nil {
+		var closeErr error
+		if force {
+			closeErr = b.ForceCloseWithReason("burned: force-close descendants", idsToClose...)
+		} else {
+			closeErr = b.Close(idsToClose...)
+		}
+		if closeErr != nil {
 			style.PrintWarning("could not close children of %s: %v", parentID, closeErr)
 		} else {
 			totalClosed += len(idsToClose)

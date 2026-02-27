@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="dashboard-token" content="{{.CSRFToken}}">
     <title>Gas Town Control Center</title>
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script src="https://unpkg.com/idiomorph@0.3.0/dist/idiomorph-ext.min.js"></script>
@@ -69,7 +70,7 @@
                 {{end}}
                 <div class="stat">
                     <span class="stat-value">{{.Summary.PolecatCount}}</span>
-                    <span class="stat-label">⚙️ Workers</span>
+                    <span class="stat-label">🦨 Polecats</span>
                 </div>
                 <div class="stat">
                     <span class="stat-value">{{.Summary.HookCount}}</span>
@@ -279,10 +280,10 @@
                 </div>
             </div>
 
-            <!-- Workers Panel (polecats + refinery) -->
+            <!-- Polecats Panel -->
             <div class="panel">
                 <div class="panel-header">
-                    <h2>⚙️ Workers</h2>
+                    <h2>🦨 Polecats</h2>
                     <span class="count">{{len .Workers}}</span>
                     <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>

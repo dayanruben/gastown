@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/session"
 )
 
 func TestValidateCommand(t *testing.T) {
@@ -245,7 +247,7 @@ func TestParseCommandArgs(t *testing.T) {
 }
 
 func TestAPIHandler_Commands(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/commands", nil)
 	w := httptest.NewRecorder()
@@ -291,11 +293,12 @@ func TestAPIHandler_Commands(t *testing.T) {
 }
 
 func TestAPIHandler_Run_BlockedCommand(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	body := `{"command": "delete everything"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
@@ -318,11 +321,12 @@ func TestAPIHandler_Run_BlockedCommand(t *testing.T) {
 }
 
 func TestAPIHandler_Run_InvalidJSON(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	body := `{invalid json}`
 	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
@@ -333,11 +337,12 @@ func TestAPIHandler_Run_InvalidJSON(t *testing.T) {
 }
 
 func TestAPIHandler_Run_EmptyCommand(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	body := `{"command": ""}`
 	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
@@ -347,8 +352,76 @@ func TestAPIHandler_Run_EmptyCommand(t *testing.T) {
 	}
 }
 
+func TestAPIHandler_Run_MissingCSRFToken(t *testing.T) {
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
+
+	body := `{"command": "status"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	// Deliberately omit X-Dashboard-Token header
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("POST /api/run without CSRF token status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+
+	var resp CommandResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if resp.Success {
+		t.Error("Expected success=false without CSRF token")
+	}
+	if !strings.Contains(resp.Error, "dashboard token") {
+		t.Errorf("Expected error about dashboard token, got: %q", resp.Error)
+	}
+}
+
+func TestAPIHandler_Run_WrongCSRFToken(t *testing.T) {
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
+
+	body := `{"command": "status"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "wrong-token")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("POST /api/run with wrong CSRF token status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+}
+
+func TestAPIHandler_Run_ConfirmRequired(t *testing.T) {
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
+
+	// "mail send" requires Confirm: true in AllowedCommands
+	body := `{"command": "mail send alice -s test -m hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("POST /api/run confirm command without confirmed=true status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+
+	var resp CommandResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if !strings.Contains(resp.Error, "confirmation") {
+		t.Errorf("Expected error about confirmation, got: %q", resp.Error)
+	}
+}
+
 func TestAPIHandler_NotFound(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/unknown", nil)
 	w := httptest.NewRecorder()
@@ -382,7 +455,7 @@ func TestGetCommandList(t *testing.T) {
 }
 
 func TestAPIHandler_Crew(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/crew", nil)
 	w := httptest.NewRecorder()
@@ -408,7 +481,7 @@ func TestAPIHandler_Crew(t *testing.T) {
 }
 
 func TestAPIHandler_Ready(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/ready", nil)
 	w := httptest.NewRecorder()
@@ -434,11 +507,12 @@ func TestAPIHandler_Ready(t *testing.T) {
 }
 
 func TestAPIHandler_IssueCreate_MissingTitle(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	body := `{"title": ""}`
 	req := httptest.NewRequest(http.MethodPost, "/api/issues/create", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
@@ -449,7 +523,7 @@ func TestAPIHandler_IssueCreate_MissingTitle(t *testing.T) {
 }
 
 func TestAPIHandler_IssueCreate_InvalidTitle(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	tests := []struct {
 		name  string
@@ -468,6 +542,7 @@ func TestAPIHandler_IssueCreate_InvalidTitle(t *testing.T) {
 			body, _ := json.Marshal(payload)
 			req := httptest.NewRequest(http.MethodPost, "/api/issues/create", bytes.NewBuffer(body))
 			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Dashboard-Token", "test-token")
 			w := httptest.NewRecorder()
 
 			handler.ServeHTTP(w, req)
@@ -480,7 +555,7 @@ func TestAPIHandler_IssueCreate_InvalidTitle(t *testing.T) {
 }
 
 func TestAPIHandler_IssueCreate_InvalidDescription(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	payload := map[string]interface{}{
 		"title":       "Valid title",
@@ -489,6 +564,7 @@ func TestAPIHandler_IssueCreate_InvalidDescription(t *testing.T) {
 	body, _ := json.Marshal(payload)
 	req := httptest.NewRequest(http.MethodPost, "/api/issues/create", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
@@ -499,11 +575,12 @@ func TestAPIHandler_IssueCreate_InvalidDescription(t *testing.T) {
 }
 
 func TestAPIHandler_IssueCreate_InvalidJSON(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	body := `{not valid json}`
 	req := httptest.NewRequest(http.MethodPost, "/api/issues/create", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
@@ -765,7 +842,7 @@ func TestParseIssueShowJSON_InvalidInputs(t *testing.T) {
 }
 
 func TestAPIHandler_SSE_ContentType(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/events", nil)
 	// Cancel context quickly so the SSE handler returns instead of blocking
@@ -1001,5 +1078,69 @@ func TestRunGtCommandSemaphoreTimeoutBudget(t *testing.T) {
 	// The call should have returned within the timeout budget (200ms + margin).
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("elapsed = %v, want < 500ms (timeout should bound semaphore wait)", elapsed)
+	}
+}
+
+// TestHandleSessionPreviewPrefixValidation verifies that handleSessionPreview
+// accepts session names with known rig prefixes and rejects invalid prefixes.
+func TestHandleSessionPreviewPrefixValidation(t *testing.T) {
+	originalRegistry := session.DefaultRegistry()
+	t.Cleanup(func() { session.SetDefaultRegistry(originalRegistry) })
+
+	testRegistry := session.NewPrefixRegistry()
+	testRegistry.Register("nx", "nexus")
+	testRegistry.Register("myrig", "myrig-project")
+	session.SetDefaultRegistry(testRegistry)
+
+	h := &APIHandler{
+		gtPath:            "true",
+		workDir:           t.TempDir(),
+		defaultRunTimeout: 1 * time.Second,
+		maxRunTimeout:     2 * time.Second,
+		cmdSem:            make(chan struct{}, 5),
+	}
+
+	tests := []struct {
+		name          string
+		sessionName   string
+		wantRejected  bool
+		wantErrSubstr string
+	}{
+		{"registered prefix nx", "nx-polecat-alpha", false, ""},
+		{"registered prefix myrig", "myrig-crew-bob", false, ""},
+		{"legacy gt- prefix", "gt-polecat-test", false, ""},
+		{"legacy bd- prefix", "bd-some-bead", false, ""},
+		{"hq- prefix", "hq-nonexistent-session", false, ""},
+		{"gthq- prefix", "gthq-deacon", false, ""},
+		{"unknown prefix rejected", "unknown-session-name", true, "must start with a known rig prefix"},
+		{"no prefix rejected", "justsomename", true, "must start with a known rig prefix"},
+		{"invalid characters rejected", "gt-bad_chars!", true, "invalid characters"},
+		{"missing session parameter", "", true, "Missing session parameter"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			url := "/api/session-preview"
+			if tc.sessionName != "" {
+				url += "?session=" + tc.sessionName
+			}
+			req := httptest.NewRequest(http.MethodGet, url, nil)
+			rec := httptest.NewRecorder()
+
+			h.handleSessionPreview(rec, req)
+
+			if tc.wantRejected {
+				if rec.Code != http.StatusBadRequest {
+					t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+				}
+				if !strings.Contains(rec.Body.String(), tc.wantErrSubstr) {
+					t.Errorf("body = %q, want substring %q", rec.Body.String(), tc.wantErrSubstr)
+				}
+			} else {
+				if rec.Code == http.StatusBadRequest && strings.Contains(rec.Body.String(), "prefix") {
+					t.Errorf("valid prefix %q was rejected: %s", tc.sessionName, rec.Body.String())
+				}
+			}
+		})
 	}
 }
