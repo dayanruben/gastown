@@ -723,8 +723,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 		}
 
+		// Pre-declare for checkpoint goto (gt-aufru)
+		var existingMR *beads.Issue
+
+		// Resume: skip MR creation if already completed in a previous run (gt-aufru).
+		// Mirrors the push checkpoint pattern above. Without this, every retry
+		// re-attempts bd.Create which hits unique constraints or creates duplicates.
+		if checkpoints[CheckpointMRCreated] != "" {
+			mrID = checkpoints[CheckpointMRCreated]
+			fmt.Printf("%s MR already created (resumed from checkpoint: %s)\n", style.Bold.Render("✓"), mrID)
+			goto afterMR
+		}
+
 		// Check if MR bead already exists for this branch (idempotency)
-		existingMR, err := bd.FindMRForBranch(branch)
+		existingMR, err = bd.FindMRForBranch(branch)
 		if err != nil {
 			style.PrintWarning("could not check for existing MR: %v", err)
 			// Continue with creation attempt - Create will fail if duplicate
@@ -771,6 +783,16 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 			mrID = mrIssue.ID
 
+			// Guard against empty ID from bd create (observed in ephemeral/wisp mode).
+			// Fail fast with a clear message rather than passing "" to bd.Show.
+			if mrID == "" {
+				mrFailed = true
+				errMsg := "MR bead creation returned empty ID"
+				doneErrors = append(doneErrors, errMsg)
+				style.PrintWarning("%s\nBranch is pushed but MR bead has no ID. Witness will be notified.", errMsg)
+				goto notifyWitness
+			}
+
 			// GH#1945: Verify MR bead is readable before considering it confirmed.
 			// bd.Create() succeeds when the bead is written locally, but if the write
 			// didn't persist (Dolt failure, corrupt state), we'd nuke the worktree
@@ -806,6 +828,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			writeDoneCheckpoint(cpBd, agentBeadID, CheckpointMRCreated, mrID)
 		}
 
+	afterMR:
 		fmt.Printf("  Source: %s\n", branch)
 		fmt.Printf("  Target: %s\n", target)
 		fmt.Printf("  Issue: %s\n", issueID)
