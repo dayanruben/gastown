@@ -714,7 +714,7 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 	if len(issues) == 0 {
 		return fmt.Errorf("%w: %s", ErrIssueInvalid, issueID)
 	}
-	if issues[0].Status == "tombstone" {
+	if issues[0].Status == beads.StatusTombstone {
 		return fmt.Errorf("%w: %s is tombstoned", ErrIssueInvalid, issueID)
 	}
 	return nil

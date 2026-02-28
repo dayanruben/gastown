@@ -57,6 +57,15 @@ type AgentFields struct {
 	CompletionTime string // RFC3339 timestamp of when gt done was called
 }
 
+// Agent state constants for the agent_state field in agent beads.
+// These represent the beads-level agent lifecycle state, which is distinct from
+// the polecat.State lifecycle type (though values overlap).
+const (
+	AgentStateIdle         = "idle"          // Available for new work
+	AgentStateStuck        = "stuck"         // Explicitly signaled need for assistance
+	AgentStateAwaitingGate = "awaiting-gate" // Waiting for a gate condition, intentional pause
+)
+
 // Notification level constants
 const (
 	NotifyVerbose = "verbose" // All notifications (mail, convoy events, etc.)
