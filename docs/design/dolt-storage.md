@@ -290,11 +290,55 @@ so the merge succeeds.
 
 **Surgical compaction** via interactive rebase (squash old, keep recent):
 
+Unlike flatten (which squashes everything), interactive rebase lets you
+keep recent individual commits while squashing old history. Safe on a
+running server. Based on Jason Fulghum's rebase implementation.
+
 ```sql
--- Rebase on a side branch (never directly on main — hashes change)
--- Exact procedure TBD — awaiting instructions from Jason (Dolt team)
--- Reference: https://www.dolthub.com/blog/2024-01-03-announcing-dolt-rebase/
+-- 1. Create a branch at the initial commit (the rebase "upstream")
+SET @init = (SELECT commit_hash FROM dolt_log ORDER BY date ASC LIMIT 1);
+CALL DOLT_BRANCH('compact-base', @init);
+
+-- 2. Create a work branch from main (never rebase main directly)
+CALL DOLT_BRANCH('compact-work', 'main');
+CALL DOLT_CHECKOUT('compact-work');
+
+-- 3. Start interactive rebase — populates dolt_rebase system table
+--    All commits between compact-base and compact-work go into the plan
+CALL DOLT_REBASE('--interactive', 'compact-base');
+
+-- 4. Modify the plan: squash old commits, keep recent ones
+--    First commit must stay 'pick' (squash needs a parent to fold into).
+--    Keep last N commits as 'pick', squash everything else.
+SET @keep_recent = 50;  -- keep last 50 commits individual
+UPDATE dolt_rebase SET action = 'squash'
+WHERE rebase_order > (SELECT MIN(rebase_order) FROM dolt_rebase)
+  AND rebase_order <= (SELECT MAX(rebase_order) FROM dolt_rebase) - @keep_recent;
+
+-- 5. Execute the rebase plan
+CALL DOLT_REBASE('--continue');
+
+-- 6. Swap branches: make compact-work the new main
+CALL DOLT_CHECKOUT('compact-work');
+CALL DOLT_BRANCH('-D', 'main');
+CALL DOLT_BRANCH('-m', 'compact-work', 'main');
+CALL DOLT_BRANCH('-D', 'compact-base');
+CALL DOLT_CHECKOUT('main');
+-- GC runs automatically when journal exceeds 50MB
 ```
+
+**Rebase actions** (from `dolt_rebase` table):
+- `pick` — keep commit as-is
+- `squash` — fold into previous commit, concatenate messages
+- `fixup` — fold into previous commit, discard message
+- `drop` — remove commit entirely
+- `reword` — keep commit, change message
+
+**Caveat**: Conflicts during rebase cause automatic abort (no manual
+resolution yet). The simple flatten is more reliable for daily use;
+surgical rebase is for cases where you need to preserve some history.
+
+Reference: https://www.dolthub.com/blog/2024-01-03-announcing-dolt-rebase/
 
 ### Dolt GC
 
