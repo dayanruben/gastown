@@ -1404,10 +1404,20 @@ func handleZombieCleanup(workDir, rigName, polecatName, hookBead, cleanupStatus 
 	}
 }
 
+// StartupStallThreshold is the minimum session age before a session with no
+// recent tmux activity is considered stalled at startup. Sessions younger than
+// this are still in normal startup and should not be flagged.
+const StartupStallThreshold = 90 * time.Second
+
+// StartupActivityGrace is the maximum time since last tmux activity before
+// a session old enough to be past startup is considered stalled. If the session
+// has had tmux activity within this window, it's making progress.
+const StartupActivityGrace = 60 * time.Second
+
 // StalledResult represents a single stalled polecat detection.
 type StalledResult struct {
 	PolecatName string // e.g., "alpha"
-	StallType   string // "bypass-permissions", "unknown-prompt"
+	StallType   string // "startup-stall", "unknown-prompt"
 	Action      string // "auto-dismissed", "escalated"
 	Error       error
 }
@@ -1419,18 +1429,19 @@ type DetectStalledPolecatsResult struct {
 	Errors  []error         // Transient errors
 }
 
-// DetectStalledPolecats checks live polecat sessions for agents stuck on
-// interactive prompts (e.g., the "Bypass Permissions mode" startup warning).
+// DetectStalledPolecats checks live polecat sessions for agents stuck at
+// startup (e.g., on interactive prompts that block automated sessions).
 // Unlike zombie detection which looks for dead sessions/agents, this targets
 // alive-but-stuck agents that will never make progress without intervention.
 //
-// For each qualifying polecat (live session + alive agent):
-//   - Captures pane content (last 30 lines)
-//   - Checks for known stall patterns
-//   - Auto-dismisses known prompts (bypass-permissions) or escalates
+// Detection uses structured tmux signals (session creation time + last activity)
+// rather than screen-scraping pane content. A session is considered stalled when:
+//   - It is older than StartupStallThreshold (90s)
+//   - Its last tmux activity is older than StartupActivityGrace (60s)
 //
-// This is idempotent: calling AcceptBypassPermissionsWarning on a non-stalled
-// session is harmless, so no dedup or TOCTOU guards are needed.
+// When a startup stall is detected, AcceptStartupDialogs is called to dismiss
+// any known blocking dialogs (workspace trust, bypass permissions). This is
+// idempotent: calling it on a non-stalled session is harmless.
 func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult {
 	result := &DetectStalledPolecatsResult{}
 
@@ -1449,6 +1460,7 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 	}
 
 	t := tmux.NewTmux()
+	now := time.Now()
 
 	for _, entry := range entries {
 		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
@@ -1473,45 +1485,43 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 			continue // Dead agent — zombie detection handles this
 		}
 
-		// Agent is alive. Capture pane to check for known stall patterns.
-		content, err := t.CapturePane(sessionName, 30)
+		// Use structured signals to detect startup stalls:
+		// session_created (age) + session_activity (last output).
+		createdUnix, err := t.GetSessionCreatedUnix(sessionName)
 		if err != nil {
 			result.Errors = append(result.Errors,
-				fmt.Errorf("capturing pane for %s: %w", sessionName, err))
+				fmt.Errorf("getting session created time for %s: %w", sessionName, err))
 			continue
 		}
-
-		// Check for workspace trust dialog (appears before bypass-permissions)
-		if strings.Contains(content, "trust this folder") || strings.Contains(content, "Quick safety check") {
-			stalled := StalledResult{
-				PolecatName: polecatName,
-				StallType:   "workspace-trust",
-			}
-			if err := t.AcceptWorkspaceTrustDialog(sessionName); err != nil {
-				stalled.Action = "escalated"
-				stalled.Error = fmt.Errorf("auto-dismiss failed: %w", err)
-			} else {
-				stalled.Action = "auto-dismissed"
-			}
-			result.Stalled = append(result.Stalled, stalled)
-			// Re-capture after dismissing trust dialog, bypass-permissions may follow
-			content, _ = t.CapturePane(sessionName, 30)
+		sessionAge := now.Sub(time.Unix(createdUnix, 0))
+		if sessionAge < StartupStallThreshold {
+			continue // Too young — still in normal startup
 		}
 
-		// Check for bypass-permissions prompt
-		if strings.Contains(content, "Bypass Permissions mode") {
-			stalled := StalledResult{
-				PolecatName: polecatName,
-				StallType:   "bypass-permissions",
-			}
-			if err := t.AcceptBypassPermissionsWarning(sessionName); err != nil {
-				stalled.Action = "escalated"
-				stalled.Error = fmt.Errorf("auto-dismiss failed: %w", err)
-			} else {
-				stalled.Action = "auto-dismissed"
-			}
-			result.Stalled = append(result.Stalled, stalled)
+		activity, err := t.GetSessionActivity(sessionName)
+		if err != nil {
+			result.Errors = append(result.Errors,
+				fmt.Errorf("getting session activity for %s: %w", sessionName, err))
+			continue
 		}
+		activityAge := now.Sub(activity)
+		if activityAge < StartupActivityGrace {
+			continue // Recent activity — agent is making progress
+		}
+
+		// Session is old enough and has no recent activity: startup stall.
+		// Attempt to dismiss any known startup dialogs (idempotent).
+		stalled := StalledResult{
+			PolecatName: polecatName,
+			StallType:   "startup-stall",
+		}
+		if err := t.AcceptStartupDialogs(sessionName); err != nil {
+			stalled.Action = "escalated"
+			stalled.Error = fmt.Errorf("auto-dismiss failed: %w", err)
+		} else {
+			stalled.Action = "auto-dismissed"
+		}
+		result.Stalled = append(result.Stalled, stalled)
 	}
 
 	return result

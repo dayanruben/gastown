@@ -723,7 +723,7 @@ func TestStalledResult_Types(t *testing.T) {
 	// Verify the StalledResult type has all expected fields
 	s := StalledResult{
 		PolecatName: "alpha",
-		StallType:   "bypass-permissions",
+		StallType:   "startup-stall",
 		Action:      "auto-dismissed",
 		Error:       nil,
 	}
@@ -731,8 +731,8 @@ func TestStalledResult_Types(t *testing.T) {
 	if s.PolecatName != "alpha" {
 		t.Errorf("PolecatName = %q, want %q", s.PolecatName, "alpha")
 	}
-	if s.StallType != "bypass-permissions" {
-		t.Errorf("StallType = %q, want %q", s.StallType, "bypass-permissions")
+	if s.StallType != "startup-stall" {
+		t.Errorf("StallType = %q, want %q", s.StallType, "startup-stall")
 	}
 	if s.Action != "auto-dismissed" {
 		t.Errorf("Action = %q, want %q", s.Action, "auto-dismissed")
@@ -744,7 +744,7 @@ func TestStalledResult_Types(t *testing.T) {
 	// Verify error field works
 	s2 := StalledResult{
 		PolecatName: "bravo",
-		StallType:   "unknown-prompt",
+		StallType:   "startup-stall",
 		Action:      "escalated",
 		Error:       fmt.Errorf("auto-dismiss failed"),
 	}
@@ -801,7 +801,7 @@ func TestDetectStalledPolecats_EmptyPolecatsDir(t *testing.T) {
 	}
 }
 
-func TestDetectStalledPolecats_NoPaneCapture(t *testing.T) {
+func TestDetectStalledPolecats_NoSession(t *testing.T) {
 	// When tmux sessions don't exist (no real tmux in test),
 	// HasSession returns false so polecats are skipped (not errors).
 	tmpDir := t.TempDir()
@@ -831,9 +831,25 @@ func TestDetectStalledPolecats_NoPaneCapture(t *testing.T) {
 	}
 
 	// No stalled because HasSession returns false (no real tmux in test),
-	// so polecats are skipped before pane capture is attempted.
+	// so polecats are skipped before structured signal checks.
 	if len(result.Stalled) != 0 {
 		t.Errorf("Stalled = %d, want 0 (no tmux sessions in test)", len(result.Stalled))
+	}
+}
+
+func TestStartupStallThresholds(t *testing.T) {
+	// Verify thresholds are reasonable
+	if StartupStallThreshold < 30*time.Second {
+		t.Errorf("StartupStallThreshold = %v, too short (< 30s)", StartupStallThreshold)
+	}
+	if StartupStallThreshold > 5*time.Minute {
+		t.Errorf("StartupStallThreshold = %v, too long (> 5min)", StartupStallThreshold)
+	}
+	if StartupActivityGrace < 15*time.Second {
+		t.Errorf("StartupActivityGrace = %v, too short (< 15s)", StartupActivityGrace)
+	}
+	if StartupActivityGrace > 5*time.Minute {
+		t.Errorf("StartupActivityGrace = %v, too long (> 5min)", StartupActivityGrace)
 	}
 }
 
