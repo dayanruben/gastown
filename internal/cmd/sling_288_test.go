@@ -666,12 +666,12 @@ set "left=%3"
 if "%cmd%"=="cook" exit /b 0
 if "%cmd%"=="mol" (
   if "%sub%"=="wisp" (
-    echo {"new_epic_id":"oag-wisp-wisp-rsia"}
+    echo {^"new_epic_id^":^"oag-wisp-wisp-rsia^"}
     exit /b 0
   )
   if "%sub%"=="bond" (
     if "%left%"=="oag-wisp-wisp-rsia" (
-      echo {"root_id":"oag-wisp-wisp-rsia"}
+      echo {^"root_id^":^"oag-wisp-wisp-rsia^"}
       exit /b 0
     )
     echo Error: unexpected bond target: %left% 1>&2
