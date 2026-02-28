@@ -146,64 +146,143 @@ and design planes federate via DoltHub using the Highway Operations
 Protocol — Gas Town's public federation layer built on Dolt's native
 push/pull remotes.
 
-## Ephemeral Data Lifecycle (CRITICAL)
+## Data Lifecycle: Think Git, Not SQL (CRITICAL)
 
-Dolt is sensitive to row volume and versioning overhead. Every row change
-creates a new chunk in Dolt's content-addressed storage. Without active
-garbage collection, databases bloat rapidly.
+Dolt is git under the hood. **The commit graph IS the storage cost, not the
+rows.** Every `bd create`, `bd update`, `bd close` generates a Dolt commit.
+DELETE a row and the commit that wrote it still exists in history. `dolt gc`
+reclaims unreferenced chunks, but the commit graph itself grows forever.
+
+This is the key insight from Tim Sehn (Dolt founder, 2026-02-27):
+
+> "Your Beads databases are small but your commit history is big."
+>
+> "If you delete a bead you want to rebase with the commit that wrote it
+> so it just isn't there any more in history."
+
+**Rebase** (`CALL DOLT_REBASE()`, available since v1.81.2) rewrites the
+commit graph — it's the real cleanup mechanism. DELETE + gc is necessary
+but insufficient. DELETE + rebase + gc is the full pipeline.
+
+Reference: https://www.dolthub.com/blog/2026-01-28-everybody-rebase/
+
+### The Six-Stage Lifecycle
+
+```
+CREATE → LIVE → CLOSE → DECAY → COMPACT → FLATTEN
+  │        │       │        │        │          │
+  Dolt   active   done   DELETE   REBASE     SQUASH
+  commit  work    bead    rows    commits    all history
+                         >7-30d  together   to 1 commit
+```
+
+| Stage | Owner | Frequency | Mechanism |
+|-------|-------|-----------|-----------|
+| CREATE | Any agent | Continuous | `bd create`, `bd mol wisp create` |
+| CLOSE | Agent or patrol | Per-task | `bd close`, `gt done` |
+| DECAY | Reaper Dog | Daily | `DELETE FROM wisps WHERE status='closed' AND age > 7d` |
+| COMPACT | Compactor Dog | Daily | `CALL DOLT_REBASE()` — squash old commits together |
+| FLATTEN | Mayor or manual | Monthly | Branch, soft-reset to initial commit, commit, swap main |
+
+The first three stages exist today. The last three are new work.
 
 ### Two Data Streams
 
 ```
-EPHEMERAL (wisps, patrol data)          SACRED (issues, molecules, mail, agents)
+EPHEMERAL (wisps, patrol data)          PERMANENT (issues, molecules, agents)
   CREATE                                  CREATE
   → work                                  → work
   → CLOSE (>24h)                          → CLOSE
-  → SQUASH to digest summary              → JSONL export (scrubbed)
-  → DELETE original rows                  → git push to GitHub
-  → digest into git                       → never delete from Dolt
+  → DELETE rows (Reaper)                  → JSONL export (scrubbed)
+  → REBASE history (Compactor)            → git push to GitHub
+  → gc unreferenced chunks (Doctor)       → COMPACT history periodically
+                                          → FLATTEN history quarterly
 ```
 
 **Ephemeral data** (wisps, wisp_events, wisp_labels, wisp_deps) is
-high-volume patrol exhaust. It's valuable in real-time but worthless
-after 24 hours. The Reaper Dog squashes it into digest summaries
-(aggregate stats per cycle), then DELETES the original rows. Without
-this, wisp tables grow without bound and Dolt performance degrades.
+high-volume patrol exhaust. Valuable in real-time, worthless after 24h.
+The Reaper Dog DELETES the rows. The Compactor Dog REBASES the commits
+that wrote them out of history. Without both, storage grows without bound.
 
-**Sacred data** (issues, molecules, agents, mail, dependencies, labels)
-is the permanent ledger. It's backed up via JSONL exports (scrubbed of
-test artifacts and pollution) and pushed to GitHub. Never deleted from
-Dolt unless corrupted.
+**Permanent data** (issues, molecules, agents, dependencies, labels) is
+the ledger. Even permanent data benefits from history compaction — a bead
+that was created, updated 5 times, and closed generates 7 commits that
+can be rebased into 1. The data survives; the intermediate history doesn't.
 
-### Dolt GC (Non-Negotiable)
+### History Compaction Operations
 
-`dolt gc` compacts old chunk data. Without it, databases bloat by 10-50x.
-The Doctor Dog runs gc at least daily. This is the single most important
-maintenance operation.
+**Daily compaction** (Compactor Dog):
+```sql
+-- Squash recent commits on a feature branch, then merge
+CALL DOLT_CHECKOUT('-b', 'compact-temp');
+CALL DOLT_REBASE('--interactive', 'main~50', 'HEAD');
+-- Agent resolves: squash old commits, keep recent ones
+CALL DOLT_CHECKOUT('main');
+CALL DOLT_MERGE('compact-temp');
+CALL DOLT_BRANCH('-d', 'compact-temp');
+```
+
+**Monthly flatten** (nuclear option from Tim Sehn):
+```bash
+# Squash ALL history to a single commit
+cd ~/.dolt-data/<db>
+dolt checkout -b fresh-start
+dolt reset --soft $(dolt log --oneline | tail -1 | awk '{print $1}')
+dolt commit -m "Flatten: squash history to single commit"
+dolt branch -D main
+dolt branch -m fresh-start main
+dolt gc
+```
+
+### Dolt GC
+
+`dolt gc` compacts old chunk data AFTER rebase removes commits from the
+graph. Run gc after rebase, not instead of it. The Doctor Dog runs gc
+daily. Order matters: rebase first, gc second.
 
 ```bash
 # Manual gc (stop server first for exclusive access)
 gt dolt stop
 cd ~/.dolt-data/<db> && dolt gc
 gt dolt start
-
-# Or: Doctor Dog runs it automatically via daemon
 ```
 
 ### Pollution Prevention
 
-Pollution enters Dolt via:
-1. **Test artifacts**: test code creates issues on production server
-2. **Wisp accumulation**: wisps closed but never deleted
-3. **Orphan databases**: test DBs that survive cleanup
-4. **Zombie servers**: test dolt-server processes in /tmp
+Pollution enters Dolt via four vectors:
+
+1. **Commit graph growth**: Every mutation = a commit. Rebase compacts.
+2. **Mail pollution**: Agents overuse `gt mail send` for routine comms.
+   Use `gt nudge` (ephemeral, zero Dolt cost) instead. See mail-protocol.md.
+3. **Test artifacts**: Test code creating issues on production server.
+   Firewall in store.go refuses test-prefixed CREATE DATABASE on port 3307.
+4. **Zombie processes**: Test dolt-server processes that outlive tests.
+   Doctor Dog kills these. 45 zombies (7GB RAM) found and killed 2026-02-27.
 
 Prevention is layered:
+- **Prompting**: Agents prefer `gt nudge` over `gt mail send` (zero commits)
 - **Firewall** (store.go): refuses test-prefixed CREATE DATABASE on port 3307
-- **Reaper Dog**: deletes closed wisps, auto-closes stale issues
+- **Reaper Dog**: DELETEs closed wisps, auto-closes stale issues
+- **Compactor Dog**: REBASEs old commits to compress history (NEW)
 - **Doctor Dog**: runs gc, kills zombie servers, detects orphan DBs
 - **JSONL Dog**: scrubs exports, rejects pollution, spike-detects before commit
 - **Janitor Dog**: cleans test server (port 3308)
+
+### Communication Hygiene (Reducing Commit Volume)
+
+Every `gt mail send` creates a bead + Dolt commit. Every `gt nudge`
+creates nothing. The rule:
+
+**Default to `gt nudge`. Only use `gt mail send` when the message MUST
+survive the recipient's session death.**
+
+| Role | Mail budget | Nudge for everything else |
+|------|-------------|--------------------------|
+| Polecat | 0-1 per session (HELP only) | Status, questions, updates |
+| Witness | Protocol messages only | Health checks, polecat pokes |
+| Refinery | Protocol messages only | Status to Witness |
+| Deacon | Escalations only | Timer callbacks, health pokes |
+| Dogs | Zero (never mail) | DOG_DONE via nudge to Deacon |
 
 ## Standalone Beads Note
 

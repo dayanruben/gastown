@@ -91,6 +91,13 @@ type Daemon struct {
 	// Option B throttling: only pour when anomaly detected AND cooldown elapsed.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	lastDoctorMolTime time.Time
+
+	// Doctor dog action cooldowns — prevent repeated actions within a window.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	lastDoctorRestart   time.Time
+	lastDoctorJanitor   time.Time
+	lastDoctorBackup    time.Time
+	lastDoctorEscalate  time.Time
 }
 
 // sessionDeath records a detected session death for mass death analysis.
@@ -418,16 +425,21 @@ func (d *Daemon) Run() error {
 		d.logger.Printf("Doctor dog ticker started (interval %v)", interval)
 	}
 
-	// Start janitor dog ticker if configured.
-	// Cleans up orphan test databases on the test server (port 3308).
-	var janitorDogTicker *time.Ticker
-	var janitorDogChan <-chan time.Time
-	if IsPatrolEnabled(d.patrolConfig, "janitor_dog") {
-		interval := janitorDogInterval(d.patrolConfig)
-		janitorDogTicker = time.NewTicker(interval)
-		janitorDogChan = janitorDogTicker.C
-		defer janitorDogTicker.Stop()
-		d.logger.Printf("Janitor dog ticker started (interval %v)", interval)
+	// Janitor dog: no longer uses a dedicated ticker.
+	// Dispatched via plugin system (dolt-janitor/plugin.md) through handleDogs().
+	// See docs/design/dog-execution-model.md for rationale.
+	var janitorDogChan <-chan time.Time // nil channel — never fires
+
+	// Start compactor dog ticker if configured.
+	// Flattens Dolt commit history to reclaim graph storage (daily).
+	var compactorDogTicker *time.Ticker
+	var compactorDogChan <-chan time.Time
+	if IsPatrolEnabled(d.patrolConfig, "compactor_dog") {
+		interval := compactorDogInterval(d.patrolConfig)
+		compactorDogTicker = time.NewTicker(interval)
+		compactorDogChan = compactorDogTicker.C
+		defer compactorDogTicker.Stop()
+		d.logger.Printf("Compactor dog ticker started (interval %v)", interval)
 	}
 
 	// Note: PATCH-010 uses per-session hooks in deacon/manager.go (SetAutoRespawnHook).
@@ -506,6 +518,13 @@ func (d *Daemon) Run() error {
 			// Janitor dog — pours molecule for test server orphan cleanup.
 			if !d.isShutdownInProgress() {
 				d.runJanitorDog()
+			}
+
+		case <-compactorDogChan:
+			// Compactor dog — flattens Dolt commit history on production databases.
+			// Reclaims commit graph storage. Doctor Dog gc reclaims chunks after.
+			if !d.isShutdownInProgress() {
+				d.runCompactorDog()
 			}
 
 		case <-timer.C:
@@ -1838,6 +1857,9 @@ func (d *Daemon) restartPolecatSession(rigName, polecatName, sessionName string)
 		}
 		return fmt.Errorf("creating session: %w", err)
 	}
+
+	// Record polecat spawn metric.
+	d.metrics.recordPolecatSpawn(d.ctx, rigName)
 
 	// Set environment variables in tmux session table (for debugging/monitoring tools).
 	// The process itself gets env vars via 'exec env ...' in the startup command.

@@ -794,6 +794,7 @@ func (r *Router) shouldBeWisp(msg *Message) bool {
 	wispPrefixes := []string{
 		"polecat_started",
 		"polecat_done",
+		"work_done",
 		"start_work",
 		"nudge",
 	}
@@ -956,6 +957,11 @@ func (r *Router) validateAgentWorkspace(identity string) bool {
 			if dirExists(filepath.Join(r.townRoot, rig, role, name)) {
 				return true
 			}
+		}
+	case 3:
+		// Dog addresses: deacon/dogs/<name>
+		if dirExists(filepath.Join(r.townRoot, parts[0], parts[1], parts[2])) {
+			return true
 		}
 	}
 

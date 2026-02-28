@@ -611,7 +611,9 @@ func (b *Beads) ListAgentBeads() (map[string]*Issue, error) {
 	}
 
 	// Also query issues table (backward compat during migration).
-	out, err := b.run("list", "--label=gt:agent", "--json")
+	// Agent beads are type=agent (infrastructure), hidden by bd list default filter.
+	// Use --include-infra so they appear in results.
+	out, err := b.run("list", "--label=gt:agent", "--include-infra", "--json")
 	if err != nil && len(result) == 0 {
 		return nil, err
 	}
