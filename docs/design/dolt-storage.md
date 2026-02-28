@@ -1,7 +1,7 @@
 # Dolt Storage Architecture
 
 > **Status**: Current reference for Gas Town agents
-> **Updated**: 2026-02-16
+> **Updated**: 2026-02-28
 > **Context**: Dolt is the sole storage backend for Beads and Gas Town
 
 ---
@@ -11,7 +11,9 @@
 Gas Town uses [Dolt](https://github.com/dolthub/dolt), an open-source
 SQL database with Git-like versioning (Apache 2.0). One Dolt SQL server
 per town serves all databases via MySQL protocol on port 3307. There is
-no embedded mode, no SQLite, and no JSONL.
+no embedded mode and no SQLite. JSONL is used only for disaster-recovery
+backups (the JSONL Dog exports scrubbed snapshots every 15 minutes to a
+git-backed archive), not as a primary storage format.
 
 The `gt daemon` manages the server lifecycle (auto-start, health checks
 every 30s, crash restart with exponential backoff).
@@ -23,10 +25,11 @@ Dolt SQL Server (one per town, port 3307)
 ├── hq/       town-level beads  (hq-* prefix)
 ├── gastown/  rig beads         (gt-* prefix)
 ├── beads/    rig beads         (bd-* prefix)
-└── ...       additional rigs
+├── wyvern/   rig beads         (wy-* prefix)
+└── sky/      rig beads         (sky-* prefix)
 ```
 
-**Data directory**: `~/.dolt-data/` — each subdirectory is a database
+**Data directory**: `~/gt/.dolt-data/` — each subdirectory is a database
 accessible via `USE <name>` in SQL.
 
 **Connection**: `root@tcp(127.0.0.1:3307)/<database>` (no password for
@@ -74,42 +77,76 @@ transaction to maintain atomicity.
 
 ## Schema
 
+Schema version 6. The full schema lives in `beads/.../storage/dolt/schema.go`.
+Key tables shown below; see source for indexes and full column lists.
+
 ```sql
+-- Core: every bead is a row in issues (tasks, messages, agents, gates, etc.)
 CREATE TABLE issues (
-    id VARCHAR(64) PRIMARY KEY,
-    type VARCHAR(32),
-    title TEXT,
-    description TEXT,
-    status VARCHAR(32),
-    priority INT,
-    owner VARCHAR(255),
+    id VARCHAR(255) PRIMARY KEY,
+    title VARCHAR(500) NOT NULL,
+    description TEXT NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'open',
+    priority INT NOT NULL DEFAULT 2,
+    issue_type VARCHAR(32) NOT NULL DEFAULT 'task',
     assignee VARCHAR(255),
-    labels JSON,
-    parent VARCHAR(64),
-    created_at TIMESTAMP,
-    updated_at TIMESTAMP,
-    closed_at TIMESTAMP
+    owner VARCHAR(255) DEFAULT '',
+    sender VARCHAR(255) DEFAULT '',          -- messaging
+    mol_type VARCHAR(32) DEFAULT '',         -- molecule type
+    work_type VARCHAR(32) DEFAULT 'mutex',   -- mutex vs open_competition
+    hook_bead VARCHAR(255) DEFAULT '',       -- agent hook
+    role_bead VARCHAR(255) DEFAULT '',       -- agent role
+    agent_state VARCHAR(32) DEFAULT '',      -- agent lifecycle
+    wisp_type VARCHAR(32) DEFAULT '',        -- TTL-based compaction class
+    metadata JSON DEFAULT (JSON_OBJECT()),   -- extensible metadata
+    created_at DATETIME, updated_at DATETIME, closed_at DATETIME
+    -- ... plus ~20 more columns (see schema.go)
 );
 
-CREATE TABLE mail (
-    id VARCHAR(64) PRIMARY KEY,
-    thread_id VARCHAR(64),
-    from_addr VARCHAR(255),
-    to_addrs JSON,
-    subject TEXT,
-    body TEXT,
-    sent_at TIMESTAMP,
-    read_at TIMESTAMP
+-- Relationships between beads
+CREATE TABLE dependencies (
+    issue_id VARCHAR(255) NOT NULL,
+    depends_on_id VARCHAR(255) NOT NULL,
+    type VARCHAR(32) NOT NULL DEFAULT 'blocks',   -- blocks, parent-child, thread
+    PRIMARY KEY (issue_id, depends_on_id)
 );
 
-CREATE TABLE channels (
-    id VARCHAR(64) PRIMARY KEY,
-    name VARCHAR(255),
-    type VARCHAR(32),
-    config JSON,
-    created_at TIMESTAMP
+-- Labels (many-to-many)
+CREATE TABLE labels (
+    issue_id VARCHAR(255) NOT NULL,
+    label VARCHAR(255) NOT NULL,
+    PRIMARY KEY (issue_id, label)
 );
+
+-- Audit trail
+CREATE TABLE comments (id BIGINT AUTO_INCREMENT PRIMARY KEY, issue_id, author, text, created_at);
+CREATE TABLE events   (id BIGINT AUTO_INCREMENT PRIMARY KEY, issue_id, event_type, actor, old_value, new_value, created_at);
+
+-- Agent interaction log
+CREATE TABLE interactions (id, kind, actor, issue_id, model, prompt, response, created_at);
+
+-- Infrastructure
+CREATE TABLE config          (key PRIMARY KEY, value);       -- runtime config knobs
+CREATE TABLE metadata        (key PRIMARY KEY, value);       -- schema version, etc.
+CREATE TABLE routes          (prefix PRIMARY KEY, path);     -- prefix→database routing
+CREATE TABLE issue_counter   (prefix PRIMARY KEY, last_id);  -- sequential ID generation
+CREATE TABLE child_counters  (parent_id PRIMARY KEY, last_child);
+CREATE TABLE federation_peers (name PRIMARY KEY, remote_url, sovereignty, last_sync);
+
+-- Compaction
+CREATE TABLE issue_snapshots     (id, issue_id, compaction_level, original_content, ...);
+CREATE TABLE compaction_snapshots (id, issue_id, compaction_level, snapshot_json, ...);
+CREATE TABLE repo_mtimes         (repo_path PRIMARY KEY, mtime_ns, last_checked);
 ```
+
+**Wisps** (ephemeral patrol data) reuse the same `issues` table with
+`wisp_type` set. They are Dolt-ignored (`dolt_ignore` table) so wisp
+mutations don't generate Dolt commits — only structural changes to the
+ignore config itself are committed.
+
+**Mail** is implemented as beads with `issue_type='message'` in the
+issues table — there is no separate mail table. The `sender` field and
+`dependencies` (type='thread') provide threading.
 
 ## Dolt-Specific Capabilities
 
@@ -135,16 +172,17 @@ Arrays (labels): `union` merge. Counters: `max`.
 
 Beads data falls into three planes with different characteristics:
 
-| Plane | What | Mutation | Durability | Transport |
-|-------|------|----------|------------|-----------|
-| **Operational** | Work in progress, status, assignments, heartbeats | High (seconds) | Days–weeks | Dolt SQL server (local) |
-| **Ledger** | Completed work, permanent record, skill vectors | Low (completion boundaries) | Permanent | DoltHub remotes + federation |
-| **Design** | Epics, RFCs, specs — ideas not yet claimed | Conversational | Until crystallized | DoltHub commons (shared) |
+| Plane | What | Mutation | Durability | Transport | Status |
+|-------|------|----------|------------|-----------|--------|
+| **Operational** | Work in progress, status, assignments, heartbeats | High (seconds) | Days–weeks | Dolt SQL server (local) | **Live** |
+| **Ledger** | Completed work, permanent record | Low (completion boundaries) | Permanent | JSONL export → git push to GitHub | **Live** |
+| **Design** | Epics, RFCs, specs — ideas not yet claimed | Conversational | Until crystallized | DoltHub commons (shared) | **Planned** |
 
 The operational plane lives entirely in the local Dolt server. The ledger
-and design planes federate via DoltHub using the Highway Operations
-Protocol — Gas Town's public federation layer built on Dolt's native
-push/pull remotes.
+plane is currently served by the JSONL Dog, which exports scrubbed snapshots
+to a git-backed archive every 15 minutes — this is the durable record that
+survives disasters (proven in Clown Show #13). The design plane will
+federate via DoltHub as part of the Wasteland commons (in progress).
 
 ## Data Lifecycle: Think Git, Not SQL (CRITICAL)
 
@@ -226,7 +264,7 @@ CALL DOLT_BRANCH('-d', 'compact-temp');
 **Monthly flatten** (nuclear option from Tim Sehn):
 ```bash
 # Squash ALL history to a single commit
-cd ~/.dolt-data/<db>
+cd ~/gt/.dolt-data/<db>
 dolt checkout -b fresh-start
 dolt reset --soft $(dolt log --oneline | tail -1 | awk '{print $1}')
 dolt commit -m "Flatten: squash history to single commit"
@@ -245,7 +283,7 @@ first, gc second.
 ```bash
 # Manual gc (stop server first for exclusive access)
 gt dolt stop
-cd ~/.dolt-data/<db> && dolt gc
+cd ~/gt/.dolt-data/<db> && dolt gc
 gt dolt start
 ```
 
@@ -300,7 +338,7 @@ protocol.
 
 ### Git Remote Cache
 
-Dolt maintains a cache at `.dolt-data/<db>/.dolt/git-remote-cache/` that
+Dolt maintains a cache at `~/gt/.dolt-data/<db>/.dolt/git-remote-cache/` that
 stores git objects built from Dolt's internal format. Per the Dolt team
 (Dustin Brown, 2026-02-26):
 
@@ -336,11 +374,14 @@ remote with local state. Subsequent pushes should work without `--force`.
 - **Server downtime**: Push requires exclusive access to the data directory,
   so the server must be stopped during push. This creates a maintenance window.
 
-### Future: DoltHub Remotes
+### DoltHub Remotes (In Progress)
 
 DoltHub's native protocol (`https://doltremoteapi.dolthub.com/...`) avoids
-the git-remote-cache entirely and is much faster. Migration requires DoltHub
-accounts and reconfiguring remotes with `dolt remote set-url`.
+the git-remote-cache entirely and is much faster. Julian Knutsen is
+implementing DoltHub-based federation as part of the Wasteland commons —
+this will replace git-protocol remotes for the design and ledger planes.
+Migration requires DoltHub accounts and reconfiguring remotes with
+`dolt remote set-url`.
 
 ## File Layout
 
@@ -350,10 +391,11 @@ accounts and reconfiguring remotes with `dolt remote set-url`.
 │   ├── hq/                      Town beads (hq-*)
 │   ├── gastown/                 Gastown rig (gt-*)
 │   ├── beads/                   Beads rig (bd-*)
-│   └── wyvern/                  Wyvern rig (wy-*)
+│   ├── wyvern/                  Wyvern rig (wy-*)
+│   └── sky/                     Sky rig (sky-*)
 ├── daemon/
 │   ├── dolt.pid                 Server PID (daemon-managed)
-│   ├── dolt-server.log          Server log
+│   ├── dolt.log                 Server log
 │   └── dolt-state.json          Server state
 └── mayor/
     └── daemon.json              Daemon config (dolt_server section)
