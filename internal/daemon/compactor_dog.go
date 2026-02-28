@@ -170,7 +170,7 @@ func (d *Daemon) compactorCountCommits(dbName string) (int, error) {
 	defer db.Close()
 
 	var count int
-	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.dolt_log", dbName) //nolint:gosec // dbName is an internal config value, not user input; backtick quoting is safe
+	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.dolt_log", dbName)
 	if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count dolt_log: %w", err)
 	}
@@ -325,10 +325,10 @@ func (d *Daemon) compactorGetHead(db *sql.DB, dbName string) (string, error) {
 	defer cancel()
 
 	var hash string
-	query := fmt.Sprintf("SELECT DOLT_HASHOF('main') FROM `%s`.dual", dbName) //nolint:gosec // dbName is an internal config value, not user input; backtick quoting is safe
+	query := fmt.Sprintf("SELECT DOLT_HASHOF('main') FROM `%s`.dual", dbName)
 	if err := db.QueryRowContext(ctx, query).Scan(&hash); err != nil {
 		// Fallback: try without dual table.
-		query = fmt.Sprintf("SELECT commit_hash FROM `%s`.dolt_log ORDER BY date DESC LIMIT 1", dbName) //nolint:gosec // same: internal dbName, backtick-quoted
+		query = fmt.Sprintf("SELECT commit_hash FROM `%s`.dolt_log ORDER BY date DESC LIMIT 1", dbName)
 		if err := db.QueryRowContext(ctx, query).Scan(&hash); err != nil {
 			return "", err
 		}
@@ -357,7 +357,7 @@ func (d *Daemon) compactorGetRootCommit(db *sql.DB, dbName string) (string, erro
 	defer cancel()
 
 	var hash string
-	query := fmt.Sprintf("SELECT commit_hash FROM `%s`.dolt_log ORDER BY date ASC LIMIT 1", dbName) //nolint:gosec // dbName is an internal config value, not user input; backtick quoting is safe
+	query := fmt.Sprintf("SELECT commit_hash FROM `%s`.dolt_log ORDER BY date ASC LIMIT 1", dbName)
 	if err := db.QueryRowContext(ctx, query).Scan(&hash); err != nil {
 		return "", err
 	}
