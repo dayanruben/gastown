@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -376,7 +375,7 @@ func runDaemonClearBackoff(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("finding daemon process: %w", err)
 		}
-		if err := process.Signal(syscall.SIGUSR2); err != nil {
+		if err := signalDaemonReload(process); err != nil {
 			return fmt.Errorf("signaling daemon to reload: %w", err)
 		}
 		fmt.Printf("%s Cleared backoff for %s (daemon reloaded)\n", style.Bold.Render("✓"), agentID)
