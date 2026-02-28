@@ -1444,14 +1444,17 @@ func (m *Manager) ReconcilePoolWith(namesWithDirs, namesWithSessions []string) {
 	// - Has directory but dead process: stale session from crashed startup (gt-jn40ft)
 	// Use KillSessionWithProcesses to ensure all descendant processes are killed.
 	if m.tmux != nil {
+		townRoot := filepath.Dir(m.rig.Path)
 		for _, name := range namesWithSessions {
 			sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), name)
 			if !dirSet[name] {
 				// Orphan: session exists but no directory
 				_ = m.tmux.KillSessionWithProcesses(sessionName)
-			} else if isSessionProcessDead(m.tmux, sessionName) {
+				RemoveSessionHeartbeat(townRoot, sessionName)
+			} else if isSessionProcessDead(m.tmux, sessionName, townRoot) {
 				// Stale: directory exists but session's process has died
 				_ = m.tmux.KillSessionWithProcesses(sessionName)
+				RemoveSessionHeartbeat(townRoot, sessionName)
 			}
 		}
 	}
@@ -1463,10 +1466,29 @@ func (m *Manager) ReconcilePoolWith(namesWithDirs, namesWithSessions []string) {
 	m.cleanupOrphanPolecatState()
 }
 
-// isSessionProcessDead checks if a tmux session's pane process has exited.
+// isSessionProcessDead checks if a polecat session's agent has exited.
+//
+// Uses heartbeat-based liveness detection (gt-qjtq): checks whether the session's
+// heartbeat file has been updated recently. Polecat sessions touch their heartbeat
+// via gt commands (gt prime, gt hook, bd show, etc.) which run frequently during
+// normal operation. A stale heartbeat indicates the agent is no longer active.
+//
+// Falls back to PID signal probing when no heartbeat file exists (backward
+// compatibility for sessions started before heartbeat support was added).
+//
 // Returns true only when we can confirm the process is dead, not on transient
-// tmux query failures (gt-kncti: permission denied false positives).
-func isSessionProcessDead(t *tmux.Tmux, sessionName string) bool {
+// failures (gt-kncti: permission denied false positives).
+func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) bool {
+	// Primary: heartbeat-based liveness check (gt-qjtq ZFC fix).
+	if townRoot != "" {
+		stale, exists := IsSessionHeartbeatStale(townRoot, sessionName)
+		if exists {
+			return stale
+		}
+		// No heartbeat file — fall through to PID-based check for backward compatibility.
+	}
+
+	// Fallback: PID signal probing (legacy, for sessions without heartbeat support).
 	pidStr, err := t.GetPanePID(sessionName)
 	if err != nil {
 		// Tmux query failed — could be permission denied, server busy, etc.

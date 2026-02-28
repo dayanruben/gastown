@@ -452,6 +452,10 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
 	_ = session.TrackSessionPID(townRoot, sessionID, m.tmux)
 
+	// Touch initial heartbeat so liveness detection works from the start (gt-qjtq).
+	// Subsequent touches happen on every gt command via persistentPreRun.
+	TouchSessionHeartbeat(townRoot, sessionID)
+
 	return nil
 }
 
@@ -460,7 +464,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 // This happens when the agent crashes during startup but tmux keeps the dead pane.
 // Delegates to isSessionProcessDead to avoid duplicating process-check logic (gt-qgzj1h).
 func (m *SessionManager) isSessionStale(sessionID string) bool {
-	return isSessionProcessDead(m.tmux, sessionID)
+	return isSessionProcessDead(m.tmux, sessionID, filepath.Dir(m.rig.Path))
 }
 
 // Stop terminates a polecat session.
