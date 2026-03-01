@@ -75,6 +75,10 @@ type Daemon struct {
 	gtPath string
 	bdPath string
 
+	// Boot spawn cooldown: prevents Boot from spawning on every heartbeat tick.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	bootLastSpawned time.Time
+
 	// Restart tracking with exponential backoff to prevent crash loops
 	restartTracker *RestartTracker
 
@@ -92,12 +96,9 @@ type Daemon struct {
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	lastDoctorMolTime time.Time
 
-	// Doctor dog action cooldowns — prevent repeated actions within a window.
+	// lastMaintenanceRun tracks when scheduled maintenance last ran.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
-	lastDoctorRestart   time.Time
-	lastDoctorJanitor   time.Time
-	lastDoctorBackup    time.Time
-	lastDoctorEscalate  time.Time
+	lastMaintenanceRun time.Time
 }
 
 // sessionDeath records a detected session death for mass death analysis.
@@ -147,7 +148,21 @@ func New(config *Config) (*Daemon, error) {
 		logger.Printf("Warning: failed to initialize town registry: %v", err)
 	}
 
-	// Load patrol config from mayor/daemon.json (optional - nil if missing)
+	// Set GT_TOWN_ROOT in tmux global environment so run-shell subprocesses
+	// (e.g., gt cycle next/prev) can find the workspace even when CWD is $HOME.
+	// Non-fatal: tmux server may not be running yet — daemon creates sessions shortly.
+	t := tmux.NewTmux()
+	if err := t.SetGlobalEnvironment("GT_TOWN_ROOT", config.TownRoot); err != nil {
+		logger.Printf("Warning: failed to set GT_TOWN_ROOT in tmux global env: %v", err)
+	}
+
+	// Load patrol config from mayor/daemon.json, ensuring lifecycle defaults
+	// are populated for any missing data maintenance tickers. Without this,
+	// opt-in patrols (compactor, reaper, doctor, JSONL backup, dolt backup)
+	// remain disabled if the file was created before they were implemented.
+	if err := EnsureLifecycleConfigFile(config.TownRoot); err != nil {
+		logger.Printf("Warning: failed to ensure lifecycle config: %v", err)
+	}
 	patrolConfig := LoadPatrolConfig(config.TownRoot)
 	if patrolConfig != nil {
 		logger.Printf("Loaded patrol config from %s", PatrolConfigFile(config.TownRoot))
@@ -188,8 +203,13 @@ func New(config *Config) (*Daemon, error) {
 		logger.Printf("Warning: bd not found in PATH, subprocess calls may fail")
 	}
 
-	// Initialize restart tracker with exponential backoff
-	restartTracker := NewRestartTracker(config.TownRoot)
+	// Initialize restart tracker with exponential backoff.
+	// Parameters are configurable via patrols.restart_tracker in daemon.json.
+	var rtCfg RestartTrackerConfig
+	if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.RestartTracker != nil {
+		rtCfg = *patrolConfig.Patrols.RestartTracker
+	}
+	restartTracker := NewRestartTracker(config.TownRoot, rtCfg)
 	if err := restartTracker.Load(); err != nil {
 		logger.Printf("Warning: failed to load restart state: %v", err)
 	}
@@ -271,8 +291,8 @@ func (d *Daemon) Run() error {
 		}
 	}
 
-	// Write PID file
-	if err := os.WriteFile(d.config.PidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
+	// Write PID file with nonce for ownership verification
+	if _, err := writePIDFile(d.config.PidFile, os.Getpid()); err != nil {
 		return fmt.Errorf("writing PID file: %w", err)
 	}
 	defer func() { _ = os.Remove(d.config.PidFile) }() // best-effort cleanup
@@ -442,6 +462,20 @@ func (d *Daemon) Run() error {
 		d.logger.Printf("Compactor dog ticker started (interval %v)", interval)
 	}
 
+	// Start scheduled maintenance ticker if configured.
+	// Checks periodically whether we're in the maintenance window and
+	// runs `gt maintain --force` when commit counts exceed threshold.
+	var scheduledMaintenanceTicker *time.Ticker
+	var scheduledMaintenanceChan <-chan time.Time
+	if IsPatrolEnabled(d.patrolConfig, "scheduled_maintenance") {
+		interval := maintenanceCheckInterval(d.patrolConfig)
+		scheduledMaintenanceTicker = time.NewTicker(interval)
+		scheduledMaintenanceChan = scheduledMaintenanceTicker.C
+		defer scheduledMaintenanceTicker.Stop()
+		window := maintenanceWindow(d.patrolConfig)
+		d.logger.Printf("Scheduled maintenance ticker started (check interval %v, window %s)", interval, window)
+	}
+
 	// Note: PATCH-010 uses per-session hooks in deacon/manager.go (SetAutoRespawnHook).
 	// Global pane-died hooks don't fire reliably in tmux 3.2a, so we rely on the
 	// per-session approach which has been tested to work for continuous recovery.
@@ -460,6 +494,14 @@ func (d *Daemon) Run() error {
 				// Lifecycle signal: immediate lifecycle processing (from gt handoff)
 				d.logger.Println("Received lifecycle signal, processing lifecycle requests immediately")
 				d.processLifecycleRequests()
+			} else if isReloadRestartSignal(sig) {
+				// Reload restart tracker from disk (from 'gt daemon clear-backoff')
+				d.logger.Println("Received reload-restart signal, reloading restart tracker from disk")
+				if d.restartTracker != nil {
+					if err := d.restartTracker.Load(); err != nil {
+						d.logger.Printf("Warning: failed to reload restart tracker: %v", err)
+					}
+				}
 			} else {
 				d.logger.Printf("Received signal %v, shutting down", sig)
 				return d.shutdown(state)
@@ -522,9 +564,16 @@ func (d *Daemon) Run() error {
 
 		case <-compactorDogChan:
 			// Compactor dog — flattens Dolt commit history on production databases.
-			// Reclaims commit graph storage. Doctor Dog gc reclaims chunks after.
+			// Reclaims commit graph storage, then runs gc to reclaim chunks.
 			if !d.isShutdownInProgress() {
 				d.runCompactorDog()
+			}
+
+		case <-scheduledMaintenanceChan:
+			// Scheduled maintenance — checks if we're in the maintenance window
+			// and runs `gt maintain --force` when commit counts exceed threshold.
+			if !d.isShutdownInProgress() {
+				d.runScheduledMaintenance()
 			}
 
 		case <-timer.C:
@@ -792,12 +841,19 @@ func (d *Daemon) getDeaconSessionName() string {
 // Boot is a fresh-each-tick watchdog that decides whether to start/wake/nudge
 // the Deacon, centralizing the "when to wake" decision in an agent.
 // In degraded mode (no tmux), falls back to mechanical checks.
-func (d *Daemon) ensureBootRunning() {
-	b := boot.New(d.config.TownRoot)
+// bootSpawnCooldown prevents Boot from spawning on every daemon heartbeat.
+// Boot triage runs are expensive (AI reasoning); if one just ran, skip.
+const bootSpawnCooldown = 2 * time.Minute
 
-	// Boot is ephemeral - always spawn fresh each tick.
-	// spawnTmux() kills any existing session before spawning, ensuring
-	// Boot never accumulates context across triage cycles.
+func (d *Daemon) ensureBootRunning() {
+	// Cooldown gate: skip if Boot was spawned recently (fixes #2084)
+	if !d.bootLastSpawned.IsZero() && time.Since(d.bootLastSpawned) < bootSpawnCooldown {
+		d.logger.Printf("Boot spawned %s ago, within cooldown (%s), skipping",
+			time.Since(d.bootLastSpawned).Round(time.Second), bootSpawnCooldown)
+		return
+	}
+
+	b := boot.New(d.config.TownRoot)
 
 	// Check for degraded mode
 	degraded := os.Getenv("GT_DEGRADED") == "true"
@@ -817,6 +873,7 @@ func (d *Daemon) ensureBootRunning() {
 		return
 	}
 
+	d.bootLastSpawned = time.Now()
 	d.logger.Println("Boot spawned successfully")
 }
 
@@ -913,6 +970,14 @@ const deaconGracePeriod = 5 * time.Minute
 // - Grace period only applies if heartbeat is from BEFORE we started Deacon
 // - If heartbeat is from AFTER start but stale, Deacon is stuck
 func (d *Daemon) checkDeaconHeartbeat() {
+	// Respect crash-loop guard: if the restart tracker says Deacon is in a
+	// crash loop, do not kill the session — the guard is deliberately holding
+	// off restarts to break the cycle. (Fixes #2086)
+	if d.restartTracker != nil && d.restartTracker.IsInCrashLoop("deacon") {
+		d.logger.Printf("Deacon is in crash-loop state, skipping heartbeat kill check")
+		return
+	}
+
 	// Always read heartbeat first (PATCH-005)
 	hb := deacon.ReadHeartbeat(d.config.TownRoot)
 
@@ -1241,15 +1306,29 @@ func (d *Daemon) getKnownRigs() []string {
 	return rigs
 }
 
-// getPatrolRigs returns the list of rigs for a patrol.
+// getPatrolRigs returns the list of operational rigs for a patrol.
 // If the patrol config specifies a rigs filter, only those rigs are returned.
-// Otherwise, all known rigs are returned.
+// Otherwise, all known rigs are returned. In both cases, non-operational
+// rigs (parked/docked) are filtered out at list-building time. (Fixes upstream #2082)
 func (d *Daemon) getPatrolRigs(patrol string) []string {
 	configRigs := GetPatrolRigs(d.patrolConfig, patrol)
+	var candidates []string
 	if len(configRigs) > 0 {
-		return configRigs
+		candidates = configRigs
+	} else {
+		candidates = d.getKnownRigs()
 	}
-	return d.getKnownRigs()
+
+	// Filter out non-operational rigs early to avoid per-rig skip noise
+	var operational []string
+	for _, rigName := range candidates {
+		if ok, reason := d.isRigOperational(rigName); ok {
+			operational = append(operational, rigName)
+		} else {
+			d.logger.Printf("Excluding %s from %s patrol: %s", rigName, patrol, reason)
+		}
+	}
+	return operational
 }
 
 // isRigOperational checks if a rig is in an operational state.
@@ -1447,65 +1526,26 @@ func IsShutdownInProgress(townRoot string) bool {
 // duplicate daemons. This function is for status checks and cleanup.
 func IsRunning(townRoot string) (bool, int, error) {
 	pidFile := filepath.Join(townRoot, "daemon", "daemon.pid")
-	data, err := os.ReadFile(pidFile)
+
+	pid, alive, err := verifyPIDOwnership(pidFile)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return false, 0, nil
-		}
-		// Return error for other failures (permissions, I/O)
-		return false, 0, fmt.Errorf("reading PID file: %w", err)
+		return false, 0, fmt.Errorf("checking PID file: %w", err)
 	}
 
-	pidStr := strings.TrimSpace(string(data))
-	pid, err := strconv.Atoi(pidStr)
-	if err != nil {
-		// Corrupted PID file - return error, not silent false
-		return false, 0, fmt.Errorf("invalid PID in file %q: %w", pidStr, err)
-	}
-
-	// Check if process is alive
-	process, err := os.FindProcess(pid)
-	if err != nil {
+	if pid == 0 {
+		// No PID file
 		return false, 0, nil
 	}
 
-	// On Unix, FindProcess always succeeds. Send signal 0 to check if alive.
-	if err := process.Signal(syscall.Signal(0)); err != nil {
+	if !alive {
 		// Process not running, clean up stale PID file
 		if err := os.Remove(pidFile); err == nil {
-			// Successfully cleaned up stale file
 			return false, 0, fmt.Errorf("removed stale PID file (process %d not found)", pid)
 		}
 		return false, 0, nil
 	}
 
-	// CRITICAL: Verify it's actually our daemon, not PID reuse
-	if !isGasTownDaemon(pid) {
-		// PID reused by different process
-		if err := os.Remove(pidFile); err == nil {
-			return false, 0, fmt.Errorf("removed stale PID file (PID %d is not gt daemon)", pid)
-		}
-		return false, 0, nil
-	}
-
 	return true, pid, nil
-}
-
-// isGasTownDaemon checks if a PID is actually a gt daemon run process.
-// This prevents false positives from PID reuse.
-// Uses ps command for cross-platform compatibility (Linux, macOS).
-func isGasTownDaemon(pid int) bool {
-	// Use ps to get command for the PID (works on Linux and macOS)
-	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=")
-	output, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-
-	cmdline := strings.TrimSpace(string(output))
-
-	// Check if it's "gt daemon run" or "/path/to/gt daemon run"
-	return strings.Contains(cmdline, "gt") && strings.Contains(cmdline, "daemon") && strings.Contains(cmdline, "run")
 }
 
 // StopDaemon stops the running daemon for the given town.
@@ -1547,10 +1587,10 @@ func StopDaemon(townRoot string) error {
 }
 
 // FindOrphanedDaemons finds all gt daemon run processes that aren't tracked by PID file.
-// Returns list of orphaned PIDs.
-func FindOrphanedDaemons() ([]int, error) {
-	// Use pgrep to find all "daemon run" processes (broad search, then verify with isGasTownDaemon)
-	cmd := exec.Command("pgrep", "-f", "daemon run")
+// Returns list of orphaned PIDs. The townRoot is used to check if a PID is tracked.
+func FindOrphanedDaemons(townRoot string) ([]int, error) {
+	// Use pgrep to find all "daemon run" processes (broad search)
+	cmd := exec.Command("pgrep", "-f", "gt.*daemon.*run")
 	output, err := cmd.Output()
 	if err != nil {
 		// Exit code 1 means no processes found - that's OK
@@ -1560,7 +1600,10 @@ func FindOrphanedDaemons() ([]int, error) {
 		return nil, fmt.Errorf("pgrep failed: %w", err)
 	}
 
-	// Parse PIDs
+	// Get the tracked daemon PID from PID file
+	trackedPID, _, _ := readPIDFile(filepath.Join(townRoot, "daemon", "daemon.pid"))
+
+	// Parse PIDs and filter out tracked ones
 	var pids []int
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 		if line == "" {
@@ -1570,10 +1613,11 @@ func FindOrphanedDaemons() ([]int, error) {
 		if err != nil {
 			continue
 		}
-		// Verify it's actually gt daemon (filters out unrelated processes)
-		if isGasTownDaemon(pid) {
-			pids = append(pids, pid)
+		// Skip our own PID and the tracked daemon PID
+		if pid == os.Getpid() || pid == trackedPID {
+			continue
 		}
+		pids = append(pids, pid)
 	}
 
 	return pids, nil
@@ -1581,8 +1625,8 @@ func FindOrphanedDaemons() ([]int, error) {
 
 // KillOrphanedDaemons finds and kills any orphaned gt daemon processes.
 // Returns number of processes killed.
-func KillOrphanedDaemons() (int, error) {
-	pids, err := FindOrphanedDaemons()
+func KillOrphanedDaemons(townRoot string) (int, error) {
+	pids, err := FindOrphanedDaemons(townRoot)
 	if err != nil {
 		return 0, err
 	}

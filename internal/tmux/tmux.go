@@ -59,14 +59,26 @@ func validateSessionName(name string) error {
 
 // defaultSocket is the tmux socket name (-L flag) for multi-instance isolation.
 // When set, all tmux commands use this socket instead of the default server.
-var defaultSocket string
+// Access is protected by defaultSocketMu for concurrent test safety.
+var (
+	defaultSocket   string
+	defaultSocketMu sync.RWMutex
+)
 
 // SetDefaultSocket sets the package-level default tmux socket name.
 // Called during init to scope tmux to the current town.
-func SetDefaultSocket(name string) { defaultSocket = name }
+func SetDefaultSocket(name string) {
+	defaultSocketMu.Lock()
+	defaultSocket = name
+	defaultSocketMu.Unlock()
+}
 
 // GetDefaultSocket returns the current default tmux socket name.
-func GetDefaultSocket() string { return defaultSocket }
+func GetDefaultSocket() string {
+	defaultSocketMu.RLock()
+	defer defaultSocketMu.RUnlock()
+	return defaultSocket
+}
 
 // SocketDir returns the directory where tmux stores its socket files.
 // On macOS, tmux uses /tmp (not $TMPDIR which points to /var/folders/...),
@@ -87,7 +99,7 @@ func IsInSameSocket() bool {
 	parts := strings.SplitN(tmuxEnv, ",", 2)
 	currentSocket := filepath.Base(parts[0])
 
-	targetSocket := defaultSocket
+	targetSocket := GetDefaultSocket()
 	if targetSocket == "" {
 		targetSocket = "default"
 	}
@@ -98,8 +110,8 @@ func IsInSameSocket() bool {
 // Use this instead of exec.Command("tmux", ...) for code outside the Tmux struct.
 func BuildCommand(args ...string) *exec.Cmd {
 	allArgs := []string{"-u"}
-	if defaultSocket != "" {
-		allArgs = append(allArgs, "-L", defaultSocket)
+	if sock := GetDefaultSocket(); sock != "" {
+		allArgs = append(allArgs, "-L", sock)
 	}
 	allArgs = append(allArgs, args...)
 	return exec.Command("tmux", allArgs...)
@@ -119,7 +131,7 @@ const noTownSocket = "gt-no-town-socket"
 // Falls back to GT_TOWN_SOCKET env var (set by cross-socket tmux bindings),
 // then to a sentinel socket that fails clearly if neither is available.
 func NewTmux() *Tmux {
-	sock := defaultSocket
+	sock := GetDefaultSocket()
 	if sock == "" {
 		// GT_TOWN_SOCKET is embedded in tmux bindings created by EnsureBindingsOnSocket
 		// so that "gt agents menu" / "gt feed" invoked from a personal terminal still
@@ -200,8 +212,14 @@ func (t *Tmux) NewSession(name, workDir string) error {
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
-	_, err := t.run(args...)
-	return err
+	if _, err := t.run(args...); err != nil {
+		return err
+	}
+	// tmux 3.3+ sets window-size=manual on detached sessions (no client present),
+	// which locks the window at 80x24 even after a client attaches. Override to
+	// "latest" so the window auto-resizes to the attaching client's terminal size.
+	_, _ = t.run("set-option", "-wt", name, "window-size", "latest")
+	return nil
 }
 
 // NewSessionWithCommand creates a new detached tmux session that immediately runs a command.
@@ -237,6 +255,10 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 	if _, err := t.run(args...); err != nil {
 		return err
 	}
+	// tmux 3.3+ sets window-size=manual on detached sessions (no client present),
+	// which locks the window at 80x24 even after a client attaches. Override to
+	// "latest" so the window auto-resizes to the attaching client's terminal size.
+	_, _ = t.run("set-option", "-wt", name, "window-size", "latest")
 
 	// Enable remain-on-exit BEFORE command runs so we can inspect exit status
 	_, _ = t.run("set-option", "-t", name, "remain-on-exit", "on")
@@ -298,6 +320,10 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 	if _, err := t.run(args...); err != nil {
 		return err
 	}
+	// tmux 3.3+ sets window-size=manual on detached sessions (no client present),
+	// which locks the window at 80x24 even after a client attaches. Override to
+	// "latest" so the window auto-resizes to the attaching client's terminal size.
+	_, _ = t.run("set-option", "-wt", name, "window-size", "latest")
 
 	// Enable remain-on-exit BEFORE command runs so we can inspect exit status
 	_, _ = t.run("set-option", "-t", name, "remain-on-exit", "on")
@@ -1106,6 +1132,13 @@ func (t *Tmux) WakePane(target string) {
 	_, _ = t.run("resize-window", "-t", target, "-x", fmt.Sprintf("%d", w+1))
 	time.Sleep(50 * time.Millisecond)
 	_, _ = t.run("resize-window", "-t", target, "-x", width)
+
+	// Reset window-size to "latest" after the resize dance. tmux automatically
+	// sets window-size to "manual" whenever resize-window is called, which
+	// permanently locks the window at the current dimensions. This prevents
+	// the window from auto-sizing to a client when a human later attaches,
+	// causing dots around the edges as if another smaller client is viewing.
+	_, _ = t.run("set-option", "-w", "-t", target, "window-size", "latest")
 }
 
 // WakePaneIfDetached triggers a SIGWINCH only if the session is detached.
@@ -1843,6 +1876,27 @@ func (t *Tmux) GetEnvironment(session, key string) (string, error) {
 	return parts[1], nil
 }
 
+// SetGlobalEnvironment sets an environment variable in the tmux global environment.
+// Unlike SetEnvironment, this is not scoped to a session — it applies server-wide.
+func (t *Tmux) SetGlobalEnvironment(key, value string) error {
+	_, err := t.run("set-environment", "-g", key, value)
+	return err
+}
+
+// GetGlobalEnvironment gets an environment variable from the tmux global environment.
+func (t *Tmux) GetGlobalEnvironment(key string) (string, error) {
+	out, err := t.run("show-environment", "-g", key)
+	if err != nil {
+		return "", err
+	}
+	// Output format: KEY=value
+	parts := strings.SplitN(out, "=", 2)
+	if len(parts) != 2 {
+		return "", fmt.Errorf("unexpected global environment format for %s: %q", key, out)
+	}
+	return parts[1], nil
+}
+
 // GetAllEnvironment returns all environment variables for a session.
 func (t *Tmux) GetAllEnvironment(session string) (map[string]string, error) {
 	out, err := t.run("show-environment", "-t", session)
@@ -2417,13 +2471,22 @@ func (t *Tmux) ConfigureGasTownSession(session string, theme Theme, rig, worker,
 // This allows clicking to select panes/windows, scrolling with mouse wheel,
 // and dragging to resize panes. Hold Shift for native terminal text selection.
 // Also enables clipboard integration so copied text goes to system clipboard.
+//
+// Respects the user's global mouse preference: if the global setting is "off",
+// mouse is not forced on for the session, so prefix+m toggles work correctly.
 func (t *Tmux) EnableMouseMode(session string) error {
+	// Check global mouse setting — respect user toggle (prefix+m)
+	out, err := t.run("show-options", "-gv", "mouse")
+	if err == nil && strings.TrimSpace(out) == "off" {
+		// User has globally disabled mouse; don't override per-session
+		return nil
+	}
 	if _, err := t.run("set-option", "-t", session, "mouse", "on"); err != nil {
 		return err
 	}
 	// Enable clipboard integration with terminal (OSC 52)
 	// This allows copying text to system clipboard when selecting with mouse
-	_, err := t.run("set-option", "-t", session, "set-clipboard", "on")
+	_, err = t.run("set-option", "-t", session, "set-clipboard", "on")
 	return err
 }
 
@@ -2550,7 +2613,7 @@ func (t *Tmux) SetTownCycleBindings(session string) error {
 // Used to skip redundant re-binding on repeated ConfigureGasTownSession /
 // EnsureBindingsOnSocket calls, preserving the user's original fallback.
 //
-// Two forms are recognised:
+// Two forms are recognized:
 //  1. Guarded form (set by SetAgentsBinding/SetFeedBinding): uses if-shell
 //     with a "gt " command — detects both old and new guarded bindings.
 //  2. Unguarded form (set by EnsureBindingsOnSocket): direct run-shell
@@ -2685,6 +2748,7 @@ func sessionPrefixPattern() string {
 // within the appropriate group:
 // - Town sessions: Mayor ↔ Deacon
 // - Crew sessions: All crew members in the same rig
+// - Rig ops sessions: Witness + Refinery + Polecats in the same rig
 //
 // IMPORTANT: These bindings are conditional - they only run gt cycle for
 // Gas Town sessions (those matching a registered rig prefix or "hq-").
