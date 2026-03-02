@@ -184,6 +184,55 @@ needs = ["implement"]
 	}
 }
 
+func TestParse_PourFlag(t *testing.T) {
+	// pour = true: steps should be materialized as sub-wisps
+	data := []byte(`
+description = "Test pour workflow"
+formula = "test-pour"
+type = "workflow"
+version = 1
+pour = true
+
+[[steps]]
+id = "step1"
+title = "First Step"
+description = "Do the first thing"
+`)
+
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	if !f.Pour {
+		t.Error("Pour = false, want true")
+	}
+}
+
+func TestParse_PourFlagDefault(t *testing.T) {
+	// Default: pour is false (inline/root-only)
+	data := []byte(`
+description = "Test inline workflow"
+formula = "test-inline"
+type = "workflow"
+version = 1
+
+[[steps]]
+id = "step1"
+title = "First Step"
+description = "Do the first thing"
+`)
+
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	if f.Pour {
+		t.Error("Pour = true, want false (default)")
+	}
+}
+
 func TestValidate_MissingName(t *testing.T) {
 	data := []byte(`
 type = "workflow"

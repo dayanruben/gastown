@@ -853,6 +853,9 @@ func generateWorkflowTemplate(name string) string {
 	return fmt.Sprintf(`# Formula: %s
 # Type: workflow
 # Created by: gt formula create
+#
+# pour = true  — Steps materialized as sub-wisps (checkpoint recovery on crash)
+# pour = false — Steps read inline (root-only, restart on failure) [DEFAULT]
 
 description = """%s workflow.
 

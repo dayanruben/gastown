@@ -31,6 +31,7 @@ type Formula struct {
 	Description string      `toml:"description"`
 	Type        FormulaType `toml:"type"`
 	Version     int         `toml:"version"`
+	Pour        bool        `toml:"pour"` // If true, steps are materialized as sub-wisps with checkpoint recovery. Default false (inline/root-only).
 
 	// Convoy-specific
 	Inputs    map[string]Input `toml:"inputs"`
