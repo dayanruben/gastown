@@ -231,7 +231,7 @@ Assessment of existing test infrastructure for stage/launch needs.
 | Fixtures & Setup | **3** | `setupTownWithBdStub` and `setupTestStore` exist but no DAG fixture builder; each test hand-rolls bead graphs |
 | Isolation | **4** | Tests use temp dirs, PATH injection, chdir with cleanup; parallel-safe except for `os.Chdir` (serializes cmd tests) |
 | Observability | **3** | bd stub logs capture commands; but no structured assertion on DAG shape or wave output |
-| Speed | **4** | Unit tests <1s, Dolt store tests ~0.1s each, full cmd suite ~10s; acceptable |
+| Speed | **4** | Unit tests &lt;1s, Dolt store tests ~0.1s each, full cmd suite ~10s; acceptable |
 | Determinism | **4** | No known flaky tests; Dolt store tests skip when unavailable rather than flake |
 
 ### Key gaps for stage/launch

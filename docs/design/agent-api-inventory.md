@@ -473,7 +473,7 @@ returns allow/deny with reason
   3-minute threshold, `ReadSessionHeartbeat()` (line ~54), `RemoveSessionHeartbeat()`
 - `internal/deacon/heartbeat.go` — `WriteHeartbeat()` (line ~52): deacon heartbeat
   at `deacon/heartbeat.json` with cycle count, health stats;
-  `IsFresh()` (<5min), `IsStale()` (5-15min), `IsVeryStale()` (>15min)
+  `IsFresh()` (&lt;5min), `IsStale()` (5-15min), `IsVeryStale()` (&gt;15min)
 
 **Flow**: Agent→GT (implicit). Agent command writes file; GT reads it.
 
