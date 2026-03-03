@@ -16,9 +16,9 @@ import (
 )
 
 // DoltDockerImage is the Docker image used for Dolt test containers.
-// Note: 1.82.4 has a broken auth handshake for root connections via
-// the MySQL wire protocol with go-sql-driver. Use 1.43.0 which works.
-const DoltDockerImage = "dolthub/dolt-sql-server:1.43.0"
+// DOLT_ROOT_HOST=% tells the entrypoint to create root@'%' (available
+// since Dolt 1.46.0), which lets testcontainers connect via TCP.
+const DoltDockerImage = "dolthub/dolt-sql-server:1.83.0"
 
 var (
 	doltCtr      *dolt.DoltContainer
@@ -44,6 +44,7 @@ func startSharedDoltContainer() {
 	ctx := context.Background()
 	ctr, err := dolt.Run(ctx, DoltDockerImage,
 		dolt.WithDatabase("gt_test"),
+		testcontainers.WithEnv(map[string]string{"DOLT_ROOT_HOST": "%"}),
 	)
 	if err != nil {
 		doltCtrErr = fmt.Errorf("starting Dolt container: %w", err)
@@ -75,6 +76,7 @@ func StartIsolatedDoltContainer(t *testing.T) string {
 	ctx := context.Background()
 	ctr, err := dolt.Run(ctx, DoltDockerImage,
 		dolt.WithDatabase("gt_test"),
+		testcontainers.WithEnv(map[string]string{"DOLT_ROOT_HOST": "%"}),
 	)
 	if err != nil {
 		t.Fatalf("starting Dolt container: %v", err)

@@ -12,6 +12,7 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/telemetry"
 )
@@ -31,30 +32,6 @@ func (b *Beads) lockAgentBead(id string) (*flock.Flock, error) {
 		return nil, fmt.Errorf("acquiring agent bead lock for %s: %w", id, err)
 	}
 	return fl, nil
-}
-
-// Agent state constants. These are the known values for AgentFields.AgentState.
-const (
-	AgentStateSpawning  = "spawning"
-	AgentStateWorking   = "working"
-	AgentStateRunning   = "running"
-	AgentStateDone      = "done"
-	AgentStateStuck     = "stuck"
-	AgentStateEscalated = "escalated"
-	AgentStateIdle      = "idle"
-	AgentStateNuked     = "nuked"
-)
-
-// IsActiveAgentState returns true if the given agent state indicates the agent
-// was actively working. Used by zombie detection to distinguish stale (was doing
-// work) from orphan (no evidence of recent work) zombies.
-func IsActiveAgentState(state string) bool {
-	switch state {
-	case AgentStateWorking, AgentStateRunning, AgentStateSpawning:
-		return true
-	default:
-		return false
-	}
 }
 
 // AgentFields holds structured fields for agent beads.
@@ -80,14 +57,6 @@ type AgentFields struct {
 	MRFailed       bool   // True when MR creation was attempted but failed
 	CompletionTime string // RFC3339 timestamp of when gt done was called
 }
-
-// Agent state constants for the agent_state field in agent beads.
-// These represent the beads-level agent lifecycle state, which is distinct from
-// the polecat.State lifecycle type (though values overlap).
-// Note: AgentStateIdle and AgentStateStuck are declared above in the primary block.
-const (
-	AgentStateAwaitingGate = "awaiting-gate" // Waiting for a gate condition, intentional pause
-)
 
 // Notification level constants
 const (
@@ -450,7 +419,7 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 	fields.HookBead = ""      // Clear hook_bead
 	fields.ActiveMR = ""      // Clear active_mr
 	fields.CleanupStatus = "" // Clear cleanup_status
-	fields.AgentState = "nuked"
+	fields.AgentState = string(AgentStateNuked)
 	// Clear completion metadata (gt-x7t9)
 	fields.ExitType = ""
 	fields.MRID = ""
@@ -733,39 +702,48 @@ func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
 // ListAgentBeads returns all agent beads in a single query.
 // Returns a map of agent bead ID to Issue.
 //
-// Queries both the wisps table (primary, for migrated agent beads) and
-// the issues table (backward compat during migration). Wisps take
-// precedence for duplicate IDs.
+// Queries both the issues table (authoritative metadata source) and the
+// wisps table (fallback existence source). Issues take precedence for duplicate
+// IDs so labels/type are preserved for doctor validation.
 func (b *Beads) ListAgentBeads() (map[string]*Issue, error) {
-	result := make(map[string]*Issue)
-
-	// Query wisps table first (primary source after agent bead migration).
-	// Gracefully ignore errors — wisps table may not exist yet.
-	if wispBeads, _ := b.ListAgentBeadsFromWisps(); len(wispBeads) > 0 {
-		for id, issue := range wispBeads {
-			result[id] = issue
-		}
-	}
-
-	// Also query issues table (backward compat during migration).
+	// Query issues table first. Issues include labels and type metadata used by
+	// doctor checks (for example, validating gt:agent labels).
 	// Agent beads are type=agent (infrastructure), hidden by bd list default filter.
 	// Use --include-infra so they appear in results.
 	out, err := b.run("list", "--label=gt:agent", "--include-infra", "--json")
-	if err != nil && len(result) == 0 {
+	if err != nil {
 		return nil, err
 	}
-	if err == nil {
-		var issues []*Issue
-		if jsonErr := json.Unmarshal(out, &issues); jsonErr == nil {
-			for _, issue := range issues {
-				if _, exists := result[issue.ID]; !exists {
-					result[issue.ID] = issue
-				}
-			}
+	issuesByID := make(map[string]*Issue)
+	var issues []*Issue
+	if jsonErr := json.Unmarshal(out, &issues); jsonErr == nil {
+		for _, issue := range issues {
+			issuesByID[issue.ID] = issue
 		}
 	}
 
-	return result, nil
+	// Query wisps table as a fallback source.
+	// Keep issues-table entries when both exist for the same ID so richer
+	// metadata (labels/type) is preserved.
+	wispBeads, _ := b.ListAgentBeadsFromWisps()
+
+	return mergeAgentBeadSources(issuesByID, wispBeads), nil
+}
+
+// mergeAgentBeadSources merges issue-backed and wisp-backed agent bead maps.
+// Issues are authoritative because they carry full metadata (labels/type),
+// while wisps are treated as a fallback existence source.
+func mergeAgentBeadSources(issuesByID, wispsByID map[string]*Issue) map[string]*Issue {
+	merged := make(map[string]*Issue, len(issuesByID)+len(wispsByID))
+	for id, issue := range issuesByID {
+		merged[id] = issue
+	}
+	for id, issue := range wispsByID {
+		if _, exists := merged[id]; !exists {
+			merged[id] = issue
+		}
+	}
+	return merged
 }
 
 // ListAgentBeadsFromWisps queries the wisps table for agent beads.
@@ -818,7 +796,7 @@ func isAgentBeadByID(id string) bool {
 	// collapsed-form (role at parts[1]) agent bead IDs.
 	for _, part := range parts[1:] {
 		switch part {
-		case "witness", "refinery", "crew", "polecat", "deacon", "mayor":
+		case constants.RoleWitness, constants.RoleRefinery, constants.RoleCrew, constants.RolePolecat, constants.RoleDeacon, constants.RoleMayor:
 			return true
 		}
 	}

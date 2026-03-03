@@ -109,12 +109,17 @@ func IsInSameSocket() bool {
 // BuildCommand creates an exec.Cmd for tmux with the default socket applied.
 // Use this instead of exec.Command("tmux", ...) for code outside the Tmux struct.
 func BuildCommand(args ...string) *exec.Cmd {
+	return BuildCommandContext(context.Background(), args...)
+}
+
+// BuildCommandContext is like BuildCommand but honours a context for cancellation.
+func BuildCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 	allArgs := []string{"-u"}
 	if sock := GetDefaultSocket(); sock != "" {
 		allArgs = append(allArgs, "-L", sock)
 	}
 	allArgs = append(allArgs, args...)
-	return exec.Command("tmux", allArgs...)
+	return exec.CommandContext(ctx, "tmux", allArgs...)
 }
 
 // Tmux wraps tmux operations.
@@ -347,25 +352,34 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 // to already be enabled on the session. Checks the exit status after a brief delay.
 // Only returns an error for non-zero exits (command failures), not clean exits (status 0).
 func (t *Tmux) checkSessionAfterCreate(name, command string) error {
-	// Brief delay for immediate failures to manifest (binary not found, syntax errors).
-	time.Sleep(50 * time.Millisecond)
-
-	// Check if pane died
-	paneDead, _ := t.run("display-message", "-p", "-t", name, "#{pane_dead}")
-	if strings.TrimSpace(paneDead) == "1" {
-		// Pane is dead — check exit status
+	checkPaneDead := func() (bool, error) {
+		paneDead, _ := t.run("display-message", "-p", "-t", name, "#{pane_dead}")
+		if strings.TrimSpace(paneDead) != "1" {
+			return false, nil
+		}
 		exitStatus, _ := t.run("display-message", "-p", "-t", name, "#{pane_dead_status}")
 		status := strings.TrimSpace(exitStatus)
 		if status != "" && status != "0" {
-			// Command failed (non-zero exit) — clean up and return error
 			_ = t.KillSession(name)
-			return fmt.Errorf("session %q: command exited with status %s: %s", name, status, command)
+			return true, fmt.Errorf("session %q: command exited with status %s: %s", name, status, command)
 		}
-		// Command exited cleanly (status 0) — clean up the dead session.
-		// This matches the default tmux behavior (no remain-on-exit) where
-		// sessions are destroyed when the pane process exits.
 		_ = t.KillSession(name)
-		return nil
+		return true, nil
+	}
+
+	// First check at 50ms: catches fast failures on lightly-loaded runners.
+	time.Sleep(50 * time.Millisecond)
+	if dead, err := checkPaneDead(); dead {
+		return err
+	}
+
+	// Second check at 250ms: catches exec failures on loaded CI runners where
+	// process startup takes longer than 50ms. This is the fix for CI getting
+	// false negatives on TestNewSessionWithCommand_ExecEnvBadBinary. Normal
+	// long-lived sessions (Claude, shell) will still be alive here and return nil.
+	time.Sleep(200 * time.Millisecond)
+	if dead, err := checkPaneDead(); dead {
+		return err
 	}
 
 	// Pane is alive — restore default (no need to keep dead sessions around)
@@ -814,6 +828,17 @@ func (t *Tmux) KillPaneProcessesExcluding(pane string, excludePIDs []string) err
 	}
 
 	return nil
+}
+
+// ServerPID returns the PID of the tmux server process.
+// Returns 0 if the server is not running or the PID cannot be determined.
+func (t *Tmux) ServerPID() int {
+	out, err := t.run("display-message", "-p", "#{pid}")
+	if err != nil {
+		return 0
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(out))
+	return pid
 }
 
 // KillServer terminates the entire tmux server and all sessions.
@@ -1426,31 +1451,63 @@ func (t *Tmux) AcceptStartupDialogs(session string) error {
 // in a workspace, asking the user to confirm they trust the folder. Option 1 ("Yes, I trust
 // this folder") is pre-selected, so we just need to press Enter to accept.
 // This dialog appears BEFORE the bypass permissions warning, so call this first.
+//
+// Uses a polling loop instead of a single check to handle the race condition where
+// Claude hasn't rendered the dialog yet when we first check. Exits early if the
+// agent prompt appears (indicating no dialog will be shown).
 func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
-	// Wait for the dialog to potentially render
-	time.Sleep(1 * time.Second)
+	deadline := time.Now().Add(constants.DialogPollTimeout)
+	for time.Now().Before(deadline) {
+		content, err := t.CapturePane(session, 30)
+		if err != nil {
+			time.Sleep(constants.DialogPollInterval)
+			continue
+		}
 
-	// Check if the workspace trust dialog is present
-	content, err := t.CapturePane(session, 30)
-	if err != nil {
-		return err
+		// Look for characteristic trust dialog text
+		if strings.Contains(content, "trust this folder") || strings.Contains(content, "Quick safety check") {
+			// Dialog found — accept it (option 1 is pre-selected, just press Enter)
+			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
+				return err
+			}
+			// Wait for dialog to dismiss before proceeding
+			time.Sleep(500 * time.Millisecond)
+			return nil
+		}
+
+		// Early exit: if agent prompt or shell prompt is visible, no trust dialog will appear.
+		// Claude prompt is ">", shell prompts are "$", "%", "#".
+		// Also exit if bypass permissions dialog is next (handled by AcceptBypassPermissionsWarning).
+		if containsPromptIndicator(content) || strings.Contains(content, "Bypass Permissions mode") {
+			return nil
+		}
+
+		time.Sleep(constants.DialogPollInterval)
 	}
 
-	// Look for characteristic trust dialog text
-	if !strings.Contains(content, "trust this folder") && !strings.Contains(content, "Quick safety check") {
-		// Trust dialog not present, nothing to do
-		return nil
-	}
-
-	// Option 1 ("Yes, I trust this folder") is already pre-selected, just press Enter
-	if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-		return err
-	}
-
-	// Wait for dialog to dismiss before proceeding to bypass permissions
-	time.Sleep(500 * time.Millisecond)
-
+	// Timeout — no dialog detected, safe to proceed
 	return nil
+}
+
+// promptSuffixes are strings that indicate a shell or agent prompt is visible.
+// Claude prompt ends with ">", shell prompts end with "$", "%", "#", or "❯".
+var promptSuffixes = []string{">", "$", "%", "#", "❯"}
+
+// containsPromptIndicator checks if pane content contains a prompt indicator
+// that signals a shell or agent is ready (no dialog blocking it).
+func containsPromptIndicator(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		for _, suffix := range promptSuffixes {
+			if strings.HasSuffix(trimmed, suffix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // AcceptBypassPermissionsWarning dismisses the Claude Code bypass permissions warning dialog.
@@ -1459,35 +1516,75 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 // This function checks if the warning is present before sending keys to avoid interfering
 // with sessions that don't show the warning (e.g., already accepted or different config).
 //
+// Uses a polling loop instead of a single check to handle the race condition where
+// Claude hasn't rendered the dialog yet when we first check. Exits early if the
+// agent prompt appears (indicating no dialog will be shown).
+//
 // Call this after starting Claude and waiting for it to initialize (WaitForCommand),
 // but before sending any prompts.
 func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
-	// Wait for the dialog to potentially render
-	time.Sleep(1 * time.Second)
+	deadline := time.Now().Add(constants.DialogPollTimeout)
+	for time.Now().Before(deadline) {
+		content, err := t.CapturePane(session, 30)
+		if err != nil {
+			time.Sleep(constants.DialogPollInterval)
+			continue
+		}
 
-	// Check if the bypass permissions warning is present
-	content, err := t.CapturePane(session, 30)
-	if err != nil {
-		return err
+		// Look for the characteristic warning text
+		if strings.Contains(content, "Bypass Permissions mode") {
+			// Dialog found — press Down to select "Yes, I accept" then Enter
+			if _, err := t.run("send-keys", "-t", session, "Down"); err != nil {
+				return err
+			}
+			time.Sleep(200 * time.Millisecond)
+			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
+				return err
+			}
+			return nil
+		}
+
+		// Early exit: if agent prompt or shell prompt is visible, no dialog will appear
+		if containsPromptIndicator(content) {
+			return nil
+		}
+
+		time.Sleep(constants.DialogPollInterval)
 	}
 
-	// Look for the characteristic warning text
-	if !strings.Contains(content, "Bypass Permissions mode") {
-		// Warning not present, nothing to do
-		return nil
-	}
+	// Timeout — no dialog detected, safe to proceed
+	return nil
+}
 
-	// Press Down to select "Yes, I accept" (option 2)
-	if _, err := t.run("send-keys", "-t", session, "Down"); err != nil {
-		return err
-	}
-
-	// Small delay to let selection update
-	time.Sleep(200 * time.Millisecond)
-
-	// Press Enter to confirm
+// DismissStartupDialogsBlind sends the key sequences needed to dismiss all
+// known Claude Code startup dialogs without screen-scraping pane content.
+// This avoids coupling to third-party TUI strings that can change with any update.
+//
+// The sequence handles (in order):
+//  1. Workspace trust dialog — Enter (option 1 "Yes, I trust this folder" is pre-selected)
+//  2. Bypass permissions warning — Down+Enter (select "Yes, I accept" then confirm)
+//
+// Safe to call on sessions where no dialog is showing: Enter sends a blank input
+// to an idle Claude prompt (harmless for a stalled session), and Down+Enter either
+// does nothing or sends another blank input.
+//
+// This is intended for remediation of stalled sessions detected via structured
+// signals (session age + activity). For startup-time dialog handling where
+// precision matters, use AcceptStartupDialogs instead.
+func (t *Tmux) DismissStartupDialogsBlind(session string) error {
+	// Step 1: Send Enter to dismiss trust dialog (if present)
 	if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-		return err
+		return fmt.Errorf("sending Enter for trust dialog: %w", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Step 2: Send Down+Enter to dismiss bypass permissions dialog (if present)
+	if _, err := t.run("send-keys", "-t", session, "Down"); err != nil {
+		return fmt.Errorf("sending Down for bypass dialog: %w", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
+		return fmt.Errorf("sending Enter for bypass dialog: %w", err)
 	}
 
 	return nil
@@ -1514,17 +1611,33 @@ func (t *Tmux) GetPaneCommand(session string) (string, error) {
 
 // FindAgentPane finds the pane running an agent process within a session.
 // In multi-window/multi-pane sessions, send-keys -t <session> targets the
-// active/focused pane, which may not be the agent pane. This method enumerates
-// all panes across all windows (-s) and returns the pane ID (e.g., "%5") of
-// the one running the agent.
+// active/focused pane, which may not be the agent pane. This method returns
+// the pane ID (e.g., "%5") of the one running the agent.
 //
-// Detection checks pane_current_command, then falls back to process tree inspection
-// (same logic as IsRuntimeRunning) to handle agents started via shell wrappers.
+// ZFC (gt-qmsx): Reads declared GT_PANE_ID from session environment first.
+// Falls back to scanning all panes for legacy sessions without GT_PANE_ID.
 //
 // Returns ("", nil) if the session has only one pane (no disambiguation needed),
 // or if no agent pane can be identified (caller should fall back to session targeting).
 func (t *Tmux) FindAgentPane(session string) (string, error) {
-	// List all panes across all windows with ID, command, and PID
+	// ZFC: read declared pane identity set at session startup (gt-qmsx).
+	// This replaces process-tree inference for sessions that record GT_PANE_ID.
+	if declaredPane, err := t.GetEnvironment(session, "GT_PANE_ID"); err == nil && declaredPane != "" {
+		// Verify the pane still exists in tmux (it may have been killed/respawned).
+		if _, verifyErr := t.run("display-message", "-t", declaredPane, "-p", "#{pane_id}"); verifyErr == nil {
+			return declaredPane, nil
+		}
+		// Declared pane is gone — fall through to scan.
+	}
+
+	// Fallback: scan all panes for legacy sessions without GT_PANE_ID.
+	return t.findAgentPaneByScan(session)
+}
+
+// findAgentPaneByScan enumerates all panes across all windows (-s) and returns
+// the pane ID of the one running the agent. This is the legacy path for sessions
+// that predate GT_PANE_ID (gt-qmsx).
+func (t *Tmux) findAgentPaneByScan(session string) (string, error) {
 	out, err := t.run("list-panes", "-s", "-t", session, "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_pid}")
 	if err != nil {
 		return "", err
@@ -1549,22 +1662,7 @@ func (t *Tmux) FindAgentPane(session string) (string, error) {
 		paneCmd := parts[1]
 		panePID := parts[2]
 
-		// Direct command match
-		for _, name := range processNames {
-			if paneCmd == name {
-				return paneID, nil
-			}
-		}
-
-		// Shell with agent descendant
-		for _, shell := range constants.SupportedShells {
-			if paneCmd == shell && hasDescendantWithNames(panePID, processNames, 0) {
-				return paneID, nil
-			}
-		}
-
-		// Version-as-argv[0] (e.g., "2.1.30") — check real binary name
-		if processMatchesNames(panePID, processNames) {
+		if matchesPaneRuntime(paneCmd, panePID, processNames) {
 			return paneID, nil
 		}
 	}
@@ -1821,9 +1919,7 @@ func (t *Tmux) FindSessionByWorkDir(targetDir string, processNames []string) ([]
 
 // CapturePane captures the visible content of a pane.
 func (t *Tmux) CapturePane(session string, lines int) (string, error) {
-	content, err := t.run("capture-pane", "-p", "-t", session, "-S", fmt.Sprintf("-%d", lines))
-	telemetry.RecordPaneRead(context.Background(), session, lines, len(content), err)
-	return content, err
+	return t.run("capture-pane", "-p", "-t", session, "-S", fmt.Sprintf("-%d", lines))
 }
 
 // CapturePaneAll captures all scrollback history.
@@ -2004,19 +2100,24 @@ func (t *Tmux) IsAgentRunning(session string, expectedPaneCommands ...string) bo
 }
 
 // IsRuntimeRunning checks if a runtime appears to be running in the session.
-// First checks the first window (where the agent is started) via GetPaneCommand/GetPanePID.
-// Falls back to scanning all panes across all windows for multi-window sessions.
-// This is the unified agent detection method for all agent types.
+//
+// ZFC (gt-qmsx): Reads declared GT_PANE_ID from session environment first,
+// then checks only that pane. Falls back to scanning all panes for legacy
+// sessions without GT_PANE_ID.
 func (t *Tmux) IsRuntimeRunning(session string, processNames []string) bool {
 	if len(processNames) == 0 {
 		return false
 	}
-	// Fast path: check first window (agent's expected location)
+
+	// ZFC: check declared pane identity set at session startup (gt-qmsx).
+	if declaredPane, err := t.GetEnvironment(session, "GT_PANE_ID"); err == nil && declaredPane != "" {
+		return t.checkTargetPaneForRuntime(declaredPane, processNames)
+	}
+
+	// Legacy fallback: check first window, then scan all panes.
 	if t.checkPaneForRuntime(session, processNames) {
 		return true
 	}
-	// Fallback: scan all panes across all windows. The agent is almost always
-	// in the first window, but if it isn't, we scan everything before declaring dead.
 	out, err := t.run("list-panes", "-s", "-t", session, "-F", "#{pane_current_command}\t#{pane_pid}")
 	if err != nil {
 		return false
@@ -2032,6 +2133,17 @@ func (t *Tmux) IsRuntimeRunning(session string, processNames []string) bool {
 		}
 	}
 	return false
+}
+
+// checkTargetPaneForRuntime checks if a specific pane (by ID, e.g., "%5") is
+// running a matching process. Used by the ZFC path when GT_PANE_ID is declared.
+func (t *Tmux) checkTargetPaneForRuntime(paneID string, processNames []string) bool {
+	cmd, err := t.run("display-message", "-t", paneID, "-p", "#{pane_current_command}")
+	if err != nil {
+		return false // pane doesn't exist
+	}
+	pid, _ := t.run("display-message", "-t", paneID, "-p", "#{pane_pid}")
+	return matchesPaneRuntime(strings.TrimSpace(cmd), strings.TrimSpace(pid), processNames)
 }
 
 // checkPaneForRuntime checks if the first window's pane is running a matching process.

@@ -139,7 +139,9 @@ func updateGitExclude(repoPath string) error {
 		return nil // Already configured
 	}
 
-	// Append agent dirs
+	// Append agent dirs with leading '/' to anchor at repo root.
+	// Without the anchor, patterns like 'refinery/' match at any depth
+	// and would hide source code directories like 'internal/refinery/'.
 	additions := "\n# Gas Town agent directories\n"
 	for _, dir := range rig.AgentDirs {
 		// Get first component (e.g., "polecats" from "polecats")
@@ -148,7 +150,7 @@ func updateGitExclude(repoPath string) error {
 		if base == "." {
 			base = dir
 		}
-		additions += base + "/\n"
+		additions += "/" + base + "/\n"
 	}
 
 	// Write back

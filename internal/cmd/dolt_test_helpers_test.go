@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,11 @@ import (
 func requireDoltServer(t *testing.T) {
 	t.Helper()
 	testutil.RequireDoltContainer(t)
+}
+
+// cleanupDoltServer delegates to testutil.TerminateDoltContainer.
+func cleanupDoltServer() {
+	testutil.TerminateDoltContainer()
 }
 
 // configureTestGitIdentity sets git global config in an isolated HOME directory
@@ -36,6 +42,27 @@ func configureTestGitIdentity(t *testing.T, homeDir string) {
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v failed: %v\n%s", args, err, out)
 		}
+	}
+}
+
+// bridgeDoltPidToTown writes the Go test process PID into townRoot/daemon/dolt.pid
+// so that doltserver.IsRunning(townRoot) finds it via the PID-file shortcut path.
+//
+// With containers there is no dolt binary PID file. We write our own process PID
+// instead — the PID file's purpose is to make IsRunning() take the PID-file
+// shortcut path (which just checks if the PID is alive, not the process name).
+func bridgeDoltPidToTown(t *testing.T, townRoot string) {
+	t.Helper()
+
+	pid := fmt.Sprintf("%d", os.Getpid())
+
+	daemonDir := filepath.Join(townRoot, "daemon")
+	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+		t.Fatalf("bridgeDoltPidToTown: mkdir daemon: %v", err)
+	}
+	townPidPath := filepath.Join(daemonDir, "dolt.pid")
+	if err := os.WriteFile(townPidPath, []byte(pid+"\n"), 0644); err != nil { //nolint:gosec
+		t.Fatalf("bridgeDoltPidToTown: write PID file: %v", err)
 	}
 }
 
@@ -63,13 +90,10 @@ func cleanStaleBeadsDatabases(t *testing.T) {
 	}
 }
 
-// dropStaleBeadsDatabases connects to the Dolt container and drops all beads_*
-// databases that were created by earlier tests. Uses SQL-level cleanup only:
+// dropStaleBeadsDatabases connects to the Dolt server and drops all beads_*
+// databases that were created by earlier tests. Uses two strategies:
 //  1. SHOW DATABASES → DROP any visible beads_* databases
 //  2. DROP known phantom database names from beads_db_init_test.go
-//  3. Purge dropped databases from Dolt's catalog
-//
-// No filesystem cleanup needed — container data is ephemeral.
 func dropStaleBeadsDatabases() error {
 	dsn := "root:@tcp(127.0.0.1:" + testutil.DoltContainerPort() + ")/"
 	db, err := sql.Open("mysql", dsn)
