@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -1902,6 +1903,149 @@ func TestResetAbandonedBead_SkipsWhenBeadActivelyWorked(t *testing.T) {
 	}
 	if resetCalled {
 		t.Error("bd update should not have been called — bead is actively worked")
+	}
+}
+
+// --- Heartbeat v2 tests (gt-3vr5) ---
+
+func TestHeartbeatV2_ExitingStateSkipsZombieDetection(t *testing.T) {
+	t.Parallel()
+	// Agent reports "exiting" state via heartbeat v2.
+	// The witness should trust the agent and NOT flag as zombie,
+	// even if done-intent is older than DoneIntentGracePeriod.
+	// This replaces timer-based inference for v2 agents.
+
+	// Fresh heartbeat with state="exiting" → not a zombie
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		State:     polecat.HeartbeatExiting,
+	}
+	stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+	if stale {
+		t.Error("fresh heartbeat should not be stale")
+	}
+	if hb.EffectiveState() != polecat.HeartbeatExiting {
+		t.Errorf("EffectiveState() = %q, want %q", hb.EffectiveState(), polecat.HeartbeatExiting)
+	}
+
+	// With a v2 exiting heartbeat, the witness should NOT check done-intent timers
+	shouldSkip := hb.IsV2() && !stale && hb.EffectiveState() == polecat.HeartbeatExiting
+	if !shouldSkip {
+		t.Error("expected v2 exiting heartbeat to skip zombie detection")
+	}
+}
+
+func TestHeartbeatV2_StuckStateEscalates(t *testing.T) {
+	t.Parallel()
+	// Agent self-reports "stuck" via heartbeat v2.
+	// The witness should escalate (not restart — agent is alive).
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		State:     polecat.HeartbeatStuck,
+		Context:   "blocked on auth issue",
+	}
+	stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+	if stale {
+		t.Error("fresh heartbeat should not be stale")
+	}
+
+	shouldEscalate := hb.IsV2() && !stale && hb.EffectiveState() == polecat.HeartbeatStuck
+	if !shouldEscalate {
+		t.Error("expected v2 stuck heartbeat to trigger escalation")
+	}
+}
+
+func TestHeartbeatV2_WorkingStateHealthy(t *testing.T) {
+	t.Parallel()
+	// Agent heartbeats "working" — healthy, not a zombie.
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		State:     polecat.HeartbeatWorking,
+	}
+	stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+	shouldSkip := hb.IsV2() && !stale && (hb.EffectiveState() == polecat.HeartbeatWorking || hb.EffectiveState() == polecat.HeartbeatIdle)
+	if !shouldSkip {
+		t.Error("expected v2 working heartbeat to skip zombie detection")
+	}
+}
+
+func TestHeartbeatV2_IdleStateHealthy(t *testing.T) {
+	t.Parallel()
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		State:     polecat.HeartbeatIdle,
+	}
+	stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+	shouldSkip := hb.IsV2() && !stale && (hb.EffectiveState() == polecat.HeartbeatWorking || hb.EffectiveState() == polecat.HeartbeatIdle)
+	if !shouldSkip {
+		t.Error("expected v2 idle heartbeat to skip zombie detection")
+	}
+}
+
+func TestHeartbeatV2_StaleHeartbeatFallsThrough(t *testing.T) {
+	t.Parallel()
+	// Stale v2 heartbeat (agent died) → fall through to legacy detection.
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now().Add(-10 * time.Minute), // 10min old → stale
+		State:     polecat.HeartbeatWorking,
+	}
+	stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+	if !stale {
+		t.Error("10-minute-old heartbeat should be stale")
+	}
+
+	// Stale heartbeat should NOT skip zombie detection — falls through to legacy
+	shouldSkip := hb.IsV2() && !stale
+	if shouldSkip {
+		t.Error("stale v2 heartbeat should fall through to legacy detection")
+	}
+}
+
+func TestHeartbeatV2_V1FallsThrough(t *testing.T) {
+	t.Parallel()
+	// v1 heartbeat (no state field) → fall through to legacy detection.
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		// No State field → v1
+	}
+	if hb.IsV2() {
+		t.Error("expected IsV2()=false for v1 heartbeat")
+	}
+
+	// v1 heartbeat should NOT trigger v2 logic
+	shouldUseV2 := hb.IsV2()
+	if shouldUseV2 {
+		t.Error("v1 heartbeat should fall through to legacy detection")
+	}
+}
+
+func TestHeartbeatV2_DeadSessionFreshHeartbeatRace(t *testing.T) {
+	t.Parallel()
+	// Dead session but fresh heartbeat → possible race (session just restarted).
+	// Should skip zombie detection to avoid killing a newly-started session.
+	hb := &polecat.SessionHeartbeat{
+		Timestamp: time.Now(),
+		State:     polecat.HeartbeatWorking,
+	}
+	stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
+	sessionDead := true
+
+	// Fresh heartbeat + dead session → skip (race condition)
+	shouldSkip := sessionDead && hb.IsV2() && !stale
+	if !shouldSkip {
+		t.Error("expected fresh v2 heartbeat + dead session to skip zombie detection (race)")
+	}
+}
+
+func TestZombieAgentSelfReportedStuck_Classification(t *testing.T) {
+	t.Parallel()
+	// Verify the new classification type
+	if ZombieAgentSelfReportedStuck != "agent-self-reported-stuck" {
+		t.Errorf("ZombieAgentSelfReportedStuck = %q, want %q", ZombieAgentSelfReportedStuck, "agent-self-reported-stuck")
+	}
+	// Should imply active work (agent is alive and asking for help)
+	if !ZombieAgentSelfReportedStuck.ImpliesActiveWork() {
+		t.Error("ZombieAgentSelfReportedStuck should imply active work")
 	}
 }
 

@@ -319,6 +319,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		}
 	}
 
+	// Write heartbeat state="exiting" (gt-3vr5: heartbeat v2).
+	// Tells the witness we're in the gt done flow — trust the agent until
+	// heartbeat goes stale. No timer-based inference needed.
+	// Parallel to done-intent label for backwards compat during migration.
+	if sessionName := os.Getenv("GT_SESSION"); sessionName != "" && townRoot != "" {
+		polecat.TouchSessionHeartbeatWithState(townRoot, sessionName, polecat.HeartbeatExiting, "gt done", issueID)
+	}
+
 	// Get configured default branch for this rig
 	defaultBranch := "main" // fallback
 	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
