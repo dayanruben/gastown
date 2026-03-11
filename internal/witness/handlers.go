@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
@@ -238,12 +239,20 @@ func handlePolecatDonePendingMR(bd *BdCli, workDir, rigName string, payload *Pol
 	return result
 }
 
-// notifyRefineryMergeReady nudges the Refinery to check the merge queue.
-// Previously sent MERGE_READY mail (creating permanent Dolt commits); now
-// just nudges. The Refinery discovers pending MRs from beads queries.
+// notifyRefineryMergeReady emits a MERGE_READY channel event and nudges the
+// Refinery to check the merge queue. The channel event unblocks the refinery's
+// await-event loop instantly; the tmux nudge is a belt-and-suspenders fallback
+// for when the refinery is at the Claude prompt rather than in await-event.
 // Errors are non-fatal (Refinery will still pick up work on next patrol cycle).
 func notifyRefineryMergeReady(workDir, rigName string, result *HandlerResult) {
 	townRoot, _ := workspace.Find(workDir)
+	// Emit file-based event so refinery's await-event unblocks instantly.
+	if townRoot != "" {
+		_, _ = channelevents.EmitToTown(townRoot, "refinery", "MERGE_READY", []string{
+			"source=witness",
+			"rig=" + rigName,
+		})
+	}
 	if nudgeErr := nudgeRefinery(townRoot, rigName); nudgeErr != nil {
 		if result.Error == nil {
 			result.Error = fmt.Errorf("nudging refinery: %w (non-fatal)", nudgeErr)
