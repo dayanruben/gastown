@@ -68,8 +68,14 @@ func getRig(rigName string) (string, *rig.Rig, error) {
 // Returns false if the rig config or bead can't be loaded (safe default).
 func hasRigBeadLabel(townRoot, rigName, label string) bool {
 	rigPath := filepath.Join(townRoot, rigName)
-	rigCfg, err := rig.LoadRigConfig(rigPath)
-	if err != nil || rigCfg.Beads == nil {
+	prefix := ""
+	rigsConfigPath := constants.MayorRigsPath(townRoot)
+	if rigsConfig, err := config.LoadRigsConfig(rigsConfigPath); err == nil {
+		if entry, ok := rigsConfig.Rigs[rigName]; ok && entry.BeadsConfig != nil {
+			prefix = entry.BeadsConfig.Prefix
+		}
+	}
+	if prefix == "" {
 		return false
 	}
 
@@ -79,7 +85,7 @@ func hasRigBeadLabel(townRoot, rigName, label string) bool {
 	}
 
 	bd := beads.New(beadsPath)
-	rigBeadID := beads.RigBeadIDWithPrefix(rigCfg.Beads.Prefix, rigName)
+	rigBeadID := beads.RigBeadIDWithPrefix(prefix, rigName)
 
 	rigBead, err := bd.Show(rigBeadID)
 	if err != nil {
@@ -111,10 +117,18 @@ func IsRigParkedOrDocked(townRoot, rigName string) (bool, string) {
 		return true, "parked"
 	}
 
-	// Single bead lookup for both parked and docked labels
+	// Single bead lookup for both parked and docked labels.
+	// Look up the beads prefix from rigs.json (the rig registry) instead of
+	// <rigPath>/config.json which doesn't exist for most rigs.
 	rigPath := filepath.Join(townRoot, rigName)
-	rigCfg, err := rig.LoadRigConfig(rigPath)
-	if err != nil || rigCfg.Beads == nil {
+	prefix := ""
+	rigsConfigPath := constants.MayorRigsPath(townRoot)
+	if rigsConfig, err := config.LoadRigsConfig(rigsConfigPath); err == nil {
+		if entry, ok := rigsConfig.Rigs[rigName]; ok && entry.BeadsConfig != nil {
+			prefix = entry.BeadsConfig.Prefix
+		}
+	}
+	if prefix == "" {
 		return false, ""
 	}
 
@@ -124,7 +138,7 @@ func IsRigParkedOrDocked(townRoot, rigName string) (bool, string) {
 	}
 
 	bd := beads.New(beadsPath)
-	rigBeadID := beads.RigBeadIDWithPrefix(rigCfg.Beads.Prefix, rigName)
+	rigBeadID := beads.RigBeadIDWithPrefix(prefix, rigName)
 	rigBead, err := bd.Show(rigBeadID)
 	if err != nil {
 		return false, ""
@@ -144,6 +158,8 @@ func IsRigParkedOrDocked(townRoot, rigName string) (bool, string) {
 
 // getAllRigs discovers all rigs in the current Gas Town workspace.
 // Returns the list of rigs, the town root path, and any error.
+//
+//nolint:unparam // Keep townRoot in the result for callers that need follow-up town-scoped operations.
 func getAllRigs() ([]*rig.Rig, string, error) {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
