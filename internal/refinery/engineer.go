@@ -453,7 +453,9 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	}
 	if len(subChanges) > 0 {
 		// Ensure submodules are initialized in the refinery worktree
-		if initErr := git.InitSubmodules(e.git.WorkDir()); initErr != nil {
+		// Use mayor/rig as reference to avoid re-fetching from remote
+		mayorRig := filepath.Join(e.rig.Path, "mayor", "rig")
+		if initErr := git.InitSubmodules(e.git.WorkDir(), mayorRig); initErr != nil {
 			return ProcessResult{
 				Success: false,
 				Error:   fmt.Sprintf("failed to init submodules in refinery worktree: %v", initErr),
