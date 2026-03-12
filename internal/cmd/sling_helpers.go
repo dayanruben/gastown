@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -264,6 +265,7 @@ type beadFieldUpdates struct {
 	ConvoyID         string // Convoy bead ID (e.g., "hq-cv-abc")
 	MergeStrategy    string // Convoy merge strategy: "direct", "mr", "local"
 	ConvoyOwned      bool   // Convoy has gt:owned label (caller-managed lifecycle)
+	FormulaVars      string // Newline-separated key=value pairs for formula template substitution
 }
 
 // storeFieldsInBead performs a single read-modify-write to update all attachment fields
@@ -337,6 +339,9 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	}
 	if updates.ConvoyOwned {
 		fields.ConvoyOwned = true
+	}
+	if updates.FormulaVars != "" {
+		fields.FormulaVars = updates.FormulaVars
 	}
 
 	// Write back once
@@ -605,7 +610,7 @@ func nudgeWitness(rigName, message string) {
 	// Emit a file event so the witness's await-event unblocks instantly.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		_, _ = EmitEventToTown(townRoot, "witness", "POLECAT_DONE", []string{
+		_, _ = channelevents.EmitToTown(townRoot, "witness", "POLECAT_DONE", []string{
 			"source=polecat",
 			"message=" + message,
 		})
@@ -640,7 +645,7 @@ func nudgeRefinery(rigName, message string) {
 	// This is the programmatic bridge between mq submit and the event system.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		_, _ = EmitEventToTown(townRoot, "refinery", "MQ_SUBMIT", []string{
+		_, _ = channelevents.EmitToTown(townRoot, "refinery", "MQ_SUBMIT", []string{
 			"source=sling",
 			"message=" + message,
 		})
@@ -895,7 +900,7 @@ func ensureFormulaRequiredVars(formulaName string, vars []string) []string {
 		{"setup_command", ""},
 		{"typecheck_command", ""},
 		{"lint_command", ""},
-		{"test_command", "go test ./..."},
+		{"test_command", ""},
 		{"build_command", ""},
 	}
 	for _, item := range requiredDefaults {
@@ -989,7 +994,6 @@ func hookBeadWithRetry(beadID, targetAgent, hookDir string) error {
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		err := BdCmd("update", beadID, "--status=hooked", "--assignee="+targetAgent).
 			Dir(hookDir).
-			WithAutoCommit().
 			Run()
 		if err != nil {
 			lastErr = err
