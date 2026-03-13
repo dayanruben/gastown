@@ -324,6 +324,20 @@ type DaemonThresholds struct {
 
 	// DeaconGracePeriod is time to wait after starting Deacon before checking heartbeat (default "5m").
 	DeaconGracePeriod string `json:"deacon_grace_period,omitempty"`
+
+	// PressureCPUThreshold is the per-core load average above which new
+	// non-infrastructure spawns are deferred. Disabled by default (0).
+	// Recommended starting value: 3.0 (only trips under severe load).
+	PressureCPUThreshold *float64 `json:"pressure_cpu_threshold,omitempty"`
+
+	// PressureMemThresholdGB is the minimum available memory (in GB) below
+	// which new non-infrastructure spawns are deferred. Disabled by default (0).
+	// Recommended starting value: 0.5 (only trips when swapping).
+	PressureMemThresholdGB *float64 `json:"pressure_mem_threshold_gb,omitempty"`
+
+	// PressureMaxSessions is the maximum number of concurrent agent tmux
+	// sessions before new non-infrastructure spawns are deferred. Disabled by default (0 = unlimited).
+	PressureMaxSessions *int `json:"pressure_max_sessions,omitempty"`
 }
 
 // DeaconThresholds configures deacon health-check and dispatch thresholds.
@@ -405,6 +419,11 @@ type MailThresholds struct {
 
 	// MaxConcurrentAckOps is max concurrent mail acknowledge operations (default 8).
 	MaxConcurrentAckOps *int `json:"max_concurrent_ack_ops,omitempty"`
+
+	// ReplyReminderDelay is how long after mail delivery to nudge the recipient
+	// to reply via gt mail send rather than in chat (default "30s").
+	// Set to "0s" to disable reply reminders entirely.
+	ReplyReminderDelay string `json:"reply_reminder_delay,omitempty"`
 }
 
 // WebThresholds configures web API thresholds.
@@ -691,6 +710,17 @@ type RuntimeConfig struct {
 
 	// Instructions controls the per-workspace instruction file name.
 	Instructions *RuntimeInstructionsConfig `json:"instructions,omitempty"`
+
+	// ACP configures ACP (Agent Communication Protocol) support.
+	// When set, the agent can run in ACP mode. If nil, ACP support is
+	// determined by matching the Command to a known preset with ACP config.
+	ACP *ACPConfig `json:"acp,omitempty"`
+
+	// ExecWrapper is a command prefix inserted between environment variables
+	// and the agent binary in the startup command. Used for sandboxed execution.
+	// Example: ["exitbox", "run", "--profile=gastown-polecat", "--"]
+	// Produces: exec env VAR=val ... exitbox run --profile=gastown-polecat -- claude ...
+	ExecWrapper []string `json:"exec_wrapper,omitempty"`
 
 	// ResolvedAgent is the agent name that was resolved during config lookup.
 	// Set by ResolveRoleAgentConfig / resolveAgentConfigInternal so that
