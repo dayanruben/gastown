@@ -381,9 +381,9 @@ func buildDoltSQLCmd(ctx context.Context, config *Config, args ...string) *exec.
 
 	cmd := exec.CommandContext(ctx, "dolt", fullArgs...)
 
-	if !config.IsRemote() {
-		cmd.Dir = config.DataDir
-	}
+	// Always set cmd.Dir to DataDir — even for remote connections (GH#2537).
+	// Without this, dolt auto-creates .doltcfg/privileges.db in $CWD.
+	cmd.Dir = config.DataDir
 
 	if config.IsRemote() && config.Password != "" {
 		cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD="+config.Password)
@@ -1299,6 +1299,28 @@ func Start(townRoot string) error {
 	if err != nil {
 		return fmt.Errorf("checking server status: %w", err)
 	}
+
+	// If IsRunning returns false, the port may still be held by a dolt process
+	// that doesn't match this town's ownership (e.g., a leftover from an old
+	// town setup started with different flags). IsRunning's ownership check
+	// correctly returns false, but we need to evict the squatter before we can
+	// bind the port. (fix: start-kills-unowned-port-holder)
+	if !running {
+		if squatterPID := findDoltServerOnPort(config.Port); squatterPID > 0 {
+			fmt.Fprintf(os.Stderr, "Warning: port %d held by unowned dolt process (PID %d) — killing before start\n", config.Port, squatterPID)
+			if proc, findErr := os.FindProcess(squatterPID); findErr == nil {
+				_ = proc.Signal(syscall.SIGTERM)
+				if err := waitForPortRelease(config.Port, 5*time.Second); err != nil {
+					// SIGTERM didn't work, escalate to SIGKILL
+					_ = proc.Kill()
+					if err := waitForPortRelease(config.Port, 3*time.Second); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: port %d still occupied after killing PID %d: %v\n", config.Port, squatterPID, err)
+					}
+				}
+			}
+		}
+	}
+
 	if running {
 		// If data directory doesn't exist, this is an orphaned server (e.g., user
 		// deleted ~/gt and re-ran gt install). Kill it so we can start fresh.
@@ -3042,6 +3064,9 @@ func GetActiveConnectionCount(townRoot string) (int, error) {
 		"-q", "SELECT COUNT(*) AS cnt FROM information_schema.PROCESSLIST",
 	}
 	cmd := exec.CommandContext(ctx, "dolt", fullArgs...)
+	// Run from the data dir to prevent dolt from creating stray .doltcfg/
+	// in the process CWD (GH#2537).
+	cmd.Dir = config.DataDir
 	// Always set DOLT_CLI_PASSWORD to prevent interactive password prompt.
 	// When empty, dolt connects without a password (which is the default for local servers).
 	cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD="+config.Password)

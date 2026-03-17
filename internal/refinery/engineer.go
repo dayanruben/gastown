@@ -394,6 +394,18 @@ type ProcessResult struct {
 
 // doMerge performs the actual git merge operation.
 func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue string, skipGates ...bool) ProcessResult {
+	// GH#2778: Check no_merge flag on source issue before merging. The polecat
+	// normally skips MR creation when no_merge is set, but if an MR is created
+	// manually (e.g., gh pr create) the refinery would otherwise auto-merge it.
+	if sourceIssue != "" {
+		if si, err := e.beads.Show(sourceIssue); err == nil && si != nil {
+			if af := beads.ParseAttachmentFields(si); af != nil && af.NoMerge {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Source issue %s has no_merge=true — skipping merge\n", sourceIssue)
+				return ProcessResult{Error: "no_merge flag set on source issue"}
+			}
+		}
+	}
+
 	// Step 1: Verify source branch exists locally (shared .repo.git with polecats)
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Checking local branch %s...\n", branch)
 	exists, err := e.git.BranchExists(branch)
