@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -127,6 +126,13 @@ func TestBdSupportsAllowStale_ReprobesWhenBinaryPathChanges(t *testing.T) {
 	}
 }
 
+// writeAllowStaleBDStub creates a mock bd binary in dir.
+//
+// The detection function (BdSupportsAllowStaleWithEnv) ignores the exit code
+// and checks output for "unknown flag" (matching real bd v0.60+ behavior where
+// unknown flags exit 0 but print an error to stderr). The stubs must match:
+//   - Supporting: exit 0, no output
+//   - Non-supporting: exit 0, print "unknown flag" to stderr
 func writeAllowStaleBDStub(t *testing.T, dir string, supportsAllowStale bool) {
 	t.Helper()
 
@@ -137,11 +143,17 @@ func writeAllowStaleBDStub(t *testing.T, dir string, supportsAllowStale bool) {
 		scriptPath = filepath.Join(dir, "bd.bat")
 		if supportsAllowStale {
 			script = `@echo off
+setlocal enableextensions
+if "%1"=="--allow-stale" exit /b 0
 exit /b 0
 `
 		} else {
 			script = `@echo off
-echo unknown flag --allow-stale 1>&2
+setlocal enableextensions
+if "%1"=="--allow-stale" (
+  echo Error: unknown flag: --allow-stale 1>&2
+  exit /b 0
+)
 exit /b 0
 `
 		}
@@ -153,7 +165,9 @@ exit 0
 `
 		} else {
 			script = `#!/bin/sh
-echo "unknown flag --allow-stale" >&2
+if [ "$1" = "--allow-stale" ]; then
+  echo "Error: unknown flag: --allow-stale" >&2
+fi
 exit 0
 `
 		}
@@ -2951,20 +2965,15 @@ func TestBdBranch_SystemScenario_FilterBeadsEnvIsolation(t *testing.T) {
 	t.Setenv("BEADS_DIR", "/tmp/filter-test-beads")
 	t.Setenv("GT_ROOT", "/tmp/filter-test-gt")
 
-	cmd := exec.Command("env")
-	cmd.Env = filterBeadsEnv(os.Environ())
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("env command failed: %v", err)
-	}
+	filtered := filterBeadsEnv(os.Environ())
 
-	output := string(out)
-	// Note: HOME= is stripped by filterBeadsEnv, but on macOS the kernel may
-	// re-inject HOME into subprocesses. Only check beads-specific vars here.
+	// Verify beads-specific vars are stripped from the filtered env.
 	forbidden := []string{"BD_ACTOR=", "BEADS_DIR=", "GT_ROOT="}
-	for _, prefix := range forbidden {
-		if strings.Contains(output, prefix) {
-			t.Errorf("filterBeadsEnv subprocess still contains %s", prefix)
+	for _, entry := range filtered {
+		for _, prefix := range forbidden {
+			if strings.HasPrefix(entry, prefix) {
+				t.Errorf("filterBeadsEnv result still contains %s", entry)
+			}
 		}
 	}
 }
