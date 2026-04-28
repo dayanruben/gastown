@@ -4,7 +4,7 @@
 >
 > **Status**: Design
 > **Depends on**: Convoy Milestones 0-2 (ConvoyManager, stage-launch)
-> **Related**: [roadmap.md](roadmap.md) | [spec.md](spec.md) | [swarm-architecture.md](../../../docs/swarm-architecture.md)
+> **Related**: [roadmap.md](roadmap.md) | [spec.md](spec.md) | swarm architecture
 
 ---
 
@@ -471,10 +471,9 @@ skipped issues. This is useful for all convoys, not just mountains.
 
 ## 10. Relationship to Swarm Architecture
 
-The [swarm architecture doc](../../../docs/swarm-architecture.md) describes
-a design where swarms are persistent molecules coordinated by a dedicated
-agent. The Mountain-Eater achieves the same outcome through a different
-mechanism:
+The swarm architecture design describes a model where swarms are persistent
+molecules coordinated by a dedicated agent. The Mountain-Eater achieves the
+same outcome through a different mechanism:
 
 | Swarm Architecture | Mountain-Eater |
 |--------------------|----------------|

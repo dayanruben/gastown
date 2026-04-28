@@ -224,7 +224,7 @@ commands — use your normal development workflow:
 1. **Fork the relevant repo** (if contributing code)
 2. **Create a feature branch** following the target project's contribution
    guidelines (Gas Town uses `docs/*`, `fix/*`, `feat/*`, `refactor/*` —
-   see [CONTRIBUTING.md](../CONTRIBUTING.md))
+   see [CONTRIBUTING.md](https://github.com/steveyegge/gastown/blob/main/CONTRIBUTING.md))
 3. **Make your changes**
 4. **Open a pull request** against the upstream repository
 

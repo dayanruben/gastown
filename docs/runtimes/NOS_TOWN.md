@@ -157,7 +157,7 @@ Groq-specific features (routing, councils, Historian, Safeguard):
 
 ## Documentation
 
-- **Gas Town**: [README.md](../../README.md), [docs/](../)
+- **Gas Town**: [README.md](https://github.com/steveyegge/gastown/blob/main/README.md), [docs](/docs/overview)
 - **NOS Town**: [github.com/kab0rn/nostown](https://github.com/kab0rn/nostown)
   - [docs/ROLES.md](https://github.com/kab0rn/nostown/blob/main/docs/ROLES.md) — Groq-specific role designs
   - [docs/ROUTING.md](https://github.com/kab0rn/nostown/blob/main/docs/ROUTING.md) — Multi-model routing
