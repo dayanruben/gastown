@@ -194,6 +194,9 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 	if report.Dispatched > 0 || report.Failed > 0 {
 		fmt.Printf("\n%s Dispatched %d, failed %d (reason: %s)\n",
 			style.Bold.Render("✓"), report.Dispatched, report.Failed, report.Reason)
+	} else if report.Skipped > 0 {
+		fmt.Printf("\n%s Skipped %d bead(s) — zero capacity (working: %d)\n",
+			style.Dim.Render("○"), report.Skipped, countWorkingPolecats())
 	}
 
 	return report.Dispatched, nil
@@ -489,15 +492,26 @@ func recordDispatchFailure(townBeads *beads.Beads, b capacity.PendingBead, dispa
 // (GH#3468), so we scan HQ plus all rig dirs.
 // Used by scheduler list/status/clear, cleanupStaleContexts, and areScheduled.
 // Does NOT filter by readiness or circuit breaker.
+//
+// Deduplicates by context ID: different search dirs can resolve to the same
+// underlying beads DB (e.g., when a rig's top-level .beads is a redirect to
+// mayor/rig/.beads), and both paths would otherwise return the same contexts.
 func listAllSlingContexts(townRoot string) []*beads.Issue {
 	var all []*beads.Issue
+	seen := make(map[string]bool)
 	for _, dir := range beadsSearchDirs(townRoot) {
 		b := beads.NewWithBeadsDir(dir, beads.ResolveBeadsDir(dir))
 		contexts, err := b.ListOpenSlingContexts()
 		if err != nil {
 			continue // Partial failure is acceptable — skip unavailable dirs
 		}
-		all = append(all, contexts...)
+		for _, ctx := range contexts {
+			if seen[ctx.ID] {
+				continue
+			}
+			seen[ctx.ID] = true
+			all = append(all, ctx)
+		}
 	}
 	return all
 }
