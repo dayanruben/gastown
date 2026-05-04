@@ -29,29 +29,24 @@ func DeliverySendLabels() []string {
 	return []string{DeliveryLabelPending}
 }
 
-// DeliveryAckLabelSequence returns labels for phase-2 (ack). The ordering is
-// intentional for crash safety: state remains pending until the final ack label
-// write succeeds.
-func DeliveryAckLabelSequence(recipientIdentity string, at time.Time) []string {
-	ackedAt := at.UTC().Format(time.RFC3339)
-	return []string{
-		DeliveryLabelAckedByPrefix + recipientIdentity,
-		DeliveryLabelAckedAtPrefix + ackedAt,
-		DeliveryLabelAcked,
-	}
-}
-
-// DeliveryAckLabelSequenceIdempotent returns ack labels, reusing an existing
-// timestamp from existingLabels if one is present AND the recipient identity
-// matches. This ensures retries produce the exact same label set instead of
-// appending duplicate timestamps. If the recipient differs (e.g., after a
-// claim-release-reclaim cycle), a fresh timestamp is generated.
+// DeliveryAckLabelSequence returns the full intended ack label sequence for
+// phase-2 (ack), reusing an existing timestamp from existingLabels if one is
+// present AND the recipient identity matches. This ensures retries produce
+// the exact same label set instead of appending duplicate timestamps. If the
+// recipient differs (e.g., after a claim-release-reclaim cycle), a fresh
+// timestamp is generated.
+//
+// The label ordering is intentional for crash safety: state remains pending
+// until the final delivery:acked label write succeeds.
 //
 // The scan is order-independent because bd show --json returns labels in
 // lexicographic order, not insertion order. We collect all acked-by and
 // acked-at values and only reuse a timestamp when this recipient is the
 // sole acker (no mixed state from crash recovery).
-func DeliveryAckLabelSequenceIdempotent(recipientIdentity string, at time.Time, existingLabels []string) []string {
+//
+// This returns the intended sequence; idempotent filtering against the
+// labels already present is performed by deliveryAckLabelsToWrite.
+func DeliveryAckLabelSequence(recipientIdentity string, at time.Time, existingLabels []string) []string {
 	ts := at.UTC().Format(time.RFC3339)
 	var recipients []string
 	var timestamps []string
@@ -95,7 +90,7 @@ func AcknowledgeDeliveryBead(workDir, beadsDir, beadID, recipientIdentity string
 		fmt.Fprintf(os.Stderr, "delivery ack: could not read labels for %s: %v (proceeding with fresh timestamp)\n", beadID, readErr)
 	}
 
-	for _, label := range DeliveryAckLabelSequenceIdempotent(recipientIdentity, timeNow().UTC(), existingLabels) {
+	for _, label := range deliveryAckLabelsToWrite(recipientIdentity, timeNow().UTC(), existingLabels) {
 		args := []string{"label", "add", beadID, label}
 		ctx, cancel := bdWriteCtx()
 		_, err := runBdCommand(ctx, args, workDir, beadsDir)
@@ -109,6 +104,30 @@ func AcknowledgeDeliveryBead(workDir, beadsDir, beadID, recipientIdentity string
 		return err
 	}
 	return nil
+}
+
+// deliveryAckLabelsToWrite returns the idempotent ack labels that are not
+// already present. This avoids duplicate bd label-add calls, which otherwise
+// attempt a Dolt commit and produce "nothing to commit" warnings.
+func deliveryAckLabelsToWrite(recipientIdentity string, at time.Time, existingLabels []string) []string {
+	sequence := DeliveryAckLabelSequence(recipientIdentity, at, existingLabels)
+	if len(existingLabels) == 0 {
+		return sequence
+	}
+
+	existing := make(map[string]struct{}, len(existingLabels))
+	for _, label := range existingLabels {
+		existing[label] = struct{}{}
+	}
+
+	missing := make([]string, 0, len(sequence))
+	for _, label := range sequence {
+		if _, ok := existing[label]; ok {
+			continue
+		}
+		missing = append(missing, label)
+	}
+	return missing
 }
 
 // routedBeadsDirForID returns the BEADS_DIR value to pass into runBdCommand
