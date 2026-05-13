@@ -1707,7 +1707,12 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 		}
 	}
 
-	if hookedBeadID != "" && exitType != ExitDeferred {
+	// Workflow step beads (*-wfs-*) are ephemeral formula steps managed by the workflow
+	// engine. For these, DEFERRED means "step complete, no code commits" not "work
+	// paused for resumption". Close them on DEFERRED so the convoy can advance.
+	isWorkflowStep := strings.Contains(hookedBeadID, "-wfs-")
+
+	if hookedBeadID != "" && (exitType != ExitDeferred || isWorkflowStep) {
 		// BUG FIX (gt-pftz): Close hooked bead unless already terminal (closed/tombstone).
 		// Previously checked hookedBead.Status == StatusHooked, but polecats update
 		// their work bead to in_progress during work. The exact-match check caused
@@ -1716,6 +1721,7 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 		//
 		// DEFERRED exits preserve the bead: work is paused, not done. The bead
 		// stays open/in_progress so it can be resumed on the next session.
+		// Exception: workflow step beads (*-wfs-*) are always closed — see above.
 		if hookedBead, err := bd.Show(hookedBeadID); err == nil && !beads.IssueStatus(hookedBead.Status).IsTerminal() {
 			// Guard: never close a rig identity bead. Polecats dispatched with the
 			// rig bead as their hook (via mol-polecat-work) must not close permanent
@@ -1747,9 +1753,10 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 				if closeErr := bd.ForceCloseWithReason("done", attachment.AttachedMolecule); closeErr != nil {
 					if !errors.Is(closeErr, beads.ErrNotFound) {
 						fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s: %v\n", attachment.AttachedMolecule, closeErr)
-						// Don't try to close hookedBeadID - it may still be blocked
-						// The Witness will clean up orphaned state
-						return
+						// Don't try to close hookedBeadID - it may still be blocked.
+						// But DO clear hooks and update agent state (goto doneStateUpdate)
+						// so the polecat isn't stuck in 'working' state (za-o9e).
+						goto doneStateUpdate
 					}
 					// Not found = already burned/deleted by another path, continue
 				}
@@ -1804,8 +1811,8 @@ doneStateUpdate:
 		cleanupStatus := parseCleanupStatus(doneCleanupStatus)
 		if cleanupStatus != polecat.CleanupUnknown {
 			if err := bd.UpdateAgentCleanupStatus(agentBeadID, string(cleanupStatus)); err != nil {
+				// Non-fatal: don't return — done-intent labels still need clearing (za-o9e)
 				fmt.Fprintf(os.Stderr, "Warning: couldn't update agent %s cleanup status: %v\n", agentBeadID, err)
-				return
 			}
 		}
 	}
