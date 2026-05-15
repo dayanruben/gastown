@@ -17,6 +17,15 @@ func (f fakeMRFinder) FindMRForBranchAny(branch string) (*beads.Issue, error) {
 	return f.issue, f.err
 }
 
+type fakeIssueShower struct {
+	issue *beads.Issue
+	err   error
+}
+
+func (f fakeIssueShower) Show(issueID string) (*beads.Issue, error) {
+	return f.issue, f.err
+}
+
 func TestApplyMQCheck(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -99,6 +108,52 @@ func TestApplyMQCheck(t *testing.T) {
 			}
 			if status.NeedsRecovery != tt.wantNeedsRecov {
 				t.Errorf("NeedsRecovery = %v, want %v", status.NeedsRecovery, tt.wantNeedsRecov)
+			}
+		})
+	}
+}
+
+func TestIsActiveMRTerminal(t *testing.T) {
+	tests := []struct {
+		name string
+		mrID string
+		bd   issueShower
+		want bool
+	}{
+		{
+			name: "empty active MR is terminal",
+			want: true,
+		},
+		{
+			name: "closed active MR is terminal",
+			mrID: "mr-1",
+			bd:   fakeIssueShower{issue: &beads.Issue{ID: "mr-1", Status: "closed"}},
+			want: true,
+		},
+		{
+			name: "open active MR is not terminal",
+			mrID: "mr-1",
+			bd:   fakeIssueShower{issue: &beads.Issue{ID: "mr-1", Status: "open"}},
+			want: false,
+		},
+		{
+			name: "missing active MR is not terminal",
+			mrID: "mr-1",
+			bd:   fakeIssueShower{issue: nil},
+			want: false,
+		},
+		{
+			name: "lookup error is not terminal",
+			mrID: "mr-1",
+			bd:   fakeIssueShower{err: errors.New("bd exploded")},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isActiveMRTerminal(tt.bd, tt.mrID); got != tt.want {
+				t.Errorf("isActiveMRTerminal() = %v, want %v", got, tt.want)
 			}
 		})
 	}

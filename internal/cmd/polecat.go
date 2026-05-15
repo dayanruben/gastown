@@ -1022,7 +1022,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	} else {
 		// Use cleanup_status from agent bead
 		status.CleanupStatus = polecat.CleanupStatus(fields.CleanupStatus)
-		if status.CleanupStatus.IsSafe() && fields.ActiveMR == "" {
+		if status.CleanupStatus.IsSafe() && isActiveMRTerminal(bd, fields.ActiveMR) {
 			status.NeedsRecovery = false
 			status.Verdict = "SAFE_TO_NUKE"
 		} else {
@@ -1091,6 +1091,24 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+type issueShower interface {
+	Show(issueID string) (*beads.Issue, error)
+}
+
+func isActiveMRTerminal(bd issueShower, mrID string) bool {
+	if mrID == "" {
+		return true
+	}
+	if bd == nil {
+		return false
+	}
+	mr, err := bd.Show(mrID)
+	if err != nil || mr == nil {
+		return false
+	}
+	return beads.IssueStatus(mr.Status).IsTerminal()
 }
 
 // mrFinder is the subset of *beads.Beads that applyMQCheck needs. It lets us
