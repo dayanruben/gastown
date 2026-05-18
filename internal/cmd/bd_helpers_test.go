@@ -192,6 +192,30 @@ timeout /t 5 /nobreak >NUL
 	}
 }
 
+func TestBdCmd_CombinedOutputDoesNotPreSetStderr(t *testing.T) {
+	binDir := t.TempDir()
+	writeBDStub(t, binDir, `#!/usr/bin/env sh
+printf 'stdout:%s\n' "$*"
+printf 'stderr:%s\n' "$*" >&2
+`, `@echo off
+echo stdout:%*
+echo stderr:%* 1>&2
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	out, err := BdCmd("show", "id").CombinedOutput()
+	if err != nil {
+		t.Fatalf("CombinedOutput: %v", err)
+	}
+	text := string(out)
+	if !strings.Contains(text, "stdout:show id") {
+		t.Fatalf("missing stdout in combined output: %q", text)
+	}
+	if !strings.Contains(text, "stderr:show id") {
+		t.Fatalf("missing stderr in combined output: %q", text)
+	}
+}
+
 func TestBdCmd_Chaining(t *testing.T) {
 	// Test that all builder methods return the receiver for chaining
 	bdc := BdCmd("test")

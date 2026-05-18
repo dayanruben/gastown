@@ -248,6 +248,11 @@ func (b *bdCmd) Output() ([]byte, error) {
 func (b *bdCmd) CombinedOutput() ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), resolveBdCmdTimeout())
 	defer cancel()
-	out, err := b.buildContextCommand(ctx).CombinedOutput()
+	args := b.resolvedArgs()
+	cmd := exec.CommandContext(ctx, "bd", args...)
+	util.SetProcessGroup(cmd)
+	cmd.Dir = b.dir
+	cmd.Env = b.buildEnv()
+	out, err := cmd.CombinedOutput()
 	return out, wrapBdCmdTimeout(ctx, err)
 }
