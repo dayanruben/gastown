@@ -2496,6 +2496,9 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	state := StateIdle
 	if issueID != "" {
 		state = StateWorking
+		if sessionDead {
+			state = StateStalled
+		}
 	} else if sessionRunning && !sessionStale && !m.getCleanupStatusFromBead(name).IsSafe() {
 		state = StateReviewNeeded
 	}
