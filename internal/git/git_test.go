@@ -55,6 +55,11 @@ func initTownRootSafetyRepo(t *testing.T) string {
 
 	root := initTestRepo(t)
 	g := NewGit(root)
+	cmd := exec.Command("git", "branch", "polecat/safety")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create safety branch: %v\n%s", err, out)
+	}
 	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("committed\n"), 0644); err != nil {
 		t.Fatalf("write tracked file: %v", err)
 	}
@@ -63,11 +68,6 @@ func initTownRootSafetyRepo(t *testing.T) string {
 	}
 	if err := g.Commit("add tracked file"); err != nil {
 		t.Fatalf("git commit tracked: %v", err)
-	}
-	cmd := exec.Command("git", "branch", "polecat/safety")
-	cmd.Dir = root
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("create safety branch: %v\n%s", err, out)
 	}
 
 	writeTownSafetyFile(t, root, "mayor/town.json", `{"name":"test-town"}\n`)
@@ -162,9 +162,9 @@ func TestTownRootMutatingGitCommandsAreBlocked(t *testing.T) {
 		run  func(*Git) error
 	}{
 		{name: "checkout", run: func(g *Git) error { return g.Checkout("polecat/safety") }},
-		{name: "checkout new branch", run: func(g *Git) error { return g.CheckoutNewBranch("polecat/new", "HEAD") }},
-		{name: "checkout reset branch", run: func(g *Git) error { return g.CheckoutResetBranch("polecat/reset", "HEAD") }},
-		{name: "reset hard", run: func(g *Git) error { return g.ResetHard("HEAD") }},
+		{name: "checkout new branch", run: func(g *Git) error { return g.CheckoutNewBranch("polecat/new", "polecat/safety") }},
+		{name: "checkout reset branch", run: func(g *Git) error { return g.CheckoutResetBranch("polecat/reset", "polecat/safety") }},
+		{name: "reset hard", run: func(g *Git) error { return g.ResetHard("polecat/safety") }},
 		{name: "clean force", run: func(g *Git) error { return g.CleanForce() }},
 	}
 
@@ -176,6 +176,17 @@ func TestTownRootMutatingGitCommandsAreBlocked(t *testing.T) {
 			requireTownRootSafetyError(t, err)
 			assertTownRootSafetyPreserved(t, root, before)
 		})
+	}
+}
+
+func TestTownRootReadOnlyStashListIsAllowed(t *testing.T) {
+	root := initTownRootSafetyRepo(t)
+	count, err := NewGit(root).StashCount()
+	if err != nil {
+		t.Fatalf("stash count should be allowed: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("stash count = %d, want 0", count)
 	}
 }
 
@@ -195,9 +206,20 @@ func TestNestedWorkDirResolvingToTownRootGitIsBlocked(t *testing.T) {
 	}
 
 	before := snapshotTownRootSafety(t, root)
-	err = NewGit(rigDir).ResetHard("HEAD")
-	requireTownRootSafetyError(t, err)
-	assertTownRootSafetyPreserved(t, root, before)
+	for _, tt := range []struct {
+		name string
+		run  func(*Git) error
+	}{
+		{name: "checkout", run: func(g *Git) error { return g.Checkout("polecat/safety") }},
+		{name: "reset hard", run: func(g *Git) error { return g.ResetHard("polecat/safety") }},
+		{name: "clean force", run: func(g *Git) error { return g.CleanForce() }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err = tt.run(NewGit(rigDir))
+			requireTownRootSafetyError(t, err)
+			assertTownRootSafetyPreserved(t, root, before)
+		})
+	}
 }
 
 func TestWorktreeAddCannotTargetTownRootRuntimePaths(t *testing.T) {
@@ -211,9 +233,20 @@ func TestWorktreeAddCannotTargetTownRootRuntimePaths(t *testing.T) {
 		t.Fatalf("clone bare: %v\n%s", err, out)
 	}
 
-	err := NewGitWithDir(bareDir, "").WorktreeAddFromRef(root, "polecat/town-root", "HEAD")
-	requireTownRootSafetyError(t, err)
-	assertTownRootSafetyPreserved(t, root, before)
+	for i, target := range []string{
+		root,
+		filepath.Join(root, "mayor", "bad-worktree"),
+		filepath.Join(root, ".dolt-data", "bad-worktree"),
+		filepath.Join(root, ".runtime", "bad-worktree"),
+		filepath.Join(root, ".beads", "bad-worktree"),
+		filepath.Join(root, "daemon", "bad-worktree"),
+	} {
+		t.Run(filepath.Base(filepath.Dir(target))+"/"+filepath.Base(target), func(t *testing.T) {
+			err := NewGitWithDir(bareDir, "").WorktreeAddFromRef(target, fmt.Sprintf("polecat/town-root-%d", i), "HEAD")
+			requireTownRootSafetyError(t, err)
+			assertTownRootSafetyPreserved(t, root, before)
+		})
+	}
 }
 
 func TestIsRepo(t *testing.T) {

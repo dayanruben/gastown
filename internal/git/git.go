@@ -218,18 +218,45 @@ func (g *Git) guardUnsafeTownRootMutation(args []string) error {
 	if cmd == "" {
 		return nil
 	}
+	effectiveWorkDir := gitEffectiveWorkDir(args, g.workDir)
 
 	if gitSubcommandMutatesWorktree(cmd, rest) {
-		if err := EnsureSafeMutationWorkDir(g.workDir); err != nil {
+		if err := EnsureSafeMutationWorkDir(effectiveWorkDir); err != nil {
 			return fmt.Errorf("%w: git %s", err, strings.Join(args, " "))
 		}
 	}
 
-	for _, target := range protectedWorktreeTargets(cmd, rest, g.workDir) {
+	for _, target := range protectedWorktreeTargets(cmd, rest, effectiveWorkDir) {
 		return fmt.Errorf("%w: git worktree target %s", ErrUnsafeTownRootGitMutation, target)
 	}
 
 	return nil
+}
+
+func gitEffectiveWorkDir(args []string, workDir string) string {
+	effective := workDir
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-C" && i+1 < len(args):
+			effective = gitPathAbs(args[i+1], effective)
+			i++
+		case arg == "--work-tree" && i+1 < len(args):
+			effective = gitPathAbs(args[i+1], effective)
+			i++
+		case strings.HasPrefix(arg, "--work-tree="):
+			effective = gitPathAbs(strings.TrimPrefix(arg, "--work-tree="), effective)
+		case arg == "-c" || arg == "--git-dir" || arg == "--namespace" || arg == "--config-env" || arg == "--exec-path":
+			i++
+		case strings.HasPrefix(arg, "--git-dir=") || strings.HasPrefix(arg, "--namespace=") || strings.HasPrefix(arg, "--config-env=") || strings.HasPrefix(arg, "--exec-path="):
+			continue
+		case strings.HasPrefix(arg, "-"):
+			continue
+		default:
+			return effective
+		}
+	}
+	return effective
 }
 
 // EnsureSafeMutationWorkDir fails when workDir's effective git worktree is the
@@ -298,8 +325,12 @@ func gitSubcommand(args []string) (string, []string) {
 
 func gitSubcommandMutatesWorktree(cmd string, args []string) bool {
 	switch cmd {
-	case "checkout", "switch", "restore", "reset", "clean", "merge", "rebase", "pull", "rm", "stash", "cherry-pick", "revert", "am", "sparse-checkout":
+	case "checkout", "switch", "restore", "reset", "clean", "merge", "rebase", "pull", "rm", "cherry-pick", "revert", "am", "apply", "checkout-index", "read-tree", "sparse-checkout":
 		return true
+	case "stash":
+		return stashArgsMutate(args)
+	case "submodule":
+		return submoduleArgsMutate(args)
 	case "branch":
 		return branchArgsMutate(args)
 	case "worktree":
@@ -307,6 +338,30 @@ func gitSubcommandMutatesWorktree(cmd string, args []string) bool {
 	case "symbolic-ref":
 		return symbolicRefArgsMutate(args)
 	case "update-ref":
+		return true
+	default:
+		return false
+	}
+}
+
+func stashArgsMutate(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	switch args[0] {
+	case "list", "show":
+		return false
+	default:
+		return true
+	}
+}
+
+func submoduleArgsMutate(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "update", "add", "deinit", "sync", "set-url", "set-branch", "absorbgitdirs":
 		return true
 	default:
 		return false
@@ -2029,6 +2084,10 @@ func IsSparseCheckoutConfigured(repoPath string) bool {
 // RemoveSparseCheckout disables sparse checkout for a repo/worktree and restores all files.
 // This is used by doctor to clean up legacy sparse checkout configurations.
 func RemoveSparseCheckout(repoPath string) error {
+	if err := EnsureSafeMutationWorkDir(repoPath); err != nil {
+		return err
+	}
+
 	// Use git sparse-checkout disable which properly restores hidden files
 	cmd := exec.Command("git", "-C", repoPath, "sparse-checkout", "disable")
 	util.SetDetachedProcessGroup(cmd)
@@ -2741,6 +2800,9 @@ func InitSubmodules(repoPath string, referencePath ...string) error {
 	if !hasTrackedGitmodules(repoPath) {
 		return nil
 	}
+	if err := EnsureSafeMutationWorkDir(repoPath); err != nil {
+		return err
+	}
 
 	args := []string{"-C", repoPath, "submodule", "update", "--init", "--recursive"}
 
@@ -2780,6 +2842,10 @@ func hasTrackedGitmodules(repoPath string) bool {
 // InitSparseCheckout initializes sparse checkout with cone mode and configures
 // the given paths. If paths is empty, initializes with cone mode only (checkout root files).
 func InitSparseCheckout(repoPath string, paths []string) error {
+	if err := EnsureSafeMutationWorkDir(repoPath); err != nil {
+		return err
+	}
+
 	// Initialize sparse checkout in cone mode
 	cmd := exec.Command("git", "-C", repoPath, "sparse-checkout", "init", "--cone")
 	util.SetDetachedProcessGroup(cmd)
