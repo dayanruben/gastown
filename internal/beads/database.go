@@ -62,8 +62,10 @@ func StripBDTargetEnv(env []string) []string {
 	return filtered
 }
 
-// BuildPinnedBDEnv returns env for a bd subprocess pinned to beadsDir. The
-// selected .beads metadata is authoritative over inherited BEADS_DOLT_* values.
+// BuildPinnedBDEnv returns env for a bd subprocess pinned to beadsDir. BEADS_DIR
+// is the authoritative database selector; inherited explicit database selectors
+// are stripped because bd 1.0.x can resolve a different/stale view when both are
+// present, making newly-created routed beads invisible to gt hook/sling.
 func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 	env := SuppressBDSideEffects(StripBDTargetEnv(base))
 	if beadsDir == "" {
@@ -191,9 +193,6 @@ func doltTargetEnvFromBeadsDir(beadsDir string, includeDatabase bool) []string {
 	}
 	meta := readDoltMetadata(beadsDir)
 	var env []string
-	if includeDatabase && meta.Database != "" {
-		env = append(env, "BEADS_DOLT_SERVER_DATABASE="+meta.Database)
-	}
 	if meta.Host != "" {
 		env = append(env, "BEADS_DOLT_SERVER_HOST="+meta.Host)
 	}
