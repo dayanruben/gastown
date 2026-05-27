@@ -19,7 +19,7 @@ is violated. They're called before the tool runs, preventing the
 forbidden operation entirely.
 
 Available guards:
-  pr-workflow        - Enforce configured PR/direct workflow
+  pr-workflow        - Block PR creation and feature branches
   bd-init            - Block bd init in wrong directories
   mol-patrol         - Block mol patrol from agent contexts
   dangerous-command  - Block rm -rf, force push, hard reset, git clean
@@ -38,13 +38,11 @@ Example hook configuration:
 
 var tapGuardPRWorkflowCmd = &cobra.Command{
 	Use:   "pr-workflow",
-	Short: "Enforce configured PR/direct workflow",
-	Long: `Enforce PR workflow operations in Gas Town.
+	Short: "Block PR creation and feature branches",
+	Long: `Block PR workflow operations in Gas Town.
 
-Gas Town supports both internal merge-queue work and fork-PR sweep work.
-This guard uses fork/upstream remote topology only as a narrow prerequisite
-for allowing PR/branch commands; formula, role, and pre-push policy still
-decide where work may land.
+Gas Town workers push directly to main. PRs add friction that breaks
+the autonomous execution model (GUPP principle).
 
 This guard blocks:
   - gh pr create
@@ -52,11 +50,14 @@ This guard blocks:
   - git switch -c (feature branches)
 
 Exit codes:
-  0 - Operation allowed (fork/upstream prerequisite present, or not an agent)
-  2 - Operation BLOCKED (agent context without fork/upstream prerequisite)
+  0 - Operation allowed (not in Gas Town agent context, not maintainer origin)
+  2 - Operation BLOCKED (in agent context OR maintainer origin)
 
-Humans and agents with a fork/upstream remote can run PR commands. Direct
-pushes to the default branch are controlled by the git pre-push hook.`,
+The guard blocks in two scenarios:
+  1. Running as a Gas Town agent (crew, polecat, witness, etc.)
+  2. Origin remote is steveyegge/gastown (maintainer should push directly)
+
+Humans running outside Gas Town with a fork origin can still use PRs.`,
 	RunE: runTapGuardPRWorkflow,
 }
 
@@ -66,56 +67,42 @@ func init() {
 }
 
 func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
-	if hasForkPRPrerequisite() {
-		return nil
-	}
-
 	// Check if we're in a Gas Town agent context
 	if isGasTownAgentContext() {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
-		fmt.Fprintln(os.Stderr, "║  ❌ PR WORKFLOW PREREQUISITE MISSING                             ║")
+		fmt.Fprintln(os.Stderr, "║  ❌ PR WORKFLOW BLOCKED                                          ║")
 		fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")
-		fmt.Fprintln(os.Stderr, "║  No fork/upstream remote is configured for PR workflow.         ║")
+		fmt.Fprintln(os.Stderr, "║  Gas Town workers push directly to main. PRs are forbidden.     ║")
 		fmt.Fprintln(os.Stderr, "║                                                                  ║")
 		fmt.Fprintln(os.Stderr, "║  Instead of:  gh pr create / git checkout -b / git switch -c    ║")
-		fmt.Fprintln(os.Stderr, "║  Do this:     use gt done or configure a fork/upstream remote   ║")
+		fmt.Fprintln(os.Stderr, "║  Do this:     git add . && git commit && git push origin main   ║")
 		fmt.Fprintln(os.Stderr, "║                                                                  ║")
-		fmt.Fprintln(os.Stderr, "║  Default-branch pushes are blocked separately by pre-push.      ║")
+		fmt.Fprintln(os.Stderr, "║  Why? PRs add friction that breaks autonomous execution.        ║")
+		fmt.Fprintln(os.Stderr, "║  See: ~/gt/docs/PRIMING.md (GUPP principle)                     ║")
 		fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════╝")
 		fmt.Fprintln(os.Stderr, "")
 		return NewSilentExit(2) // Exit 2 = BLOCK in Claude Code hooks
 	}
 
-	// Humans outside Gas Town may use their repository's normal workflow.
+	// Check if origin is the maintainer's repo (steveyegge/gastown)
+	if isMaintainerOrigin() {
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
+		fmt.Fprintln(os.Stderr, "║  ❌ PR BLOCKED - MAINTAINER ORIGIN                               ║")
+		fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")
+		fmt.Fprintln(os.Stderr, "║  Your origin is steveyegge/gastown - push directly to main.     ║")
+		fmt.Fprintln(os.Stderr, "║  PRs are for external contributors, not maintainers.            ║")
+		fmt.Fprintln(os.Stderr, "║                                                                  ║")
+		fmt.Fprintln(os.Stderr, "║  Instead of:  gh pr create                                      ║")
+		fmt.Fprintln(os.Stderr, "║  Do this:     git push origin main                              ║")
+		fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════╝")
+		fmt.Fprintln(os.Stderr, "")
+		return NewSilentExit(2) // Exit 2 = BLOCK in Claude Code hooks
+	}
+
+	// Not in Gas Town context and not maintainer origin - allow PRs
 	return nil
-}
-
-func hasForkPRPrerequisite() bool {
-	if remoteExists("fork") || remoteExists("upstream") {
-		return true
-	}
-	originURL := remoteURL("origin", false)
-	originPushURL := remoteURL("origin", true)
-	return originURL != "" && originPushURL != "" && originPushURL != originURL
-}
-
-func remoteExists(name string) bool {
-	return remoteURL(name, false) != ""
-}
-
-func remoteURL(name string, push bool) string {
-	args := []string{"remote", "get-url"}
-	if push {
-		args = append(args, "--push")
-	}
-	args = append(args, name)
-	cmd := exec.Command("git", args...)
-	output, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(output))
 }
 
 // isGasTownAgentContext returns true if we're running as a Gas Town managed agent.
@@ -149,4 +136,19 @@ func isGasTownAgentContext() bool {
 	}
 
 	return false
+}
+
+// isMaintainerOrigin returns true if the origin remote points to the maintainer's repo.
+// This prevents the maintainer from accidentally creating PRs in their own repo.
+func isMaintainerOrigin() bool {
+	cmd := exec.Command("git", "remote", "get-url", "origin")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	url := strings.TrimSpace(string(output))
+	// Match both HTTPS and SSH URL formats:
+	// - https://github.com/steveyegge/gastown.git
+	// - git@github.com:steveyegge/gastown.git
+	return strings.Contains(url, "steveyegge/gastown")
 }

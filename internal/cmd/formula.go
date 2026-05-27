@@ -469,9 +469,8 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		}
 	}
 
-	// Step 1: Create convoy bead. Convoys are town-level coordination beads;
-	// only the executable leg/synthesis beads are rig-scoped.
-	convoyID := formulaConvoyID(generateFormulaShortID())
+	// Step 1: Create convoy bead
+	convoyID := fmt.Sprintf("%s-cv-%s", rigPrefix, generateFormulaShortID())
 	convoyTitle := fmt.Sprintf("%s: %s", formulaName, f.Description)
 	if len(convoyTitle) > 80 {
 		convoyTitle = convoyTitle[:77] + "..."
@@ -501,7 +500,10 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		createArgs = append(createArgs, "--force")
 	}
 
-	if err := BdCmd(createArgs...).WithAutoCommit().Dir(townBeads).Stderr(os.Stderr).Run(); err != nil {
+	createCmd := exec.Command("bd", createArgs...)
+	createCmd.Dir = townBeads
+	createCmd.Stderr = os.Stderr
+	if err := createCmd.Run(); err != nil {
 		return fmt.Errorf("creating convoy bead: %w", err)
 	}
 
@@ -622,7 +624,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		}
 
 		// Track the leg with the convoy
-		if err := addTrackingRelationFn(townRoot, convoyID, legBeadID); err != nil {
+		if err := addTrackingRelationFn(townBeads, convoyID, legBeadID); err != nil {
 			fmt.Printf("%s Failed to track leg %s: %v\n",
 				style.Dim.Render("Warning:"), leg.ID, err)
 		}
@@ -661,7 +663,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 				style.Dim.Render("Warning:"), err)
 		} else {
 			// Track synthesis with convoy
-			_ = addTrackingRelationFn(townRoot, convoyID, synthesisBeadID)
+			_ = addTrackingRelationFn(townBeads, convoyID, synthesisBeadID)
 
 			// Add dependencies: synthesis depends on all legs
 			for _, legBeadID := range legBeads {
@@ -702,7 +704,9 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 				style.Dim.Render("Warning:"), leg.ID, err)
 			// Add comment to bead about failure
 			commentArgs := []string{"comments", "add", legBeadID, fmt.Sprintf("Failed to sling: %v", err)}
-			_ = BdCmd(commentArgs...).WithAutoCommit().Dir(rigBeadsDir).Run()
+			commentCmd := exec.Command("bd", commentArgs...)
+			commentCmd.Dir = townBeads
+			_ = commentCmd.Run()
 			continue
 		}
 
@@ -720,10 +724,6 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 	fmt.Printf("\n  Track progress: gt convoy status %s\n", convoyID)
 
 	return nil
-}
-
-func formulaConvoyID(shortID string) string {
-	return fmt.Sprintf("hq-cv-%s", shortID)
 }
 
 // executeWorkflowFormula creates step beads with dependency wiring and dispatches
