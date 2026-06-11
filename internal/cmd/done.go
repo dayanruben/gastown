@@ -85,6 +85,13 @@ func doneContaminationBaseRef(defaultBranch, explicitTarget string) string {
 	return "origin/" + targetBranch
 }
 
+func shouldSyncIdlePolecatWorktree(exitType, mergeStrategy string, pushFailed, mrFailed, syncSafe bool) bool {
+	if exitType != ExitCompleted || pushFailed || mrFailed || !syncSafe {
+		return false
+	}
+	return mergeStrategy != "local"
+}
+
 func init() {
 	doneCmd.Flags().StringVar(&doneIssue, "issue", "", "Source issue ID (default: parse from branch name)")
 	doneCmd.Flags().IntVarP(&donePriority, "priority", "p", -1, "Override priority (0-4, default: inherit from issue)")
@@ -1424,13 +1431,26 @@ notifyWitness:
 		// dirty on the feature branch so work can be recovered.
 		syncSafe := true
 		if cwdAvailable {
-			if ws, wsErr := g.CheckUncommittedWork(); wsErr == nil && ws.HasUncommittedChanges && !ws.CleanExcludingRuntime() {
+			if ws, wsErr := g.CheckUncommittedWork(); wsErr != nil {
+				syncSafe = false
+				style.PrintWarning("could not inspect worktree before idle sync: %v — skipping sync to preserve work", wsErr)
+			} else if ws.HasUncommittedChanges && !ws.CleanExcludingRuntime() {
 				syncSafe = false
 				style.PrintWarning("uncommitted changes still present — skipping worktree sync to preserve work")
 				fmt.Printf("  Files: %s\n", ws.String())
 			}
 		}
-		if cwdAvailable && !pushFailed && !mrFailed && syncSafe {
+		if exitType == ExitCompleted && issueID != "" && convoyInfo == nil {
+			convoyInfo = getConvoyInfoFromIssue(issueID, cwd)
+			if convoyInfo == nil {
+				convoyInfo = getConvoyInfoForIssue(issueID)
+			}
+		}
+		mergeStrategy := ""
+		if convoyInfo != nil {
+			mergeStrategy = convoyInfo.MergeStrategy
+		}
+		if cwdAvailable && shouldSyncIdlePolecatWorktree(exitType, mergeStrategy, pushFailed, mrFailed, syncSafe) {
 			// Remember the old branch so we can delete it after switching
 			oldBranch := branch
 
