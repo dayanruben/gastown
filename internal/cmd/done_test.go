@@ -334,6 +334,33 @@ func TestFindHookedBeadForAgent(t *testing.T) {
 			wantIssueID: "test-456",
 		},
 		{
+			// Regression for hq-xa4z: polecats claim their assignment with
+			// `bd update --status=in_progress` when starting work. A
+			// hooked-only lookup returned empty here, blinding the stale-
+			// branch guard (toast re-wisp-e2q carried source_issue re-k8oa
+			// while the real assignment re-dkf sat in_progress).
+			name:    "in_progress bead assigned to agent returns issue ID",
+			agentID: "testrig/polecats/toast",
+			setupBeads: func(t *testing.T, bd *beads.Beads) {
+				_, err := bd.CreateWithID("test-789", beads.CreateOptions{
+					Title:  "Claimed task",
+					Labels: []string{"gt:task"},
+				})
+				if err != nil {
+					t.Fatalf("create task bead: %v", err)
+				}
+				inProgress := "in_progress"
+				assignee := "testrig/polecats/toast"
+				if err := bd.Update("test-789", beads.UpdateOptions{
+					Status:   &inProgress,
+					Assignee: &assignee,
+				}); err != nil {
+					t.Fatalf("update bead to in_progress: %v", err)
+				}
+			},
+			wantIssueID: "test-789",
+		},
+		{
 			name:        "no hooked beads returns empty",
 			agentID:     "testrig/polecats/idle",
 			setupBeads:  func(t *testing.T, bd *beads.Beads) {},
@@ -367,6 +394,90 @@ func TestFindHookedBeadForAgent(t *testing.T) {
 			got := findHookedBeadForAgent(bd, tt.agentID)
 			if got != tt.wantIssueID {
 				t.Errorf("findHookedBeadForAgent(%q) = %q, want %q", tt.agentID, got, tt.wantIssueID)
+			}
+		})
+	}
+}
+
+func TestSelectAssignedIssue(t *testing.T) {
+	tests := []struct {
+		name        string
+		branchIssue string
+		assigned    []string
+		wantIssue   string
+		wantAmbig   bool
+	}{
+		{
+			name:      "single assignment selected",
+			assigned:  []string{"gt-real"},
+			wantIssue: "gt-real",
+		},
+		{
+			name:        "stale branch overridden by single assignment",
+			branchIssue: "gt-old",
+			assigned:    []string{"gt-real"},
+			wantIssue:   "gt-real",
+		},
+		{
+			name:        "branch matching assignment needs no override",
+			branchIssue: "gt-real",
+			assigned:    []string{"gt-real"},
+		},
+		{
+			name:        "subtask branch matching assignment needs no override",
+			branchIssue: "gt-real.1",
+			assigned:    []string{"gt-real"},
+		},
+		{
+			name:        "branch matching one of multiple assignments needs no override",
+			branchIssue: "gt-real",
+			assigned:    []string{"gt-real", "gt-other"},
+		},
+		{
+			name:      "duplicate assignment ids collapse",
+			assigned:  []string{"gt-real", "gt-real"},
+			wantIssue: "gt-real",
+		},
+		{
+			name:      "multiple assignments are ambiguous",
+			assigned:  []string{"gt-b", "gt-a"},
+			wantAmbig: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotIssue, gotAmbig := selectAssignedIssue(tt.branchIssue, tt.assigned)
+			if gotIssue != tt.wantIssue || gotAmbig != tt.wantAmbig {
+				t.Fatalf("selectAssignedIssue(%q, %v) = (%q, %v), want (%q, %v)",
+					tt.branchIssue, tt.assigned, gotIssue, gotAmbig, tt.wantIssue, tt.wantAmbig)
+			}
+		})
+	}
+}
+
+// TestIsStaleBranchIssue verifies the stale-branch guard (hq-l0fj): a
+// branch-derived issue id is overridden only when it conflicts with the
+// hooked bead and is not a subtask of it.
+func TestIsStaleBranchIssue(t *testing.T) {
+	tests := []struct {
+		name        string
+		branchIssue string
+		hookedIssue string
+		want        bool
+	}{
+		{"matching ids are not stale", "hq-oibv", "hq-oibv", false},
+		{"reused branch from closed bead is stale", "re-ofo", "hq-oibv", true},
+		{"subtask of hooked bead is not stale", "gt-abc.1", "gt-abc", false},
+		{"different bead with shared prefix is stale", "gt-abc1", "gt-abc", true},
+		{"no branch issue is not stale", "", "hq-oibv", false},
+		{"no hooked bead is not stale", "re-ofo", "", false},
+		{"both empty is not stale", "", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isStaleBranchIssue(tt.branchIssue, tt.hookedIssue); got != tt.want {
+				t.Errorf("isStaleBranchIssue(%q, %q) = %v, want %v", tt.branchIssue, tt.hookedIssue, got, tt.want)
 			}
 		})
 	}
@@ -469,6 +580,60 @@ func TestShouldNudgeRefinery(t *testing.T) {
 			if got := shouldNudgeRefinery(tt.exitType, tt.mrID); got != tt.want {
 				t.Errorf("shouldNudgeRefinery(%q, %q) = %v, want %v",
 					tt.exitType, tt.mrID, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldSyncIdlePolecatWorktree(t *testing.T) {
+	tests := []struct {
+		name          string
+		exitType      string
+		mergeStrategy string
+		pushFailed    bool
+		mrFailed      bool
+		syncSafe      bool
+		want          bool
+	}{
+		{"completed default strategy syncs", ExitCompleted, "", false, false, true, true},
+		{"completed direct strategy syncs", ExitCompleted, "direct", false, false, true, true},
+		{"completed mr strategy syncs", ExitCompleted, "mr", false, false, true, true},
+		{"local strategy keeps branch", ExitCompleted, "local", false, false, true, false},
+		{"deferred keeps branch", ExitDeferred, "", false, false, true, false},
+		{"escalated keeps branch", ExitEscalated, "", false, false, true, false},
+		{"push failure keeps branch", ExitCompleted, "", true, false, true, false},
+		{"mr failure keeps branch", ExitCompleted, "", false, true, true, false},
+		{"unsafe sync keeps branch", ExitCompleted, "", false, false, false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldSyncIdlePolecatWorktree(tt.exitType, tt.mergeStrategy, tt.pushFailed, tt.mrFailed, tt.syncSafe)
+			if got != tt.want {
+				t.Errorf("shouldSyncIdlePolecatWorktree(%q, %q, %v, %v, %v) = %v, want %v",
+					tt.exitType, tt.mergeStrategy, tt.pushFailed, tt.mrFailed, tt.syncSafe, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCleanupStatusAfterSuccessfulPush(t *testing.T) {
+	tests := []struct {
+		status string
+		want   string
+	}{
+		{"unpushed", "clean"},
+		{"has_unpushed", "clean"},
+		{"clean", "clean"},
+		{"uncommitted", "uncommitted"},
+		{"stash", "stash"},
+		{"unknown", "unknown"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			if got := cleanupStatusAfterSuccessfulPush(tt.status); got != tt.want {
+				t.Errorf("cleanupStatusAfterSuccessfulPush(%q) = %q, want %q", tt.status, got, tt.want)
 			}
 		})
 	}
