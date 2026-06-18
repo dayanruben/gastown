@@ -108,6 +108,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	if beadsDir == "" {
 		beadsDir = filepath.Join(townRoot, ".beads")
 	}
+	workBeadsDir := resolveSlingMutationBeadsDir(beadsDir, townRoot, params.BeadID)
 
 	result := &SlingResult{
 		BeadID: params.BeadID,
@@ -126,7 +127,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	}
 
 	// 1. Get bead info + status check
-	info, err := getBeadInfoFromTownRoot(townRoot, params.BeadID)
+	info, err := getBeadInfoForSling(townRoot, workBeadsDir, params.BeadID)
 	if err != nil {
 		result.ErrMsg = err.Error()
 		return result, fmt.Errorf("could not get bead info: %w", err)
@@ -347,7 +348,8 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	}
 	defer assigneeUnlock()
 	hookDir := beads.ResolveHookDir(townRoot, beadToHook, hookWorkDir)
-	if err := hookBeadWithRetryWithTownRootFn(beadToHook, targetAgent, hookDir, townRoot); err != nil {
+	hookBeadsDir := resolveSlingMutationBeadsDir(beadsDir, townRoot, beadToHook)
+	if err := hookBeadWithRetryWithBeadsDirFn(beadToHook, targetAgent, hookDir, townRoot, hookBeadsDir); err != nil {
 		// Clean up orphaned polecat to avoid leaving spawned-but-unhookable polecats
 		cleanupSpawnedPolecat(spawnInfo, params.RigName, convoyID)
 		result.ErrMsg = "hook failed"
@@ -376,7 +378,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		FormulaVars:      formulaVarsForAttachment,
 	}
 	// Use beadToHook for the update target (may differ from beadID when formula-on-bead)
-	if err := storeFieldsInBeadFromTownRoot(townRoot, beadToHook, fieldUpdates); err != nil {
+	if err := storeFieldsInBeadFromBeadsDir(hookDir, hookBeadsDir, beadToHook, fieldUpdates); err != nil {
 		fmt.Printf("  %s Could not store fields in bead: %v\n", style.Dim.Render("Warning:"), err)
 	}
 

@@ -399,6 +399,19 @@ func bdShowBeadOutputFromTownRoot(townRoot, beadID string) ([]byte, error) {
 	return out, err
 }
 
+func bdShowBeadOutputFromBeadsDir(workDir, beadsDir, beadID string) ([]byte, error) {
+	if beadsDir == "" {
+		return bdShowBeadOutputFromTownRoot("", beadID)
+	}
+	workDir = commandWorkDirForBeadsDir(workDir, beadsDir)
+	return BdCmd("show", beadID, "--json").
+		AllowStale().
+		Dir(workDir).
+		WithBeadsDir(beadsDir).
+		Stderr(io.Discard).
+		Output()
+}
+
 func bdShowBeadDirectCmd(beadID string) *bdCmd {
 	return BdCmd("show", beadID, "--json").
 		AllowStale().
@@ -441,6 +454,41 @@ func getBeadInfoFromTownRoot(townRoot, beadID string) (*beadInfo, error) {
 		return nil, fmt.Errorf("bead '%s' not found", beadID)
 	}
 	return parseBeadInfo(beadID, out)
+}
+
+func getBeadInfoFromBeadsDir(workDir, beadsDir, beadID string) (*beadInfo, error) {
+	out, err := bdShowBeadOutputFromBeadsDir(workDir, beadsDir, beadID)
+	if err != nil {
+		return nil, fmt.Errorf("bead '%s' not found", beadID)
+	}
+	return parseBeadInfo(beadID, out)
+}
+
+func getBeadInfoForSling(townRoot, beadsDir, beadID string) (*beadInfo, error) {
+	if beadsDir != "" {
+		return getBeadInfoFromBeadsDir(filepath.Dir(beadsDir), beadsDir, beadID)
+	}
+	return getBeadInfoFromTownRoot(townRoot, beadID)
+}
+
+func resolveSlingMutationBeadsDir(currentBeadsDir, townRoot, beadID string) string {
+	if currentBeadsDir == "" && townRoot != "" {
+		currentBeadsDir = filepath.Join(townRoot, ".beads")
+	}
+	if currentBeadsDir == "" {
+		return ""
+	}
+	return beads.ResolveBeadsDirForID(currentBeadsDir, beadID)
+}
+
+func commandWorkDirForBeadsDir(workDir, beadsDir string) string {
+	if workDir != "" {
+		return workDir
+	}
+	if beadsDir != "" {
+		return filepath.Dir(beadsDir)
+	}
+	return ""
 }
 
 func parseBeadInfo(beadID string, out []byte) (*beadInfo, error) {
@@ -515,12 +563,28 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 }
 
 func storeFieldsInBeadFromTownRoot(townRoot, beadID string, updates beadFieldUpdates) error {
+	return storeFieldsInBeadWithTarget(townRoot, "", "", beadID, updates)
+}
+
+func storeFieldsInBeadFromBeadsDir(workDir, beadsDir, beadID string, updates beadFieldUpdates) error {
+	return storeFieldsInBeadWithTarget("", workDir, beadsDir, beadID, updates)
+}
+
+func storeFieldsInBeadWithTarget(townRoot, workDir, beadsDir, beadID string, updates beadFieldUpdates) error {
 	logPath := os.Getenv("GT_TEST_ATTACHED_MOLECULE_LOG")
 
 	issue := &beads.Issue{}
 	if logPath == "" {
 		// Read the bead once
-		out, err := bdShowBeadOutputFromTownRoot(townRoot, beadID)
+		var (
+			out []byte
+			err error
+		)
+		if beadsDir != "" {
+			out, err = bdShowBeadOutputFromBeadsDir(workDir, beadsDir, beadID)
+		} else {
+			out, err = bdShowBeadOutputFromTownRoot(townRoot, beadID)
+		}
 		if err != nil {
 			return fmt.Errorf("fetching bead: %w", err)
 		}
@@ -592,15 +656,17 @@ func storeFieldsInBeadFromTownRoot(townRoot, beadID string, updates beadFieldUpd
 		return nil
 	}
 
-	updateDir := resolveBeadDir(beadID)
-	if townRoot != "" {
-		updateDir = resolveBeadDirFromTownRoot(townRoot, beadID)
+	updateCmd := BdCmd("update", beadID, "--description="+newDesc).WithAutoCommit()
+	if beadsDir != "" {
+		updateCmd.Dir(commandWorkDirForBeadsDir(workDir, beadsDir)).WithBeadsDir(beadsDir)
+	} else {
+		updateDir := resolveBeadDir(beadID)
+		if townRoot != "" {
+			updateDir = resolveBeadDirFromTownRoot(townRoot, beadID)
+		}
+		updateCmd.Dir(updateDir).StripBeadsDir()
 	}
-	if err := BdCmd("update", beadID, "--description="+newDesc).
-		Dir(updateDir).
-		StripBeadsDir().
-		WithAutoCommit().
-		Run(); err != nil {
+	if err := updateCmd.Run(); err != nil {
 		return fmt.Errorf("updating bead description: %w", err)
 	}
 
@@ -1243,6 +1309,10 @@ func hookBeadWithRetry(beadID, targetAgent, hookDir string) error {
 }
 
 func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string) error {
+	return hookBeadWithRetryWithBeadsDir(beadID, targetAgent, hookDir, townRoot, "")
+}
+
+func hookBeadWithRetryWithBeadsDir(beadID, targetAgent, hookDir, townRoot, beadsDir string) error {
 	const maxRetries = 10
 	const baseBackoff = 500 * time.Millisecond
 	const maxBackoff = 30 * time.Second
@@ -1250,10 +1320,13 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 
 	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		out, err := BdCmd("update", beadID, "--status=hooked", "--assignee="+targetAgent).
+		updateCmd := BdCmd("update", beadID, "--status=hooked", "--assignee="+targetAgent).
 			Dir(hookDir).
-			WithAutoCommit().
-			CombinedOutput()
+			WithAutoCommit()
+		if beadsDir != "" {
+			updateCmd.WithBeadsDir(beadsDir)
+		}
+		out, err := updateCmd.CombinedOutput()
 		if err != nil {
 			if len(out) > 0 {
 				err = fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
@@ -1276,7 +1349,15 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 			break
 		}
 
-		verifyInfo, verifyErr := getBeadInfoFromTownRoot(townRoot, beadID)
+		var (
+			verifyInfo *beadInfo
+			verifyErr  error
+		)
+		if beadsDir != "" {
+			verifyInfo, verifyErr = getBeadInfoFromBeadsDir(hookDir, beadsDir, beadID)
+		} else {
+			verifyInfo, verifyErr = getBeadInfoFromTownRoot(townRoot, beadID)
+		}
 		if verifyErr != nil {
 			lastErr = fmt.Errorf("verifying hook: %w", verifyErr)
 			if attempt < maxRetries {
@@ -1308,6 +1389,7 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 
 var hookBeadWithRetryFn = hookBeadWithRetry
 var hookBeadWithRetryWithTownRootFn = hookBeadWithRetryWithTownRoot
+var hookBeadWithRetryWithBeadsDirFn = hookBeadWithRetryWithBeadsDir
 
 // slingBackoff calculates exponential backoff with ±25% jitter for a given attempt (1-indexed).
 // Formula: base * 2^(attempt-1) * (1 ± 25% random), capped at max.
