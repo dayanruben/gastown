@@ -967,21 +967,21 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	clauses := []string{"ephemeral=true"}
 
 	if opts.Label != "" {
-		clauses = append(clauses, "label="+opts.Label)
+		clauses = append(clauses, "label="+quoteBDQueryValue(opts.Label))
 	} else if opts.Type != "" {
-		clauses = append(clauses, "label=gt:"+opts.Type)
+		clauses = append(clauses, "label="+quoteBDQueryValue("gt:"+opts.Type))
 	}
 	if opts.Status != "" && opts.Status != "all" {
-		clauses = append(clauses, "status="+opts.Status)
+		clauses = append(clauses, "status="+quoteBDQueryValue(opts.Status))
 	}
 	if opts.Priority >= 0 {
 		clauses = append(clauses, fmt.Sprintf("priority=%d", opts.Priority))
 	}
 	if opts.Parent != "" {
-		clauses = append(clauses, "parent="+opts.Parent)
+		clauses = append(clauses, "parent="+quoteBDQueryValue(opts.Parent))
 	}
 	if opts.Assignee != "" {
-		clauses = append(clauses, "assignee="+opts.Assignee)
+		clauses = append(clauses, "assignee="+quoteBDQueryValue(opts.Assignee))
 	}
 
 	queryExpr := strings.Join(clauses, " AND ")
@@ -992,6 +992,9 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	}
 	if opts.Limit > 0 {
 		args = append(args, fmt.Sprintf("--limit=%d", opts.Limit))
+	} else {
+		// Match List's no-truncation default; bd query otherwise silently caps at 50.
+		args = append(args, "--limit=0")
 	}
 
 	out, err := b.run(args...)
@@ -1009,6 +1012,10 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	}
 
 	return issues, nil
+}
+
+func quoteBDQueryValue(value string) string {
+	return strconv.Quote(value)
 }
 
 // stripStdoutWarnings removes warning/diagnostic lines that bd may emit to stdout.
@@ -1304,9 +1311,49 @@ func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issu
 	return newest, nil
 }
 
-// ShowMultiple fetches multiple issues by ID in a single bd call.
+// ShowMultiple fetches multiple issues by ID, grouped by routed database.
 // Returns a map of ID to Issue. Missing IDs are not included in the map.
+// If one routed group fails, successful groups are returned with the error.
 func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
+	if len(ids) == 0 {
+		return make(map[string]*Issue), nil
+	}
+
+	if !b.noRoute {
+		fallbackDir := b.getResolvedBeadsDir()
+		groups := make(map[string][]string)
+		for _, id := range ids {
+			targetDir := ResolveRoutingTarget(b.getTownRoot(), id, fallbackDir)
+			groups[targetDir] = append(groups[targetDir], id)
+		}
+
+		if len(groups) > 1 || groups[fallbackDir] == nil {
+			result := make(map[string]*Issue, len(ids))
+			var firstErr error
+			for targetDir, groupIDs := range groups {
+				target := b
+				if targetDir != fallbackDir {
+					target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+				}
+				issues, err := target.showMultipleLocal(groupIDs)
+				if err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
+					continue
+				}
+				for id, issue := range issues {
+					result[id] = issue
+				}
+			}
+			return result, firstErr
+		}
+	}
+
+	return b.showMultipleLocal(ids)
+}
+
+func (b *Beads) showMultipleLocal(ids []string) (map[string]*Issue, error) {
 	if len(ids) == 0 {
 		return make(map[string]*Issue), nil
 	}
