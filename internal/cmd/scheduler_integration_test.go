@@ -151,13 +151,16 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
 	}
-	initBeadsDBForServer(t, hqPath, hqPrefix)
 
 	// --- testrig directory (loadRig checks os.Stat on townRoot/<rigName>) ---
 	if err := os.MkdirAll(rigPath, 0755); err != nil {
 		t.Fatalf("mkdir rigPath: %v", err)
 	}
+	// Initialize the nested rig DB before the HQ DB exists on the shared server.
+	// bd v1's init guard walks parent workspaces in some modes and otherwise
+	// refuses nested fixture init as "already initialized".
 	initBeadsDBForServer(t, rigPath, rigPrefix)
+	initBeadsDBForServer(t, hqPath, hqPrefix)
 
 	// Drop test databases on cleanup to prevent orphaned databases on the Dolt server.
 	t.Cleanup(func() {
@@ -650,12 +653,13 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
 	}
-	initBeadsDBForServer(t, hqPath, hqPrefix)
 
 	// --- rig1 ---
 	if err := os.MkdirAll(rig1Path, 0755); err != nil {
 		t.Fatalf("mkdir rig1Path: %v", err)
 	}
+	// Initialize nested rig DBs before HQ exists on the shared server so bd v1's
+	// parent-workspace init guard does not mistake these fixtures for HQ.
 	initBeadsDBForServer(t, rig1Path, rig1Prefix)
 	// Write routes to rig1's .beads/ so bd can resolve cross-rig IDs (needed for
 	// cross-rig dep creation via external refs).
@@ -685,6 +689,7 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	if err := os.WriteFile(filepath.Join(rig2Redirect, "redirect"), []byte("mayor/rig/.beads"), 0644); err != nil {
 		t.Fatalf("write rig2 redirect: %v", err)
 	}
+	initBeadsDBForServer(t, hqPath, hqPrefix)
 
 	// Drop test databases on cleanup to prevent orphaned databases on the Dolt
 	// server. Without this, databases from multi-rig tests persist and can
