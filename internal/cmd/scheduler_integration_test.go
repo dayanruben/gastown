@@ -64,9 +64,37 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	if err := os.WriteFile(issuesPath, []byte(""), 0644); err != nil {
 		t.Fatalf("create issues.jsonl in %s: %v", dir, err)
 	}
+	ensureSchedulerMetadataDatabase(t, dir, prefix)
 
 	if err := beads.EnsureCustomTypes(filepath.Join(dir, ".beads")); err != nil {
 		t.Fatalf("ensure custom types in %s: %v", dir, err)
+	}
+}
+
+func ensureSchedulerMetadataDatabase(t *testing.T, dir, prefix string) {
+	t.Helper()
+
+	metadataPath := filepath.Join(dir, ".beads", "metadata.json")
+	raw := map[string]interface{}{}
+	if data, err := os.ReadFile(metadataPath); err == nil && len(data) > 0 {
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatalf("parse metadata.json in %s: %v", dir, err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read metadata.json in %s: %v", dir, err)
+	}
+
+	raw["backend"] = "dolt"
+	raw["dolt_mode"] = "server"
+	raw["dolt_database"] = prefix
+	raw["issue_prefix"] = prefix
+
+	data, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal metadata.json in %s: %v", dir, err)
+	}
+	if err := os.WriteFile(metadataPath, append(data, '\n'), 0644); err != nil {
+		t.Fatalf("write metadata.json in %s: %v", dir, err)
 	}
 }
 
