@@ -13,6 +13,7 @@
 package cmd
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -49,11 +50,16 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
 		args = append(args, "--server", "--server-port", p)
 	}
-	cmd := exec.Command("bd", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bd", args...)
 	cmd.Dir = dir
 	cmd.Env = withBeadsDirEnv(filepath.Join(dir, ".beads"))
 	out, err := cmd.CombinedOutput()
 	t.Logf("bd init --prefix %s in %s: exit=%v\n%s", prefix, dir, err, out)
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf("bd init --prefix %s in %s timed out after 2m\n%s", prefix, dir, out)
+	}
 	if err != nil {
 		t.Fatalf("bd init failed in %s: %v\n%s", dir, err, out)
 	}
