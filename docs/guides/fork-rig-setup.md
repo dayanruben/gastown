@@ -121,6 +121,6 @@ upstream.
 
 ## See also
 
-- [CONTRIBUTING.md](../../CONTRIBUTING.md) — "Setting up a rig to contribute
+- [CONTRIBUTING.md](https://github.com/gastownhall/gastown/blob/main/CONTRIBUTING.md) — "Setting up a rig to contribute
   to Gas Town" (Gas Town-specific worked example)
 - [Local Rig Bootstrap](local-rig-bootstrap.md) — local/private repo setup

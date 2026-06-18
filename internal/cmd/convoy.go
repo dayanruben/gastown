@@ -492,12 +492,11 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 		return nil, fmt.Errorf("invalid bead ID: %q", issueID)
 	}
 
-	// The dependency target was historically a single depends_on_id column.
-	// The schema migration split it into typed columns
+	// Newer Beads schemas split the dependency target into typed columns
 	// (depends_on_issue_id / depends_on_wisp_id / depends_on_external), where
 	// cross-database refs live in depends_on_external as "external:<prefix>:<id>".
-	// "down": targets issueID depends on → COALESCE the three target columns.
-	// "up":   issues that depend on issueID → match issueID against all three.
+	// Older Beads releases used a single depends_on_id column. Try the typed
+	// query first, then fall back for legacy local installations.
 	var selectExpr, whereClause, parseKey string
 	if direction == "up" {
 		selectExpr = "issue_id"
@@ -521,7 +520,13 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 
 	out, err := runBdJSON(dir, "sql", query, "--json")
 	if err != nil {
-		return nil, fmt.Errorf("bd sql for deps of %s: %w", issueID, err)
+		legacyQuery, legacyParseKey := legacyDependencySQL(issueID, direction, depType)
+		legacyOut, legacyErr := runBdJSON(dir, "sql", legacyQuery, "--json")
+		if legacyErr != nil {
+			return nil, fmt.Errorf("bd sql for deps of %s: %w", issueID, err)
+		}
+		out = legacyOut
+		parseKey = legacyParseKey
 	}
 
 	// Parse JSON array of single-column rows
@@ -543,10 +548,32 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 	return ids, nil
 }
 
+func legacyDependencySQL(issueID, direction, depType string) (query, parseKey string) {
+	if direction == "up" {
+		parseKey = "issue_id"
+		query = fmt.Sprintf(
+			"SELECT issue_id FROM dependencies WHERE (depends_on_id = '%s' OR %s)",
+			issueID, sqlLegacyExternalDepTargetClause(issueID))
+	} else {
+		parseKey = "depends_on_id"
+		query = fmt.Sprintf("SELECT depends_on_id FROM dependencies WHERE issue_id = '%s'", issueID)
+	}
+	if depType != "" {
+		query += fmt.Sprintf(" AND type = '%s'", depType)
+	}
+	return query, parseKey
+}
+
 func sqlExternalDepTargetClause(issueID string) string {
 	// Use an escape character that is not valid in bead IDs so underscores stay literal.
 	escapedID := strings.ReplaceAll(issueID, "_", "!_")
 	return fmt.Sprintf("depends_on_external LIKE '%%:%s' ESCAPE '!'", escapedID)
+}
+
+func sqlLegacyExternalDepTargetClause(issueID string) string {
+	// Use an escape character that is not valid in bead IDs so underscores stay literal.
+	escapedID := strings.ReplaceAll(issueID, "_", "!_")
+	return fmt.Sprintf("depends_on_id LIKE '%%:%s' ESCAPE '!'", escapedID)
 }
 
 // isValidBeadID checks that a string is safe for SQL interpolation in dep queries.

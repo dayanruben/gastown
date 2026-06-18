@@ -163,3 +163,11 @@ func TestSQLExternalDepTargetClauseEscapesUnderscore(t *testing.T) {
 		t.Fatalf("sqlExternalDepTargetClause() = %q, want %q", got, want)
 	}
 }
+
+func TestSQLLegacyExternalDepTargetClauseEscapesUnderscore(t *testing.T) {
+	got := sqlLegacyExternalDepTargetClause("gt-a_b")
+	want := "depends_on_id LIKE '%:gt-a!_b' ESCAPE '!'"
+	if got != want {
+		t.Fatalf("sqlLegacyExternalDepTargetClause() = %q, want %q", got, want)
+	}
+}
