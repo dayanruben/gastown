@@ -559,6 +559,10 @@ func dispatchSingleBead(b capacity.PendingBead, townRoot, _ string) (*SlingResul
 	}
 
 	dp := capacity.ReconstructFromContext(b.Context)
+	beadsDir := b.ContextBeadsDir
+	if beadsDir == "" {
+		beadsDir = filepath.Join(townRoot, ".beads")
+	}
 	params := SlingParams{
 		BeadID:           dp.BeadID,
 		RigName:          dp.RigName,
@@ -579,7 +583,7 @@ func dispatchSingleBead(b capacity.PendingBead, townRoot, _ string) (*SlingResul
 		NoConvoy:         true,
 		NoBoot:           true,
 		TownRoot:         townRoot,
-		BeadsDir:         filepath.Join(townRoot, ".beads"),
+		BeadsDir:         beadsDir,
 	}
 
 	fmt.Printf("  Dispatching %s → %s...\n", b.WorkBeadID, b.TargetRig)

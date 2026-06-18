@@ -336,31 +336,19 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 	}
 
 	// Verify: convoy has a "tracks" dependency pointing to the rig bead.
-	depArgs := beads.MaybePrependAllowStale([]string{
-		"dep", "list", fields.Convoy, fields.Convoy,
-		"--direction=down", "--type=tracks", "--json",
-	})
-	depCmd := exec.Command("bd", depArgs...)
-	depCmd.Dir = hqPath
-	depOut, err := depCmd.Output()
+	trackedIDs, err := bdDepListRawIDs(filepath.Join(hqPath, ".beads"), fields.Convoy, "down", "tracks")
 	if err != nil {
-		t.Fatalf("convoy %s dep list failed: %v", fields.Convoy, err)
-	}
-	var deps []struct {
-		DependsOnID string `json:"depends_on_id"`
-	}
-	if err := json.Unmarshal(depOut, &deps); err != nil {
-		t.Fatalf("parse dep list: %v\nraw: %s", err, depOut)
+		t.Fatalf("convoy %s raw dep list failed: %v", fields.Convoy, err)
 	}
 	foundTracked := false
-	for _, dep := range deps {
-		if strings.Contains(dep.DependsOnID, beadID) {
+	for _, trackedID := range trackedIDs {
+		if trackedID == beadID {
 			foundTracked = true
 			break
 		}
 	}
 	if !foundTracked {
-		t.Errorf("convoy %s should track bead %s via tracks dep, got deps: %s", fields.Convoy, beadID, depOut)
+		t.Errorf("convoy %s should track bead %s via tracks dep, got deps: %v", fields.Convoy, beadID, trackedIDs)
 	}
 }
 

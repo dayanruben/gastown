@@ -66,6 +66,11 @@ func mutateTrackingRelationViaStore(townRoot, trackerID, issueID string, add boo
 
 func fallbackTrackingRelation(townRoot, trackerID, issueID string, add bool, storeErr error) error {
 	targetID := trackingDependsOnID(townRoot, issueID)
+	sqlErr := mutateTrackingRelationViaSQL(townRoot, trackerID, targetID, add)
+	if sqlErr == nil {
+		return nil
+	}
+
 	args := []string{"dep", "add", trackerID, targetID, "--type=tracks"}
 	if !add {
 		args = []string{"dep", "remove", trackerID, targetID, "--type=tracks"}
@@ -74,12 +79,86 @@ func fallbackTrackingRelation(townRoot, trackerID, issueID string, add bool, sto
 	if out, err := BdCmd(args...).Dir(townRoot).WithAutoCommit().StripBeadsDir().CombinedOutput(); err != nil {
 		output := strings.TrimSpace(string(out))
 		if output == "" {
-			return fmt.Errorf("tracking relation via store failed: %w; fallback bd path failed: %w", storeErr, err)
+			return fmt.Errorf("tracking relation via store failed: %w; fallback sql path failed: %v; fallback bd path failed: %w", storeErr, sqlErr, err)
 		}
-		return fmt.Errorf("tracking relation via store failed: %w; fallback bd path failed: %w; output: %s", storeErr, err, output)
+		return fmt.Errorf("tracking relation via store failed: %w; fallback sql path failed: %v; fallback bd path failed: %w; output: %s", storeErr, sqlErr, err, output)
 	}
 
 	return nil
+}
+
+func mutateTrackingRelationViaSQL(townRoot, trackerID, targetID string, add bool) error {
+	if !isValidBeadID(trackerID) {
+		return fmt.Errorf("invalid tracker ID: %q", trackerID)
+	}
+	if !isValidTrackingTargetID(targetID) {
+		return fmt.Errorf("invalid tracking target ID: %q", targetID)
+	}
+
+	targetColumn := "depends_on_issue_id"
+	if strings.HasPrefix(targetID, "external:") {
+		targetColumn = "depends_on_external"
+	}
+
+	target := sqlStringLiteral(targetID)
+	tracker := sqlStringLiteral(trackerID)
+	query := fmt.Sprintf(
+		"INSERT IGNORE INTO dependencies (issue_id, %s, type, created_at, created_by, metadata) VALUES (%s, %s, 'tracks', NOW(6), %s, '{}')",
+		targetColumn,
+		tracker,
+		target,
+		sqlStringLiteral(trackingRelationActor()),
+	)
+	if !add {
+		query = fmt.Sprintf(
+			"DELETE FROM dependencies WHERE issue_id = %s AND COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) = %s AND type = 'tracks'",
+			tracker,
+			target,
+		)
+	}
+
+	if out, err := BdCmd("sql", query).Dir(townRoot).WithAutoCommit().StripBeadsDir().CombinedOutput(); err != nil {
+		output := strings.TrimSpace(string(out))
+		if output == "" {
+			return err
+		}
+		return fmt.Errorf("%w: %s", err, output)
+	}
+	return nil
+}
+
+func trackingRelationActor() string {
+	if actor := os.Getenv("BD_ACTOR"); actor != "" {
+		return actor
+	}
+	return detectSender()
+}
+
+func isValidTrackingTargetID(id string) bool {
+	if strings.HasPrefix(id, "external:") {
+		parts := strings.Split(id, ":")
+		if len(parts) != 3 {
+			return false
+		}
+		return isValidExternalRefPart(parts[1]) && isValidBeadID(parts[2])
+	}
+	return isValidBeadID(id)
+}
+
+func isValidExternalRefPart(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func sqlStringLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 func trackingDependsOnID(townRoot, issueID string) string {

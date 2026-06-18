@@ -511,12 +511,16 @@ func buildSlingFieldUpdates(
 // storeArgsInBead, storeAttachedMoleculeInBead, and storeNoMergeInBead calls that each
 // independently read-modify-write and could race under concurrent access.
 func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
+	return storeFieldsInBeadFromTownRoot("", beadID, updates)
+}
+
+func storeFieldsInBeadFromTownRoot(townRoot, beadID string, updates beadFieldUpdates) error {
 	logPath := os.Getenv("GT_TEST_ATTACHED_MOLECULE_LOG")
 
 	issue := &beads.Issue{}
 	if logPath == "" {
 		// Read the bead once
-		out, err := bdShowBeadOutput(beadID)
+		out, err := bdShowBeadOutputFromTownRoot(townRoot, beadID)
 		if err != nil {
 			return fmt.Errorf("fetching bead: %w", err)
 		}
@@ -588,8 +592,12 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 		return nil
 	}
 
+	updateDir := resolveBeadDir(beadID)
+	if townRoot != "" {
+		updateDir = resolveBeadDirFromTownRoot(townRoot, beadID)
+	}
 	if err := BdCmd("update", beadID, "--description="+newDesc).
-		Dir(resolveBeadDir(beadID)).
+		Dir(updateDir).
 		StripBeadsDir().
 		WithAutoCommit().
 		Run(); err != nil {

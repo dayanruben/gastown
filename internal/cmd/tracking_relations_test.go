@@ -29,3 +29,16 @@ func TestTrackingDependsOnID_HQStaysLocal(t *testing.T) {
 		t.Fatalf("trackingDependsOnID() = %q, want %q", got, "hq-cv-test")
 	}
 }
+
+func TestIsValidTrackingTargetID(t *testing.T) {
+	for _, id := range []string{"hq-cv-test", "external:ag:ag-95s.1", "external:rig_1:rig-abc_1"} {
+		if !isValidTrackingTargetID(id) {
+			t.Fatalf("isValidTrackingTargetID(%q) = false, want true", id)
+		}
+	}
+	for _, id := range []string{"", "external:ag", "external:bad/prefix:ag-1", "external:ag:bad'id"} {
+		if isValidTrackingTargetID(id) {
+			t.Fatalf("isValidTrackingTargetID(%q) = true, want false", id)
+		}
+	}
+}
