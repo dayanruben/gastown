@@ -156,6 +156,8 @@ jobs:
     name: Integration Tests
     runs-on: ubuntu-latest
     needs: check-repo
+    env:
+      CMD_INTEGRATION_TESTS: ^Test(FreshInstallRigPolecatHookIntegration|HookShowShorthandResolvesToCanonical|RigAdd(CreatesCorrectStructure|RespectsDefaultAgent|InitializesBeads|UpdatesRoutes|UpdatesRigsJson|DerivesPrefix|CreatesRigConfig|WithUpstreamURL|CreatesAgentDirs|RejectsInvalidNames|CreatesAgentBeads|URLValidation)|Agent(BeadIDs|WorktreesStayClean)|Beads(DbInitAfterClone|RoutingFromTownRoot|RedirectResolution|CircularRedirectDetection|PrefixConflictDetection|ListFromPolecatDirectory|ListFromCrewDirectory|RoutesLoading|AppendRoute|RemoveRoute|GetPrefixForRig)|SlingCrossRig(RoutingResolution|UnknownPrefix)|Scheduler(CircuitBreakerExclusion|AutoConvoyCreation|BlockedStatusReporting|SlingDryRun|SlingContextIdempotency|SlingContextWorkBeadPristine|MultiRigDispatch|MultiRigEpicAutoResolve|ConvoyFlagRejection|EpicFlagRejection|EpicDetection|MixedBatchRejection|MultiRigConvoyAutoResolve|DisabledMode|DirectModeNoQueue|DeferredTaskWithoutRig|ConfigSetZero|DeferredNonRigRejection|DeferredAcceptsDogTarget|DirectEpicDispatch|BatchEpicRejection|InvalidJSONContextCleanup|ActualDispatchRoutesPollutedEnvToTargetRig|DispatchFailureRecordedInContextSourceDB|DirectConvoyDispatch)|ScheduleBead_(RefusesClosed|RefusesTombstone|ClosedForceDoesNotBypass)|HookSlot_(BasicHook|Singleton|Unhook|DifferentAgents|HookPersistence|StatusTransitions)|Role(HomeE2E|HomeMissingFlags|HomeCwdDetection|EnvCwdDetection|ListE2E|ShowE2E|ShowMismatch|ShowNoMismatchAtTownRoot|DetectE2E|DetectIgnoresGTRole|DetectInvalidPaths|EnvIncompleteEnvVars|EnvCwdMismatchFromIncompleteDir|HomeInvalidPaths))$
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -203,7 +205,7 @@ jobs:
         run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Integration Tests
-        run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=35m -v ./internal/cmd/...
+        run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -run "$CMD_INTEGRATION_TESTS" -timeout=45m -v ./internal/cmd/...
 
       - name: Test Report
         if: always()

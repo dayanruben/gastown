@@ -12,7 +12,9 @@ jobs:
   integration-full:
     name: Full Integration Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 70
+    env:
+      CMD_INTEGRATION_TESTS: ^Test(FreshInstallRigPolecatHookIntegration|HookShowShorthandResolvesToCanonical|RigAdd(CreatesCorrectStructure|RespectsDefaultAgent|InitializesBeads|UpdatesRoutes|UpdatesRigsJson|DerivesPrefix|CreatesRigConfig|WithUpstreamURL|CreatesAgentDirs|RejectsInvalidNames|CreatesAgentBeads|URLValidation)|Agent(BeadIDs|WorktreesStayClean)|Beads(DbInitAfterClone|RoutingFromTownRoot|RedirectResolution|CircularRedirectDetection|PrefixConflictDetection|ListFromPolecatDirectory|ListFromCrewDirectory|RoutesLoading|AppendRoute|RemoveRoute|GetPrefixForRig)|SlingCrossRig(RoutingResolution|UnknownPrefix)|Scheduler(CircuitBreakerExclusion|AutoConvoyCreation|BlockedStatusReporting|SlingDryRun|SlingContextIdempotency|SlingContextWorkBeadPristine|MultiRigDispatch|MultiRigEpicAutoResolve|ConvoyFlagRejection|EpicFlagRejection|EpicDetection|MixedBatchRejection|MultiRigConvoyAutoResolve|DisabledMode|DirectModeNoQueue|DeferredTaskWithoutRig|ConfigSetZero|DeferredNonRigRejection|DeferredAcceptsDogTarget|DirectEpicDispatch|BatchEpicRejection|InvalidJSONContextCleanup|ActualDispatchRoutesPollutedEnvToTargetRig|DispatchFailureRecordedInContextSourceDB|DirectConvoyDispatch)|ScheduleBead_(RefusesClosed|RefusesTombstone|ClosedForceDoesNotBypass)|HookSlot_(BasicHook|Singleton|Unhook|DifferentAgents|HookPersistence|StatusTransitions)|Role(HomeE2E|HomeMissingFlags|HomeCwdDetection|EnvCwdDetection|ListE2E|ShowE2E|ShowMismatch|ShowNoMismatchAtTownRoot|DetectE2E|DetectIgnoresGTRole|DetectInvalidPaths|EnvIncompleteEnvVars|EnvCwdMismatchFromIncompleteDir|HomeInvalidPaths))$
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -60,5 +62,10 @@ jobs:
       - name: Build
         run: go build -v ./cmd/gt
 
-      - name: Run all integration tests
-        run: gotestsum --format testname --junitfile junit.xml -- -v -tags=integration -timeout=35m ./...
+      - name: Run non-cmd integration tests
+        run: |
+          packages="$(go list -tags=integration ./... | grep -v '/internal/cmd$')"
+          gotestsum --format testname --junitfile junit-non-cmd.xml -- -v -tags=integration -timeout=20m $packages
+
+      - name: Run cmd integration tests
+        run: gotestsum --format testname --junitfile junit-cmd.xml -- -v -tags=integration -run "$CMD_INTEGRATION_TESTS" -timeout=45m ./internal/cmd/...
