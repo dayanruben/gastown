@@ -14,7 +14,6 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
-	"github.com/steveyegge/gastown/internal/testutil"
 	"gopkg.in/yaml.v3"
 )
 
