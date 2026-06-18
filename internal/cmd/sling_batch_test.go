@@ -101,27 +101,42 @@ exit 0
 		t.Errorf("expected exactly 1 create command, got %d\nLog:\n%s", createCount, string(logBytes))
 	}
 
-	// Exactly N dep add commands (one per bead)
-	depAddCount := 0
+	// Exactly N tracking relation writes (one per bead). Beads v1 may route this
+	// through SQL before falling back to the legacy bd dep add command.
+	trackingCount := 0
 	trackedBeads := map[string]bool{}
 	for _, line := range logLines {
-		if strings.Contains(line, "CMD:dep add") {
-			depAddCount++
-			for _, beadID := range beadIDs {
-				if strings.Contains(line, beadID) {
-					trackedBeads[beadID] = true
-				}
+		for _, beadID := range beadIDs {
+			if containsBatchTrackingAttempt(line, convoyID, beadID) {
+				trackingCount++
+				trackedBeads[beadID] = true
 			}
 		}
 	}
-	if depAddCount != len(beadIDs) {
-		t.Errorf("expected %d dep add commands, got %d\nLog:\n%s", len(beadIDs), depAddCount, string(logBytes))
+	if trackingCount != len(beadIDs) {
+		t.Errorf("expected %d tracking relation writes, got %d\nLog:\n%s", len(beadIDs), trackingCount, string(logBytes))
 	}
 	for _, beadID := range beadIDs {
 		if !trackedBeads[beadID] {
 			t.Errorf("bead %q was not tracked in convoy\nLog:\n%s", beadID, string(logBytes))
 		}
 	}
+}
+
+func containsBatchTrackingAttempt(line, convoyID, beadID string) bool {
+	if strings.Contains(line, "CMD:dep add") &&
+		strings.Contains(line, convoyID) &&
+		strings.Contains(line, beadID) {
+		return true
+	}
+	return containsTrackingSQLInsert(line, convoyID, beadID)
+}
+
+func containsTrackingSQLInsert(line, convoyID, beadID string) bool {
+	return strings.Contains(line, "CMD:sql INSERT IGNORE INTO dependencies") &&
+		strings.Contains(line, sqlStringLiteral(convoyID)) &&
+		strings.Contains(line, sqlStringLiteral(beadID)) &&
+		strings.Contains(line, "'tracks'")
 }
 
 // TestCreateBatchConvoy_OwnedLabel verifies that --owned flag adds gt:owned label.
@@ -341,7 +356,7 @@ func TestCreateBatchConvoy_PartialDepFailureContinues(t *testing.T) {
 	}
 	logPath := filepath.Join(townRoot, "bd.log")
 
-	// Stub bd: create succeeds, dep add fails for gt-bbb only
+	// Stub bd: create succeeds, tracking relation writes fail for gt-bbb only.
 	bdScript := `#!/bin/sh
 echo "CMD:$*" >> "` + logPath + `"
 cmd="$1"
@@ -354,18 +369,24 @@ case "$cmd" in
   create)
     exit 0
     ;;
-  dep)
-    # Fail if the bead is gt-bbb
-    for arg in "$@"; do
-      if [ "$arg" = "gt-bbb" ]; then
-        exit 1
+	  dep)
+	    # Fail if the bead is gt-bbb
+	    for arg in "$@"; do
+	      if [ "$arg" = "gt-bbb" ]; then
+	        exit 1
       fi
-    done
-    exit 0
-    ;;
-esac
-exit 0
-`
+	    done
+	    exit 0
+	    ;;
+	  sql)
+	    case "$*" in
+	      *gt-bbb*) exit 1 ;;
+	    esac
+	    exit 0
+	    ;;
+	esac
+	exit 0
+	`
 	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
 		t.Fatalf("write bd stub: %v", err)
 	}
@@ -399,16 +420,18 @@ exit 0
 		t.Fatalf("read log: %v", err)
 	}
 
-	// 1 create + 3 dep add attempts = 4 commands
+	// One tracking relation write should be attempted for each bead.
 	logLines := strings.Split(strings.TrimSpace(string(logBytes)), "\n")
-	depCount := 0
+	attemptedBeads := map[string]bool{}
 	for _, line := range logLines {
-		if strings.Contains(line, "CMD:dep add") {
-			depCount++
+		for _, beadID := range []string{"gt-aaa", "gt-bbb", "gt-ccc"} {
+			if containsBatchTrackingAttempt(line, convoyID, beadID) {
+				attemptedBeads[beadID] = true
+			}
 		}
 	}
-	if depCount != 3 {
-		t.Errorf("expected 3 dep add attempts (including failed one), got %d", depCount)
+	if len(attemptedBeads) != 3 {
+		t.Errorf("expected tracking attempts for 3 beads (including failed one), got %d: %v\nLog:\n%s", len(attemptedBeads), attemptedBeads, string(logBytes))
 	}
 }
 
@@ -1320,7 +1343,7 @@ func TestCreateBatchConvoy_ReturnsTrackedBeadSet(t *testing.T) {
 		t.Fatalf("mkdir binDir: %v", err)
 	}
 
-	// Stub bd: create succeeds, dep add fails for gt-bbb only
+	// Stub bd: create succeeds, tracking relation writes fail for gt-bbb only.
 	bdScript := `#!/bin/sh
 cmd="$1"
 if [ "$cmd" = "--allow-stale" ]; then
@@ -1330,15 +1353,21 @@ fi
 shift || true
 case "$cmd" in
   create) exit 0 ;;
-  dep)
-    for arg in "$@"; do
-      if [ "$arg" = "gt-bbb" ]; then exit 1; fi
-    done
-    exit 0
-    ;;
-esac
-exit 0
-`
+	  dep)
+	    for arg in "$@"; do
+	      if [ "$arg" = "gt-bbb" ]; then exit 1; fi
+	    done
+	    exit 0
+	    ;;
+	  sql)
+	    case "$*" in
+	      *gt-bbb*) exit 1 ;;
+	    esac
+	    exit 0
+	    ;;
+	esac
+	exit 0
+	`
 	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
 		t.Fatalf("write bd stub: %v", err)
 	}
@@ -1362,7 +1391,7 @@ exit 0
 		t.Fatal("convoy ID should not be empty")
 	}
 
-	// gt-bbb dep add failed, so only gt-aaa and gt-ccc should be in tracked set
+	// gt-bbb tracking failed, so only gt-aaa and gt-ccc should be in tracked set
 	if len(tracked) != 2 {
 		t.Errorf("expected 2 tracked beads, got %d: %v", len(tracked), tracked)
 	}
@@ -1374,7 +1403,7 @@ exit 0
 		t.Error("gt-aaa should be in tracked set")
 	}
 	if trackedMap["gt-bbb"] {
-		t.Error("gt-bbb should NOT be in tracked set (dep add failed)")
+		t.Error("gt-bbb should NOT be in tracked set (tracking relation failed)")
 	}
 	if !trackedMap["gt-ccc"] {
 		t.Error("gt-ccc should be in tracked set")

@@ -1803,7 +1803,7 @@ func TestRenderWarnings_Empty(t *testing.T) {
 // IT-10: Stage clean (no errors, no warnings) → creates convoy as staged_ready.
 // Uses dagBuilder to set up the bd stub environment. Builds a clean ConvoyDAG
 // directly (with rigs set). Verifies `bd create` was called with
-// --status=staged_ready and `bd dep add` was called for each slingable bead.
+// --status=staged_ready and each slingable bead was tracked.
 func TestCreateStagedConvoy_CleanReady(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows — shell stubs")
@@ -1870,10 +1870,10 @@ func TestCreateStagedConvoy_CleanReady(t *testing.T) {
 		t.Errorf("bd.log should contain '--status=staged_ready', got:\n%s", logContent)
 	}
 
-	// Verify bd dep add was called for each slingable bead.
+	// Verify tracking relation was written for each slingable bead.
 	for _, beadID := range []string{"gt-a", "gt-b", "gt-c"} {
 		if !containsStagedTrackingDep(logContent, convoyID, beadID) {
-			t.Errorf("bd.log should contain 'dep add %s %s', got:\n%s", convoyID, beadID, logContent)
+			t.Errorf("bd.log should contain tracking relation for %s -> %s, got:\n%s", convoyID, beadID, logContent)
 		}
 	}
 }
@@ -1921,15 +1921,15 @@ func TestCreateStagedConvoy_TracksOnlySlingable(t *testing.T) {
 	// Slingable beads (tasks and bugs) should be tracked.
 	for _, beadID := range []string{"gt-t1", "gt-b1", "gt-t2"} {
 		if !containsStagedTrackingDep(logContent, convoyID, beadID) {
-			t.Errorf("bd.log should contain 'dep add %s %s' for slingable bead, got:\n%s", convoyID, beadID, logContent)
+			t.Errorf("bd.log should contain tracking relation for slingable bead %s -> %s, got:\n%s", convoyID, beadID, logContent)
 		}
 	}
 
 	// Epics should NOT be tracked.
 	lines := strings.Split(logContent, "\n")
 	for _, line := range lines {
-		if strings.Contains(line, "dep add") && strings.Contains(line, "gt-epic") {
-			t.Errorf("epic gt-epic should NOT be tracked via dep add, but found: %s", line)
+		if containsStagedTrackingDep(line, convoyID, "gt-epic") {
+			t.Errorf("epic gt-epic should NOT be tracked, but found: %s", line)
 		}
 	}
 }
@@ -1943,7 +1943,13 @@ func containsStagedTrackingDep(logContent, convoyID, beadID string) bool {
 		return false
 	}
 	externalTarget := fmt.Sprintf("external:%s:%s", prefix, beadID)
-	return strings.Contains(logContent, "dep add "+convoyID+" "+externalTarget)
+	if strings.Contains(logContent, "dep add "+convoyID+" "+externalTarget) {
+		return true
+	}
+	return strings.Contains(logContent, "CMD:sql INSERT IGNORE INTO dependencies") &&
+		strings.Contains(logContent, sqlStringLiteral(convoyID)) &&
+		strings.Contains(logContent, sqlStringLiteral(externalTarget)) &&
+		strings.Contains(logContent, "'tracks'")
 }
 
 // IT-12: Stage convoy description includes wave count + timestamp.

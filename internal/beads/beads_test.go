@@ -282,6 +282,7 @@ func TestBuildPinnedBDEnvFallsBackToGTDoltPort(t *testing.T) {
 func TestSuppressBDSideEffectsOverridesInherited(t *testing.T) {
 	env := SuppressBDSideEffects([]string{
 		"PATH=/usr/bin",
+		"BD_NO_AUTO_IMPORT=0",
 		"BD_EXPORT_AUTO=true",
 		"BD_BACKUP_ENABLED=true",
 		"BD_DOLT_AUTO_PUSH=true",
@@ -292,6 +293,7 @@ func TestSuppressBDSideEffectsOverridesInherited(t *testing.T) {
 	got := envMap(env)
 	for key, want := range map[string]string{
 		"BEADS_NO_AUTO_IMPORT": "1",
+		"BD_NO_AUTO_IMPORT":    "1",
 		"BD_EXPORT_AUTO":       "false",
 		"BD_BACKUP_ENABLED":    "false",
 		"BD_DOLT_AUTO_PUSH":    "false",

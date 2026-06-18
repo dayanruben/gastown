@@ -176,6 +176,7 @@ func stripBDCommandFlags(args []string) []string {
 func SuppressBDSideEffects(env []string) []string {
 	for _, key := range []string{
 		"BEADS_NO_AUTO_IMPORT",
+		"BD_NO_AUTO_IMPORT",
 		"BD_EXPORT_AUTO",
 		"BD_BACKUP_ENABLED",
 		"BD_DOLT_AUTO_PUSH",
@@ -187,6 +188,7 @@ func SuppressBDSideEffects(env []string) []string {
 	}
 	return append(env,
 		"BEADS_NO_AUTO_IMPORT=1",
+		"BD_NO_AUTO_IMPORT=1",
 		"BD_EXPORT_AUTO=false",
 		"BD_BACKUP_ENABLED=false",
 		"BD_DOLT_AUTO_PUSH=false",
