@@ -1872,7 +1872,7 @@ func TestCreateStagedConvoy_CleanReady(t *testing.T) {
 
 	// Verify bd dep add was called for each slingable bead.
 	for _, beadID := range []string{"gt-a", "gt-b", "gt-c"} {
-		if !strings.Contains(logContent, "dep add "+convoyID+" "+beadID) {
+		if !containsStagedTrackingDep(logContent, convoyID, beadID) {
 			t.Errorf("bd.log should contain 'dep add %s %s', got:\n%s", convoyID, beadID, logContent)
 		}
 	}
@@ -1920,7 +1920,7 @@ func TestCreateStagedConvoy_TracksOnlySlingable(t *testing.T) {
 
 	// Slingable beads (tasks and bugs) should be tracked.
 	for _, beadID := range []string{"gt-t1", "gt-b1", "gt-t2"} {
-		if !strings.Contains(logContent, "dep add "+convoyID+" "+beadID) {
+		if !containsStagedTrackingDep(logContent, convoyID, beadID) {
 			t.Errorf("bd.log should contain 'dep add %s %s' for slingable bead, got:\n%s", convoyID, beadID, logContent)
 		}
 	}
@@ -1932,6 +1932,18 @@ func TestCreateStagedConvoy_TracksOnlySlingable(t *testing.T) {
 			t.Errorf("epic gt-epic should NOT be tracked via dep add, but found: %s", line)
 		}
 	}
+}
+
+func containsStagedTrackingDep(logContent, convoyID, beadID string) bool {
+	if strings.Contains(logContent, "dep add "+convoyID+" "+beadID) {
+		return true
+	}
+	prefix, _, ok := strings.Cut(beadID, "-")
+	if !ok || prefix == "" {
+		return false
+	}
+	externalTarget := fmt.Sprintf("external:%s:%s", prefix, beadID)
+	return strings.Contains(logContent, "dep add "+convoyID+" "+externalTarget)
 }
 
 // IT-12: Stage convoy description includes wave count + timestamp.
