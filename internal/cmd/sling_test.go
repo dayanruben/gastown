@@ -959,7 +959,7 @@ exit /b 0
 	}
 }
 
-func TestTargetRigResolverAllowsRouteResolvedGtBead(t *testing.T) {
+func TestTargetRigDatabaseAllowsRouteResolvedGtBead(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows: shell stub uses POSIX env logging")
 	}
@@ -1021,8 +1021,8 @@ esac
 	t.Setenv("BEADS_DOLT_DATA_DIR", filepath.Join(townRoot, "wrong-data"))
 	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "hq")
 
-	if err := verifyBeadResolvesForTargetRig("gt-hq-oy83-cleanup", "gastown", townRoot); err != nil {
-		t.Fatalf("verifyBeadResolvesForTargetRig: %v", err)
+	if err := verifyBeadExistsInTargetRigDatabase("gt-hq-oy83-cleanup", "gastown", townRoot); err != nil {
+		t.Fatalf("verifyBeadExistsInTargetRigDatabase: %v", err)
 	}
 
 	logBytes, err := os.ReadFile(logPath)
@@ -1046,8 +1046,8 @@ esac
 	if parts[3] != "" {
 		t.Fatalf("BEADS_DOLT_DATA_DIR leaked: %q", parts[3])
 	}
-	if parts[4] != "" {
-		t.Fatalf("BEADS_DOLT_SERVER_DATABASE leaked: %q", parts[4])
+	if parts[4] != "gastown" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want gastown", parts[4])
 	}
 }
 
