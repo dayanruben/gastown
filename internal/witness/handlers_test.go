@@ -18,6 +18,78 @@ import (
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
+func TestWitnessHasSubmittableWorkUsesBranchTargetStatus(t *testing.T) {
+	repo := setupWitnessSquashPreservedRepo(t)
+	if got := witnessHasSubmittableWork(repo, []string{"integration/test"}); got {
+		t.Fatal("squash-preserved branch should not require MQ submission through witness helper")
+	}
+
+	witnessWriteFile(t, filepath.Join(repo, "feature.txt"), "one\ntwo\nthree\n")
+	runWitnessGit(t, repo, "add", "feature.txt")
+	runWitnessGit(t, repo, "commit", "-m", "extra local work")
+	if got := witnessHasSubmittableWork(repo, []string{"integration/test"}); !got {
+		t.Fatal("new local work after squash preservation should still require MQ submission")
+	}
+}
+
+func setupWitnessSquashPreservedRepo(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	repo := filepath.Join(root, "repo")
+	runWitnessGit(t, root, "init", "--bare", remote)
+	if err := os.MkdirAll(repo, 0755); err != nil {
+		t.Fatal(err)
+	}
+	runWitnessGit(t, repo, "init")
+	runWitnessGit(t, repo, "config", "user.email", "test@example.com")
+	runWitnessGit(t, repo, "config", "user.name", "Test User")
+	witnessWriteFile(t, filepath.Join(repo, "README.md"), "base\n")
+	runWitnessGit(t, repo, "add", "README.md")
+	runWitnessGit(t, repo, "commit", "-m", "base")
+	runWitnessGit(t, repo, "branch", "-M", "main")
+	runWitnessGit(t, repo, "remote", "add", "origin", remote)
+	runWitnessGit(t, repo, "push", "-u", "origin", "main")
+	runWitnessGit(t, repo, "switch", "-c", "integration/test")
+	runWitnessGit(t, repo, "push", "-u", "origin", "integration/test")
+	if err := exec.Command("git", "-C", repo, "merge-tree", "--write-tree", "HEAD", "HEAD").Run(); err != nil {
+		t.Skipf("git merge-tree --write-tree unsupported: %v", err)
+	}
+
+	runWitnessGit(t, repo, "switch", "-c", "polecat/squash")
+	witnessWriteFile(t, filepath.Join(repo, "feature.txt"), "one\n")
+	runWitnessGit(t, repo, "add", "feature.txt")
+	runWitnessGit(t, repo, "commit", "-m", "checkpoint one")
+	witnessWriteFile(t, filepath.Join(repo, "feature.txt"), "one\ntwo\n")
+	runWitnessGit(t, repo, "add", "feature.txt")
+	runWitnessGit(t, repo, "commit", "-m", "checkpoint two")
+	runWitnessGit(t, repo, "switch", "integration/test")
+	runWitnessGit(t, repo, "merge", "--squash", "polecat/squash")
+	runWitnessGit(t, repo, "commit", "-m", "squash polecat work")
+	witnessWriteFile(t, filepath.Join(repo, "target.txt"), "target advanced\n")
+	runWitnessGit(t, repo, "add", "target.txt")
+	runWitnessGit(t, repo, "commit", "-m", "advance target")
+	runWitnessGit(t, repo, "push", "origin", "integration/test")
+	runWitnessGit(t, repo, "switch", "polecat/squash")
+	return repo
+}
+
+func witnessWriteFile(t *testing.T, path, data string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runWitnessGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+}
+
 type testMayorEvent struct {
 	Type    string            `json:"type"`
 	Payload map[string]string `json:"payload"`
