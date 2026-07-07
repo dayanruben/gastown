@@ -949,13 +949,16 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 // wisps table (where ephemeral issues live in beads v0.59+). Without this,
 // "bd list" only searches the issues table and misses wisps entirely.
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
-	if b.store != nil && !opts.Ephemeral {
+	if b.store != nil {
 		return b.storeList(opts)
 	}
 	if opts.Ephemeral {
 		return b.listEphemeral(opts)
 	}
+	return b.listIssues(opts)
+}
 
+func (b *Beads) listIssues(opts ListOptions) ([]*Issue, error) {
 	args := []string{"list", "--json"}
 
 	if opts.Status != "" {
