@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -30,15 +33,52 @@ func TestTrackingDependsOnID_HQStaysLocal(t *testing.T) {
 	}
 }
 
-func TestIsValidTrackingTargetID(t *testing.T) {
-	for _, id := range []string{"hq-cv-test", "external:ag:ag-95s.1", "external:rig_1:rig-abc_1"} {
-		if !isValidTrackingTargetID(id) {
-			t.Fatalf("isValidTrackingTargetID(%q) = false, want true", id)
-		}
+func TestFallbackTrackingRelationUsesExternalTarget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
 	}
-	for _, id := range []string{"", "external:ag", "external:bad/prefix:ag-1", "external:ag:bad'id"} {
-		if isValidTrackingTargetID(id) {
-			t.Fatalf("isValidTrackingTargetID(%q) = true, want false", id)
+
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte("{\"prefix\":\"ag-\",\"path\":\"agentcompany/.beads\"}\n"), 0o644); err != nil {
+		t.Fatalf("write routes.jsonl: %v", err)
+	}
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+	writeBDStub(t, binDir, `#!/usr/bin/env sh
+{
+	printf 'args:'
+	for arg in "$@"; do
+		printf '[%s]' "$arg"
+	done
+	printf '\n'
+} >> "$BD_STUB_LOG"
+`, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_STUB_LOG", logPath)
+
+	storeErr := errors.New("store unavailable")
+	if err := fallbackTrackingRelation(townRoot, "hq-cv-test", "ag-95s.1", true, storeErr); err != nil {
+		t.Fatalf("fallback add: %v", err)
+	}
+	if err := fallbackTrackingRelation(townRoot, "hq-cv-test", "ag-95s.1", false, storeErr); err != nil {
+		t.Fatalf("fallback remove: %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(logBytes)
+	for _, want := range []string{
+		"args:[dep][add][hq-cv-test][external:ag:ag-95s.1][--type=tracks]",
+		"args:[dep][remove][hq-cv-test][external:ag:ag-95s.1][--type=tracks]",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("bd stub log missing %q:\n%s", want, log)
 		}
 	}
 }

@@ -66,11 +66,6 @@ func mutateTrackingRelationViaStore(townRoot, trackerID, issueID string, add boo
 
 func fallbackTrackingRelation(townRoot, trackerID, issueID string, add bool, storeErr error) error {
 	targetID := trackingDependsOnID(townRoot, issueID)
-	sqlErr := mutateTrackingRelationViaSQL(townRoot, trackerID, targetID, add)
-	if sqlErr == nil {
-		return nil
-	}
-
 	args := []string{"dep", "add", trackerID, targetID, "--type=tracks"}
 	if !add {
 		args = []string{"dep", "remove", trackerID, targetID, "--type=tracks"}
