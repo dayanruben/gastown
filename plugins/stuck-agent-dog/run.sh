@@ -204,20 +204,20 @@ confirm_current_polecat_outage() {
 }
 
 confirm_polecat_outages() {
-  local entry="" session="" rig="" pcat="" hook="" reason=""
+  local entry="" session="" rig="" pcat="" _hook="" _reason=""
 
   CONFIRMED_CRASHED=()
   CONFIRMED_STUCK=()
 
   for entry in ${CRASHED[@]+"${CRASHED[@]}"}; do
     [ -n "$entry" ] || continue
-    IFS='|' read -r session rig pcat hook <<< "$entry"
+    IFS='|' read -r session rig pcat _hook <<< "$entry"
     confirm_current_polecat_outage "$session" "$rig" "$pcat"
   done
 
   for entry in ${STUCK[@]+"${STUCK[@]}"}; do
     [ -n "$entry" ] || continue
-    IFS='|' read -r session rig pcat hook reason <<< "$entry"
+    IFS='|' read -r session rig pcat _hook _reason <<< "$entry"
     confirm_current_polecat_outage "$session" "$rig" "$pcat"
   done
 }
