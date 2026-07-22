@@ -156,11 +156,14 @@ func TestRunDoneWithRoutedIssueIgnoresCurrentRigMirror(t *testing.T) {
 	setupRoutedSubmitGitRepo(t, workDir, false)
 	logPath := installSubmitSourceBDRecorder(t, currentBeadsDir, ownerBeadsDir)
 	resetDoneFlagsForTest(t)
+	townRoot := routedSourceTestTownRoot(workDir)
 	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
-	t.Setenv("GT_ROLE", "unknown")
-	t.Setenv("GT_RIG", "")
-	t.Setenv("GT_POLECAT", "")
-	t.Setenv("BD_ACTOR", "")
+	t.Setenv("GT_TOWN_ROOT", townRoot)
+	t.Setenv("GT_ROOT", townRoot)
+	t.Setenv("GT_ROLE", "gastown/polecats/refuge")
+	t.Setenv("GT_RIG", "gastown")
+	t.Setenv("GT_POLECAT", "refuge")
+	t.Setenv("BD_ACTOR", "gastown/polecats/refuge")
 	t.Chdir(workDir)
 
 	doneIssue = "bd-source"
@@ -189,7 +192,7 @@ func setupRoutedSourceTestTown(t *testing.T) (workDir, currentBeadsDir, ownerBea
 		t.Fatalf("write town sentinel: %v", err)
 	}
 
-	workDir = filepath.Join(townRoot, "gastown", "polecats", "refuge", "checkout")
+	workDir = filepath.Join(townRoot, "gastown", "polecats", "refuge", "gastown")
 	currentBeadsDir = filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads")
 	ownerBeadsDir = filepath.Join(townRoot, "beads", "mayor", "rig", ".beads")
 	townBeadsDir := filepath.Join(townRoot, ".beads")
