@@ -56,6 +56,9 @@ func TestFallbackTrackingRelationUsesExternalTarget(t *testing.T) {
 	done
 	printf '\n'
 } >> "$BD_STUB_LOG"
+if [ "$1" = "sql" ]; then
+	exit 1
+fi
 `, "")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("BD_STUB_LOG", logPath)

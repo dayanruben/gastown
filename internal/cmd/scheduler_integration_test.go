@@ -79,6 +79,33 @@ func initBeadsDBForServer(t *testing.T, dir, prefix, homeDir string) {
 	}
 }
 
+func ensureSchedulerMetadataDatabase(t *testing.T, dir, prefix string) {
+	t.Helper()
+
+	metadataPath := filepath.Join(dir, ".beads", "metadata.json")
+	raw := map[string]interface{}{}
+	if data, err := os.ReadFile(metadataPath); err == nil && len(data) > 0 {
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatalf("parse metadata.json in %s: %v", dir, err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read metadata.json in %s: %v", dir, err)
+	}
+
+	raw["backend"] = "dolt"
+	raw["dolt_mode"] = "server"
+	raw["dolt_database"] = prefix
+	raw["issue_prefix"] = prefix
+
+	data, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal metadata.json in %s: %v", dir, err)
+	}
+	if err := os.WriteFile(metadataPath, append(data, '\n'), 0644); err != nil {
+		t.Fatalf("write metadata.json in %s: %v", dir, err)
+	}
+}
+
 func initSchedulerGitRepo(t *testing.T, dir, homeDir string) {
 	t.Helper()
 	cmd := exec.Command("git", "init", "--quiet")
@@ -919,7 +946,6 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	if err := os.WriteFile(filepath.Join(rig2Redirect, "redirect"), []byte("mayor/rig/.beads"), 0644); err != nil {
 		t.Fatalf("write rig2 redirect: %v", err)
 	}
-	initBeadsDBForServer(t, hqPath, hqPrefix)
 
 	// --- Environment ---
 	env = cleanSchedulerTestEnv(tmpDir)

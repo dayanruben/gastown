@@ -1875,7 +1875,7 @@ func TestCreateStagedConvoy_CleanReady(t *testing.T) {
 	// Verify tracking relation was written for each slingable bead.
 	for _, beadID := range []string{"gt-a", "gt-b", "gt-c"} {
 		targetID := "external:gt:" + beadID
-		if !strings.Contains(logContent, "dep add "+convoyID+" "+targetID) {
+		if !containsStagedTrackingDep(logContent, convoyID, beadID) {
 			t.Errorf("bd.log should contain 'dep add %s %s', got:\n%s", convoyID, targetID, logContent)
 		}
 	}
@@ -1924,7 +1924,7 @@ func TestCreateStagedConvoy_TracksOnlySlingable(t *testing.T) {
 	// Slingable beads (tasks and bugs) should be tracked.
 	for _, beadID := range []string{"gt-t1", "gt-b1", "gt-t2"} {
 		targetID := "external:gt:" + beadID
-		if !strings.Contains(logContent, "dep add "+convoyID+" "+targetID) {
+		if !containsStagedTrackingDep(logContent, convoyID, beadID) {
 			t.Errorf("bd.log should contain 'dep add %s %s' for slingable bead, got:\n%s", convoyID, targetID, logContent)
 		}
 	}
