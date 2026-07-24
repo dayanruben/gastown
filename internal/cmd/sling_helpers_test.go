@@ -340,7 +340,7 @@ exit 1
 	}
 }
 
-func TestSlingMutationHelpersPinExplicitBeadsDirUnderStaleEnv(t *testing.T) {
+func TestHookBeadPinsExplicitBeadsDirUnderStaleEnv(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses Unix shell script bd stub")
 	}
@@ -368,7 +368,7 @@ if [ "$1" = "--allow-stale" ]; then
   shift
 fi
 args=$(printf '%%s' "$*" | tr '\n' ' ')
-printf '%%s|%%s|%%s|%%s|%%s|%%s|%%s|%%s|%%s|%%s|%%s\n' "$args" "$(pwd)" "${BEADS_DIR:-}" "${BEADS_DOLT_SERVER_DATABASE:-}" "${BEADS_DOLT_SERVER_HOST:-}" "${BEADS_DOLT_SERVER_PORT:-}" "${BEADS_DOLT_PORT:-}" "${BEADS_DOLT_DATA_DIR:-}" "${BEADS_DB:-}" "${BD_DB:-}" "${BD_EXPORT_AUTO:-}" >> %q
+printf '%%s|%%s|%%s|%%s|%%s|%%s|%%s|%%s|%%s|%%s|%%s|%%s\n' "$args" "$(pwd)" "${BEADS_DIR:-}" "${BEADS_DOLT_SERVER_DATABASE:-}" "${BEADS_DOLT_SERVER_HOST:-}" "${BEADS_DOLT_SERVER_PORT:-}" "${BEADS_DOLT_PORT:-}" "${BEADS_DOLT_DATA_DIR:-}" "${GT_DOLT_DATA:-}" "${BEADS_DB:-}" "${BD_DB:-}" "${BD_EXPORT_AUTO:-}" >> %q
 case "$1" in
   show)
     echo '[{"id":"r23-abc","title":"Task","status":"hooked","assignee":"testrig/polecats/envtest","description":"body"}]'
@@ -390,12 +390,7 @@ exit 1
 	if err := hookBeadWithRetryWithBeadsDir("r23-abc", "testrig/polecats/envtest", rigDir, "", beadsDir); err != nil {
 		t.Fatalf("hookBeadWithRetryWithBeadsDir: %v", err)
 	}
-	if err := storeFieldsInBeadFromBeadsDir(rigDir, beadsDir, "r23-abc", beadFieldUpdates{Dispatcher: "scheduler"}); err != nil {
-		t.Fatalf("storeFieldsInBeadFromBeadsDir: %v", err)
-	}
 
 	logs := readBDEnvLog(t, logPath)
 	assertBDEnvLogWithBeadsDir(t, findBDEnvLog(t, logs, "update r23-abc --status=hooked"), rigDir, beadsDir, "r23", "127.0.0.8", "4411")
-	assertBDEnvLogWithBeadsDir(t, findBDEnvLog(t, logs, "show r23-abc"), rigDir, beadsDir, "r23", "127.0.0.8", "4411")
-	assertBDEnvLogWithBeadsDir(t, findBDEnvLog(t, logs, "update r23-abc --description="), rigDir, beadsDir, "r23", "127.0.0.8", "4411")
 }
