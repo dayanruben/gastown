@@ -382,8 +382,7 @@ Host (.repo.git)                     Container
 # .devcontainer/gastown-polecat/setup.sh
 set -e
 npm install -g @anthropic-ai/claude-code
-curl -fsSL https://releases.gastown.dev/gt-proxy-client/latest/linux-amd64 -o /usr/local/bin/gt
-chmod +x /usr/local/bin/gt
+# The image must include an approved gt-proxy-client binary at /usr/local/bin/gt.
 ln -sf /usr/local/bin/gt /usr/local/bin/bd
 apt-get install -y git
 ```

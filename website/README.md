@@ -33,8 +33,5 @@ npm run serve
 
 ## Deployment
 
-```bash
-npm run deploy
-```
-
-Configure `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as needed for Cloudflare Pages deployments.
+Production deployment is intentionally disabled. Build the static site locally
+with `npm run build` and inspect it with `npm run serve`.
