@@ -9,8 +9,10 @@ permissions: {}
 jobs:
   block-internal-prs:
     name: Block Internal PRs
-    # Only run if PR is from the same repo (not a fork)
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'renovate[bot]'
+    # Only enforce the upstream internal-PR policy. A compatibility fork may
+    # contain the same maintenance PRs, but must not turn that expected guard
+    # into a failed CI check.
+    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.repository.fork && github.actor != 'renovate[bot]'
     runs-on: ubuntu-latest
     permissions:
       issues: write
